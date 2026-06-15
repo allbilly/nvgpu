@@ -1,0 +1,190 @@
+
+SUBMIT #1 queue=NVComputeQueue words=16 iface=PCIIface
+  words_hex=20012000 0000c7c0 200221ec 00007293 00000000 200220a8 00007294 00000000 20050017 202bbff0 00000010 00000001 00000000 03100001 20010008 00000000
+  method[0] NVC9B0_SET_CONTROL_PARAMS_TESTRUN_ENV_TRACE3D_RUN typ=2 subc=1 mthd=0x0 size=1
+    arg0=0x0000c7c0 (51136)
+  method[2] NVC6C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A typ=2 subc=1 mthd=0x7b0 size=2
+    arg0=0x00007293 (29331)
+    arg1=0x00000000 (0)
+  method[5] NVC6C0_SET_SHADER_SHARED_MEMORY_WINDOW_A typ=2 subc=1 mthd=0x2a0 size=2
+    arg0=0x00007294 (29332)
+    arg1=0x00000000 (0)
+  method[8] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000001 (1)
+    arg3=0x00000000 (0)
+    arg4=0x03100001 (51380225)
+  method[14] NVC9B0_SET_APPLICATION_ID_ID_DHKE typ=2 subc=0 mthd=0x20 size=1
+    arg0=0x00000000 (0)
+  GPFIFO[0]=0x0000421021800000 addr=0x1021800000 packets=16 token=0x1
+  doorbell gpput=1 put_value=1
+
+SUBMIT #2 queue=NVCopyQueue words=14 iface=PCIIface
+  words_hex=20050017 202bbff0 00000010 00000001 00000000 01000003 20018000 0000c7b5 20038090 00000010 202bbff0 00000002 200180c0 00000014
+  method[0] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000001 (1)
+    arg3=0x00000000 (0)
+    arg4=0x01000003 (16777219)
+  method[6] NVC9B0_SET_CONTROL_PARAMS_TESTRUN_ENV_TRACE3D_RUN typ=2 subc=4 mthd=0x0 size=1
+    arg0=0x0000c7b5 (51125)
+  method[8] NVC9B0_SEMAPHORE_A typ=2 subc=4 mthd=0x240 size=3
+    arg0=0x00000010 (16)
+    arg1=0x202bbff0 (539738096)
+    arg2=0x00000002 (2)
+  method[12] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000014 (20)
+  GPFIFO[0]=0x00003a1021800040 addr=0x1021800040 packets=14 token=0x2
+  doorbell gpput=1 put_value=1
+device NV iface PCIIface
+
+SUBMIT #3 queue=NVCopyQueue words=21 iface=PCIIface
+  words_hex=20050017 202bbff0 00000010 00000002 00000000 01000003 20048100 00000010 21c00000 00000010 2000e000 20018106 00000010 200180c0 00000182 20038090 00000010 202bbff0 00000003 200180c0 00000014
+  method[0] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000002 (2)
+    arg3=0x00000000 (0)
+    arg4=0x01000003 (16777219)
+  method[6] NVC9B0_SET_CONTROL_PARAMS typ=2 subc=4 mthd=0x400 size=4
+    arg0=0x00000010 (16)
+    arg1=0x21c00000 (566231040)
+    arg2=0x00000010 (16)
+    arg3=0x2000e000 (536928256)
+  method[11] NVC9B0_SET_HISTORY_OFFSET typ=2 subc=4 mthd=0x418 size=1
+    arg0=0x00000010 (16)
+  method[13] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000182 (386)
+  method[15] NVC9B0_SEMAPHORE_A typ=2 subc=4 mthd=0x240 size=3
+    arg0=0x00000010 (16)
+    arg1=0x202bbff0 (539738096)
+    arg2=0x00000003 (3)
+  method[19] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000014 (20)
+  GPFIFO[1]=0x0000561021800080 addr=0x1021800080 packets=21 token=0x2
+  doorbell gpput=2 put_value=2
+
+SUBMIT #4 queue=NVCopyQueue words=21 iface=PCIIface
+  words_hex=20050017 202bbff0 00000010 00000003 00000000 01000003 20048100 00000010 25000000 00000010 20015000 20018106 00000010 200180c0 00000182 20038090 00000010 202bbff0 00000004 200180c0 00000014
+  method[0] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000003 (3)
+    arg3=0x00000000 (0)
+    arg4=0x01000003 (16777219)
+  method[6] NVC9B0_SET_CONTROL_PARAMS typ=2 subc=4 mthd=0x400 size=4
+    arg0=0x00000010 (16)
+    arg1=0x25000000 (620756992)
+    arg2=0x00000010 (16)
+    arg3=0x20015000 (536956928)
+  method[11] NVC9B0_SET_HISTORY_OFFSET typ=2 subc=4 mthd=0x418 size=1
+    arg0=0x00000010 (16)
+  method[13] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000182 (386)
+  method[15] NVC9B0_SEMAPHORE_A typ=2 subc=4 mthd=0x240 size=3
+    arg0=0x00000010 (16)
+    arg1=0x202bbff0 (539738096)
+    arg2=0x00000004 (4)
+  method[19] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000014 (20)
+  GPFIFO[2]=0x00005610218000e0 addr=0x10218000e0 packets=21 token=0x2
+  doorbell gpput=3 put_value=3
+
+SUBMIT #5 queue=NVComputeQueue words=21 iface=PCIIface
+  words_hex=20050017 202bbff0 00000010 00000004 00000000 01000003 200221e4 00000010 30000000 200320b9 00000000 001b0000 000000ff 20050017 202bbff0 00000010 00000005 00000000 03100001 20010008 00000000
+  method[0] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000004 (4)
+    arg3=0x00000000 (0)
+    arg4=0x01000003 (16777219)
+  method[6] NVC6C0_SET_SHADER_LOCAL_MEMORY_A typ=2 subc=1 mthd=0x790 size=2
+    arg0=0x00000010 (16)
+    arg1=0x30000000 (805306368)
+  method[9] NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A typ=2 subc=1 mthd=0x2e4 size=3
+    arg0=0x00000000 (0)
+    arg1=0x001b0000 (1769472)
+    arg2=0x000000ff (255)
+  method[13] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000005 (5)
+    arg3=0x00000000 (0)
+    arg4=0x03100001 (51380225)
+  method[19] NVC9B0_SET_APPLICATION_ID_ID_DHKE typ=2 subc=0 mthd=0x20 size=1
+    arg0=0x00000000 (0)
+  GPFIFO[1]=0x0000561021800140 addr=0x1021800140 packets=21 token=0x1
+  doorbell gpput=2 put_value=2
+
+SUBMIT #6 queue=NVCopyQueue words=21 iface=PCIIface
+  words_hex=20050017 202bbff0 00000010 00000005 00000000 01000003 20048100 00000010 25200000 00000010 2029a000 20018106 00000400 200180c0 00000182 20038090 00000010 202bbff0 00000006 200180c0 00000014
+  method[0] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000005 (5)
+    arg3=0x00000000 (0)
+    arg4=0x01000003 (16777219)
+  method[6] NVC9B0_SET_CONTROL_PARAMS typ=2 subc=4 mthd=0x400 size=4
+    arg0=0x00000010 (16)
+    arg1=0x25200000 (622854144)
+    arg2=0x00000010 (16)
+    arg3=0x2029a000 (539598848)
+  method[11] NVC9B0_SET_HISTORY_OFFSET typ=2 subc=4 mthd=0x418 size=1
+    arg0=0x00000400 (1024)
+  method[13] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000182 (386)
+  method[15] NVC9B0_SEMAPHORE_A typ=2 subc=4 mthd=0x240 size=3
+    arg0=0x00000010 (16)
+    arg1=0x202bbff0 (539738096)
+    arg2=0x00000006 (6)
+  method[19] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000014 (20)
+  GPFIFO[3]=0x00005610218001a0 addr=0x10218001a0 packets=21 token=0x2
+  doorbell gpput=4 put_value=4
+
+SUBMIT #7 queue=NVComputeQueue words=12 iface=PCIIface
+  words_hex=20050017 202bbff0 00000010 00000006 00000000 01000003 200125a6 00001011 200120ad 102c0002 200120b0 00000009
+  method[0] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000006 (6)
+    arg3=0x00000000 (0)
+    arg4=0x01000003 (16777219)
+  method[6] NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI typ=2 subc=1 mthd=0x1698 size=1
+    arg0=0x00001011 (4113)
+  method[8] NVC6C0_SEND_PCAS_A typ=2 subc=1 mthd=0x2b4 size=1
+    arg0=0x102c0002 (271319042)
+  method[10] NVC6C0_SEND_SIGNALING_PCAS2_B typ=2 subc=1 mthd=0x2c0 size=1
+    arg0=0x00000009 (9)
+  GPFIFO[2]=0x0000321021800200 addr=0x1021800200 packets=12 token=0x1
+  doorbell gpput=3 put_value=3
+
+SUBMIT #8 queue=NVCopyQueue words=21 iface=PCIIface
+  words_hex=20050017 202bbff0 00000010 00000007 00000000 01000003 20048100 00000010 20016000 00000010 21a00000 20018106 00000010 200180c0 00000182 20038090 00000010 202bbff0 00000008 200180c0 00000014
+  method[0] NVC56F_SEM_ADDR_LO typ=2 subc=0 mthd=0x5c size=5
+    arg0=0x202bbff0 (539738096)
+    arg1=0x00000010 (16)
+    arg2=0x00000007 (7)
+    arg3=0x00000000 (0)
+    arg4=0x01000003 (16777219)
+  method[6] NVC9B0_SET_CONTROL_PARAMS typ=2 subc=4 mthd=0x400 size=4
+    arg0=0x00000010 (16)
+    arg1=0x20016000 (536961024)
+    arg2=0x00000010 (16)
+    arg3=0x21a00000 (564133888)
+  method[11] NVC9B0_SET_HISTORY_OFFSET typ=2 subc=4 mthd=0x418 size=1
+    arg0=0x00000010 (16)
+  method[13] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000182 (386)
+  method[15] NVC9B0_SEMAPHORE_A typ=2 subc=4 mthd=0x240 size=3
+    arg0=0x00000010 (16)
+    arg1=0x202bbff0 (539738096)
+    arg2=0x00000008 (8)
+  method[19] NVC9B0_OS_INTERRUPT_CTX_ERROR_FBIF typ=2 subc=4 mthd=0x300 size=1
+    arg0=0x00000014 (20)
+  GPFIFO[4]=0x0000561021800230 addr=0x1021800230 packets=21 token=0x2
+  doorbell gpput=5 put_value=5
+
+RESULT [10.0, 40.0, 90.0, 160.0]
