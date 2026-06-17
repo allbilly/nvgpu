@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-import pathlib, struct, sys
+import array, pathlib, struct, sys, time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "ref" / "tinygrad"))
-from tinygrad.device import Device
-from tinygrad.runtime.autogen import nv_570 as nv_gpu
-from tinygrad.runtime.support.hcq import HWQueue
+sys.path.insert(0, str(ROOT))
+from nv_pcie import open_pcie_device
 
-METHOD_NAMES = {int(getattr(nv_gpu, name)): name for name in dir(nv_gpu)
-                if name[:7] in {"NVC9B0_", "NVC6C0_", "NVC56F_", "NVC6B5_"} and isinstance(getattr(nv_gpu, name), int)}
-METHOD_NAMES[0x0020] = "NVC56F_NON_STALL_INTERRUPT"
+METHOD_NAMES = {
+  0x005c: "NVC56F_SEM_ADDR_LO",
+  0x02b4: "NVC6C0_SEND_PCAS_A",
+  0x02c0: "NVC6C0_SEND_SIGNALING_PCAS2_B",
+  0x1698: "NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI",
+  0x0020: "NVC56F_NON_STALL_INTERRUPT",
+}
 
 class CubinHelper:
   class Reg:
@@ -164,52 +166,97 @@ class CubinHelper:
 
 ch = CubinHelper()
 
-def trace_submits():
-  def decode_words(words):
-    index = 0
-    while index < len(words):
-      header = words[index]
-      typ, size, subc, method = (header >> 28) & 0xf, (header >> 16) & 0xfff, (header >> 13) & 0x7, (header << 2) & 0x7fff
-      args = words[index + 1:index + 1 + size]
-      yield index, typ, subc, method, METHOD_NAMES.get(method, f"UNKNOWN_0x{method:x}"), args
-      index += size + 1
-  def describe_args(method, args):
-    if method == 0x005c and len(args) == 5:
-      sem_addr = (args[1] << 32) | args[0]
-      payload = (args[3] << 32) | args[2]
-      return [f"sem_addr=0x{sem_addr:x}", f"payload={payload}", f"execute=0x{args[4]:08x}"]
-    if method == 0x1698 and len(args) == 1:
-      return [f"invalidate_flags=0x{args[0]:08x}"]
-    if method == 0x02b4 and len(args) == 1:
-      return [f"qmd_addr=0x{args[0] << 8:x}", f"qmd_addr_shifted8=0x{args[0]:x}"]
-    if method == 0x02c0 and len(args) == 1:
-      return [f"pcas2_action=0x{args[0]:x}"]
-    return [f"arg{i}=0x{arg:08x}" for i, arg in enumerate(args)]
+def nvm(subchannel, method, *args, typ=2):
+  return [(typ << 28) | (len(args) << 16) | (subchannel << 13) | (method >> 2), *args]
 
-  real_submit = HWQueue.submit
-  count = 0
-  def traced_submit(self, dev, var_vals=None):
-    nonlocal count
-    if var_vals is not None: self._apply_var_vals(var_vals)
-    count += 1
-    words = [int(word) for word in self._q]
-    queue_name = type(self).__name__
-    fifo = dev.compute_gpfifo if queue_name == "NVComputeQueue" else dev.dma_gpfifo
-    before_put = fifo.put_value
-    print(f"submit #{count}: {type(self).__name__} words={len(words)}")
-    for index, typ, subc, method, name, args in decode_words(words):
-      decoded = ", ".join(describe_args(method, args))
-      print(f"  method[{index}] {name}: typ={typ} subc={subc} mthd=0x{method:x} args=[{decoded}]")
-    ret = real_submit(self, dev, None)
-    if fifo.put_value != before_put:
-      entry = int(fifo.ring[before_put % fifo.entries_count])
-      addr = ((entry & ((1 << 40) - 1)) >> 2) << 2
-      packets = (entry >> 42) & ((1 << 20) - 1)
-      print(f"  GPFIFO[{before_put % fifo.entries_count}]=0x{entry:016x} addr=0x{addr:x} packets={packets} token=0x{fifo.token:x}")
-      print(f"  doorbell gpput={fifo.gpput[0]} put_value={fifo.put_value}")
-    return ret
-  HWQueue.submit = traced_submit
-  return real_submit
+def build_launch_words(timeline_addr, wait_value, done_value, qmd_addr):
+  lo, hi = timeline_addr & 0xffffffff, timeline_addr >> 32
+  return [
+    *nvm(0, 0x005c, lo, hi, wait_value, 0, 0x01000003),
+    *nvm(1, 0x1698, 0x00001011),
+    *nvm(1, 0x02b4, qmd_addr >> 8),
+    *nvm(1, 0x02c0, 0x00000009),
+    *nvm(0, 0x005c, lo, hi, done_value, 0, 0x03100001),
+    *nvm(0, 0x0020, 0),
+  ]
+
+def decode_words(words):
+  index = 0
+  while index < len(words):
+    header = words[index]
+    typ, size, subc, method = (header >> 28) & 0xf, (header >> 16) & 0xfff, (header >> 13) & 0x7, (header << 2) & 0x7fff
+    args = words[index + 1:index + 1 + size]
+    yield index, typ, subc, method, METHOD_NAMES.get(method, f"UNKNOWN_0x{method:x}"), args
+    index += size + 1
+
+def describe_args(method, args):
+  if method == 0x005c and len(args) == 5:
+    sem_addr = (args[1] << 32) | args[0]
+    payload = (args[3] << 32) | args[2]
+    return [f"sem_addr=0x{sem_addr:x}", f"payload={payload}", f"execute=0x{args[4]:08x}"]
+  if method == 0x1698 and len(args) == 1:
+    return [f"invalidate_flags=0x{args[0]:08x}"]
+  if method == 0x02b4 and len(args) == 1:
+    return [f"qmd_addr=0x{args[0] << 8:x}", f"qmd_addr_shifted8=0x{args[0]:x}"]
+  if method == 0x02c0 and len(args) == 1:
+    return [f"pcas2_action=0x{args[0]:x}"]
+  return [f"arg{i}=0x{arg:08x}" for i, arg in enumerate(args)]
+
+def round_up(x, y): return ((x + y - 1) // y) * y
+
+def write_words(dst, offset, words):
+  dst[offset:offset + len(words)] = array.array('I', words)
+
+def submit_gpfifo(dev, words):
+  cmdq_addr = dev.cmdq_allocator.alloc(len(words) * 4, 16)
+  cmdq_wptr = (cmdq_addr - dev.cmdq_page.va_addr) // 4
+  write_words(dev.cmdq, cmdq_wptr, words)
+
+  fifo = dev.compute_gpfifo
+  ring_index = fifo.put_value % fifo.entries_count
+  fifo.ring[ring_index] = (cmdq_addr // 4 << 2) | (len(words) << 42) | (1 << 41)
+  fifo.gpput[0] = (fifo.put_value + 1) % fifo.entries_count
+  dev.gpu_mmio[0x90 // 4] = fifo.token
+  fifo.put_value += 1
+
+  entry = int(fifo.ring[ring_index])
+  addr = ((entry & ((1 << 40) - 1)) >> 2) << 2
+  packets = (entry >> 42) & ((1 << 20) - 1)
+  print(f"  GPFIFO[{ring_index}]=0x{entry:016x} addr=0x{addr:x} packets={packets} token=0x{fifo.token:x}")
+  print(f"  doorbell gpput={fifo.gpput[0]} put_value={fifo.put_value}")
+
+def wait_signal(signal, value, timeout_ms=30000):
+  start = time.perf_counter()
+  while signal.value < value:
+    if (time.perf_counter() - start) * 1000 > timeout_ms:
+      raise RuntimeError(f"timeout waiting for timeline {value}, got {signal.value}")
+    time.sleep(0.001)
+
+def manual_launch(dev, program, out, a, b):
+  kernargs = dev.kernargs_buf.offset(dev.kernargs_offset_allocator.alloc(program.kernargs_alloc_size, 8), program.kernargs_alloc_size)
+  cbuf_words = program.cbuf_0 or []
+  kernargs.cpu_view().view(size=len(cbuf_words) * 4, fmt='I')[:] = array.array('I', cbuf_words)
+  kernargs.cpu_view().view(offset=len(cbuf_words) * 4, size=3 * 8, fmt='Q')[:] = array.array('Q', [out.va_addr, a.va_addr, b.va_addr])
+
+  qmd_buf = kernargs.offset(round_up(program.constbufs[0][1], 1 << 8))
+  qmd_buf.cpu_view().view(size=program.qmd.mv.nbytes, fmt='B')[:] = program.qmd.mv
+  qmd = type(program.qmd)(dev=dev, view=qmd_buf.cpu_view())
+  qmd.write(cta_raster_width=1, cta_raster_height=1, cta_raster_depth=1,
+            cta_thread_dimension0=1, cta_thread_dimension1=1, cta_thread_dimension2=1)
+  qmd.set_constant_buf_addr(0, kernargs.va_addr)
+
+  wait_value = dev.timeline_value - 1
+  done_value = dev.next_timeline()
+  signal_addr = dev.timeline_signal.value_addr
+  qmd.write(release0_enable=1, release0_address_lower=signal_addr & 0xffffffff, release0_address_upper=(signal_addr >> 32) & 0xff,
+            release0_payload_lower=done_value & 0xffffffff, release0_payload_upper=done_value >> 32)
+
+  words = build_launch_words(signal_addr, wait_value, done_value, qmd_buf.va_addr)[:12]
+  print(f"submit #manual: NVComputeQueue words={len(words)}")
+  for index, typ, subc, method, name, args in decode_words(words):
+    print(f"  method[{index}] {name}: typ={typ} subc={subc} mthd=0x{method:x} args=[{', '.join(describe_args(method, args))}]")
+  submit_gpfifo(dev, words)
+  wait_signal(dev.timeline_signal, done_value)
 
 def build_cubin(): # nvdisasm add.cubin
   bundles = [
@@ -257,24 +304,24 @@ def build_cubin(): # nvdisasm add.cubin
   return bytes(cubin)
 
 def main():
-  dev = Device["NV"]
+  a = (1.0, 2.0, 3.0, 4.0)
+  b = (10.0, 20.0, 30.0, 40.0)
+  cubin = build_cubin()
+  print(f"cubin_bytes={len(cubin)} expected_result={[x + y for x, y in zip(a, b)]}")
+  dev = open_pcie_device()
   print(f"device={dev.device} iface={type(dev.iface).__name__}")
-  a = dev.allocator.alloc(16)
-  b = dev.allocator.alloc(16)
-  out = dev.allocator.alloc(16)
-  dev.allocator._copyin(a, memoryview(struct.pack("4f", 1.0, 2.0, 3.0, 4.0)))
-  dev.allocator._copyin(b, memoryview(struct.pack("4f", 10.0, 20.0, 30.0, 40.0)))
-  dev.allocator._copyin(out, memoryview(bytes(16)))
-  program = dev.runtime("E_4", build_cubin())
-  real_submit = trace_submits()
-  try:
-    program(out, a, b, global_size=(1, 1, 1), local_size=(1, 1, 1), wait=True)
-  finally:
-    HWQueue.submit = real_submit
-
+  a_buf = dev.allocator.alloc(16)
+  b_buf = dev.allocator.alloc(16)
+  out_buf = dev.allocator.alloc(16)
+  dev.allocator._copyin(a_buf, memoryview(struct.pack("4f", *a)))
+  dev.allocator._copyin(b_buf, memoryview(struct.pack("4f", *b)))
+  dev.allocator._copyin(out_buf, memoryview(bytes(16)))
+  program = dev.runtime("E_4", cubin)
+  manual_launch(dev, program, out_buf, a_buf, b_buf)
   result_bytes = bytearray(16)
-  dev.allocator._copyout(memoryview(result_bytes), out)
-  print(f"result={list(struct.unpack('4f', result_bytes))}")
+  dev.allocator._copyout(memoryview(result_bytes), out_buf)
+  result = list(struct.unpack("4f", result_bytes))
+  print(f"result={result}")
   print("submitted rebuilt NV add kernel")
 
 

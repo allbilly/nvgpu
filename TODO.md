@@ -1,0 +1,2 @@
+- compare our code with librecuda, does it self craft qmd
+- 

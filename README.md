@@ -5,10 +5,10 @@ with simple python, not even tinygrad
 
 # examples
 
-Run the hand-built add cubin through the tinygrad NV runtime:
+Run the hand-built add cubin through the local example helper:
 
 ```bash
-CACHELEVEL=0 ASSERT_COMPILE=1 python3 examples/add.py
+python3 examples/add.py
 # result=[11.0, 22.0, 33.0, 44.0]
 ```
 
@@ -19,7 +19,7 @@ macOS cannot run NVIDIA CUDA tools natively. Use Docker only for the tools; no G
 Generate the cubin from our Python byte builder:
 
 ```bash
-python3 -c 'import examples.add as a; open("add.cubin", "wb").write(a.build_cubin(a.SASS_ARITHMETIC))'
+python3 -c 'import examples.add as a; open("add.cubin", "wb").write(a.build_cubin())'
 ```
 
 Disassemble it with CUDA tools in Docker:
