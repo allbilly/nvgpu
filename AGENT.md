@@ -5,7 +5,7 @@ i want to understand how tinygrad NV backend works, by reimplemetation simple ad
 4. make each examples/*.py self contain, that is no tinygrad import except usb pcie related helpers
 5. check is it better for examples/ to run ioctl submit
 
-sample reference deepwiki
+sample reference repo ask with deepwiki mcp
 - allbilly/ane : examlpes/
 - allbilly/rk3588 : examlpes/
 - florianmattana/sass-king

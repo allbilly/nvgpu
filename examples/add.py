@@ -1,208 +1,191 @@
 #!/usr/bin/env python3
 import pathlib, struct, sys
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ref" / "tinygrad"))
-
 from tinygrad.device import Device
 from tinygrad.runtime.autogen import nv_570 as nv_gpu
 from tinygrad.runtime.support.hcq import HWQueue
-
 
 METHOD_NAMES = {int(getattr(nv_gpu, name)): name for name in dir(nv_gpu)
                 if name[:7] in {"NVC9B0_", "NVC6C0_", "NVC56F_", "NVC6B5_"} and isinstance(getattr(nv_gpu, name), int)}
 METHOD_NAMES[0x0020] = "NVC56F_NON_STALL_INTERRUPT"
 
+class CubinHelper:
+  class Reg:
+    RZ = 255
+    R0 = 0; R1 = 1; R2 = 2; R3 = 3; R4 = 4; R5 = 5; R6 = 6; R7 = 7
+    R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15
 
-def describe_args(method, args):
-  if method == 0x005c and len(args) == 5:
-    sem_addr = (args[1] << 32) | args[0]
-    payload = (args[3] << 32) | args[2]
-    return [f"sem_addr=0x{sem_addr:x}", f"payload={payload}", f"execute=0x{args[4]:08x}"]
-  if method == 0x1698 and len(args) == 1:
-    return [f"invalidate_flags=0x{args[0]:08x}"]
-  if method == 0x02b4 and len(args) == 1:
-    return [f"qmd_addr=0x{args[0] << 8:x}", f"qmd_addr_shifted8=0x{args[0]:x}"]
-  if method == 0x02c0 and len(args) == 1:
-    return [f"pcas2_action=0x{args[0]:x}"]
-  return [f"arg{i}=0x{arg:08x}" for i, arg in enumerate(args)]
+  class UReg:
+    URZ = 63
+    UR4 = 4  # only UR4 is used in our cubin
 
+  #  cuobjdump -sass   (closed-source NVIDIA disassembler; mnemonic + bytes)
+  #  cuasm sm_86       (open-source assembler, CuAsm/InsAsmRepos)
+  #  denvdis data11    (open-source 128-bit SASS spec, denvdis/data11/sm86_1.txt)
+  class Op:
+    LDC     = 0x7a02  # LDC / LDC.64 (alias: MOV).  denvdis 0xb82 family.
+    LDCU64  = 0x7ab9  # LDCU.64.                    denvdis ULDC_default 0xab9 — EXACT.
+    FADD    = 0x7221  # FADD / IMAD.WIDE.           denvdis FADD_Rb 0x221 — EXACT (low12).
+    FMUL    = 0x7220  # FMUL / IMAD.WIDE.           denvdis FMUL_v3 0x220 — EXACT (low12).
+    LDG     = 0x7981  # LDG descriptor pre-load.    denvdis LDG_R_dARI 0x981 — EXACT (low12).
+    STG     = 0x7986  # STG.E.                      denvdis STG_E 0xc86 family.
+    EXIT    = 0x794d  # EXIT.                       denvdis EXIT 0x94d — EXACT (low12).
+    BRA     = 0x7947  # BRA.                        denvdis BRA 0x947 — EXACT (low12).
+    NOP     = 0x7918  # NOP.                        denvdis NOP 0x918 — EXACT (low12).
 
-def decode_words(words):
-  index = 0
-  while index < len(words):
-    header = words[index]
-    typ, size, subc, method = (header >> 28) & 0xf, (header >> 16) & 0xfff, (header >> 13) & 0x7, (header << 2) & 0x7fff
-    args = words[index + 1:index + 1 + size]
-    yield index, typ, subc, method, METHOD_NAMES.get(method, f"UNKNOWN_0x{method:x}"), args
-    index += size + 1
+  SECTION_NAMES = (
+    ".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.E_4", ".nv.info.E_4", ".nv.shared.E_4",
+    ".nv.constant0.E_4", ".rel.nv.constant0.E_4", ".debug_frame", ".rel.debug_frame", ".rela.debug_frame", ".nv.callgraph",
+    ".nv.prototype", ".nv.rel.action"
+  )
+  SYMBOL_NAMES = (
+    ".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.E_4", ".nv.info.E_4", ".nv.shared.E_4",
+    ".rel.nv.constant0.E_4", ".nv.constant0.E_4", ".debug_frame", ".rel.debug_frame", ".rela.debug_frame", ".nv.callgraph",
+    ".nv.prototype", ".nv.rel.action", "E_4"
+  )
+  SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB, SHT_REL = 1, 2, 3, 9
+  SHT_CUDA_INFO, SHT_CUDA_CALLGRAPH, SHT_CUDA_RELOCINFO = 0x70000000, 0x70000001, 0x7000000b
+  SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHF_INFO_LINK = 1, 2, 4, 0x40
+  STB_GLOBAL, STT_SECTION, STT_FUNC = 1, 3, 2
+  PT_LOAD, PT_PHDR = 1, 6
+  PF_X, PF_R = 1, 4
+  ET_EXEC, EM_CUDA = 2, 190
+  EV_CURRENT, ELF_ABIVERSION, ELF_VERSION = 1, 7, 128
+  ELFOSABI_CUDA = 0x33
+  ELFCLASS64, ELFDATA2LSB = 2, 1
+  EF_CUDA_SM86 = 0x560556
+  ELF_HEADER_SIZE = 64
+  SECTION_HEADER_SIZE = 64
+  PROGRAM_HEADER_SIZE = 56
+  SECTION_HEADERS_OFF = 1920
+  PROGRAM_HEADERS_OFF = 2688
+  SHSTRTAB_OFF = 64
+  STRTAB_OFF = 283
+  SYMTAB_OFF = 512
+  DEBUG_FRAME_OFF = 680
+  NV_INFO_OFF = 792
+  NV_INFO_E4_OFF = 828
+  NV_CALLGRAPH_OFF = 932
+  NV_REL_ACTION_OFF = 968
+  REL_DEBUG_FRAME_OFF = 984
+  NV_CONSTANT0_OFF = 1000
+  NV_CONSTANT0_SIZE = 376
+  TEXT_OFF = 1408
+  @staticmethod
+  def string_table(names):
+    table, offsets = bytearray(b"\0"), {}
+    for name in names:
+      offsets[name] = len(table)
+      table += name.encode() + b"\0"
+    return bytes(table), offsets
 
+  @staticmethod
+  def words_blob(words): return b"".join(struct.pack("<I", w) for w in (words if isinstance(words, (list, tuple)) else (words,)))
 
-SHSTRTAB = b"\0.shstrtab\0.strtab\0.symtab\0.symtab_shndx\0.nv.info\0.text.E_4\0.nv.info.E_4\0.nv.shared.E_4\0.nv.constant0.E_4\0.rel.nv.constant0.E_4\0.debug_frame\0.rel.debug_frame\0.rela.debug_frame\0.nv.callgraph\0.nv.prototype\0.nv.rel.action\0"
-STRTAB = b"\0.shstrtab\0.strtab\0.symtab\0.symtab_shndx\0.nv.info\0.text.E_4\0.nv.info.E_4\0.nv.shared.E_4\0.rel.nv.constant0.E_4\0.nv.constant0.E_4\0.debug_frame\0.rel.debug_frame\0.rela.debug_frame\0.nv.callgraph\0.nv.prototype\0.nv.rel.action\0E_4\0"
-SYMTAB_WORDS = (0, 0, 0, 0, 0, 0, 50, 720899, 0, 0, 0, 0, 110, 655363, 0, 0, 0, 0, 128, 262147, 0, 0, 0, 0, 176, 458755, 0, 0, 0, 0, 204, 524291, 0, 0, 0, 0, 219, 725010, 0, 0, 512, 0)
-DEBUG_FRAME_WORDS = (4294967295, 36, 0, 4294967295, 4294967295, 2080636931, 4294967295, 2155940879, 134228096, 679510527, 2155905288, 40, 4294967295, 52, 0, 0, 0, 0, 0, 512, 0, 1028, 3933184, 2165047296, 2654336, 4294966276, 63, 0)
-NV_INFO_WORDS = (536324, 6, 14, 528644, 6, 0, 528900, 6, 0)
-NV_INFO_E4_WORDS = (276228, 128, 13569, 526852, 2, 1573216, 1579267, 792324, 0, 1048578, 2224128, 792324, 0, 524289, 2224128, 792324, 0, 0, 2224128, 16718595, 269316, 240, 787716, 1, 1, 1)
-NV_CALLGRAPH_WORDS = (0, 4294967295, 0, 4294967294, 0, 4294967293, 0, 4294967292)
-NV_REL_ACTION_WORDS = (115, 0, 285212672, 906297381)
-REL_DEBUG_FRAME_WORDS = (68, 0, 2, 6)
-SECTION_HEADERS = (
-  (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-  (1, 3, 0, 0, 64, 219, 0, 0, 1, 0),
-  (11, 3, 0, 0, 283, 223, 0, 0, 1, 0),
-  (19, 2, 0, 0, 512, 168, 2, 6, 8, 24),
-  (128, 1, 0, 0, 680, 112, 0, 0, 1, 0),
-  (41, 1879048192, 0, 0, 792, 36, 3, 0, 4, 0),
-  (60, 1879048192, 64, 0, 828, 104, 3, 11, 4, 0),
-  (176, 1879048193, 0, 0, 932, 32, 3, 0, 4, 8),
-  (204, 1879048203, 0, 0, 968, 16, 0, 0, 8, 8),
-  (141, 9, 64, 0, 984, 16, 3, 4, 8, 16),
-  (88, 1, 66, 0, 1000, 376, 0, 11, 4, 0),
-  (50, 1, 6, 0, 1408, 512, 3, 234881030, 128, 0),
-)
+  @staticmethod
+  def header(phoff, shoff, phnum, shnum, shstrndx):
+    ident = b"\x7fELF" + bytes((CubinHelper.ELFCLASS64, CubinHelper.ELFDATA2LSB, CubinHelper.EV_CURRENT, CubinHelper.ELFOSABI_CUDA, CubinHelper.ELF_ABIVERSION)) + bytes(7)
+    return struct.pack("<16sHHIQQQIHHHHHH", ident, CubinHelper.ET_EXEC, CubinHelper.EM_CUDA, CubinHelper.ELF_VERSION, 0, phoff, shoff, CubinHelper.EF_CUDA_SM86, 64, 56, phnum, 64, shnum, shstrndx)
 
+  @staticmethod
+  def symtab_entry(name, bind, typ, other, shndx, value=0, size=0): return struct.pack("<IBBHQQ", name, (bind << 4) | typ, other, shndx, value, size)
 
-# SASS bundles (4 little-endian u32 words each) for the .text.E_4 section of the
-# E_4(out, a, b) kernel. Each bundle is a single SASS instruction; the names below
-# are the cuobjdump -sass form.
-#
-# Spec (SASS source, for reference):
-SASS_SOURCE = """
-.visible .entry E_4(.param .u64 out, .param .u64 a, .param .u64 b) {
-  .reg .u64 %out, %a, %b;
-  .reg .f32 %a0,%a1,%a2,%a3, %b0,%b1,%b2,%b3, %r0,%r1,%r2,%r3;
-  ld.param.u64 %out, [out];
-  ld.param.u64 %a,   [a];
-  ld.param.u64 %b,   [b];
-  ld.global.v4.f32 {%a0,%a1,%a2,%a3}, [%a];
-  ld.global.v4.f32 {%b0,%b1,%b2,%b3}, [%b];
-  add.rn.f32 %r0, %a0, %b0;   // for mul, replace add.rn.f32 with mul.rn.f32
-  add.rn.f32 %r1, %a1, %b1;
-  add.rn.f32 %r2, %a2, %b2;
-  add.rn.f32 %r3, %a3, %b3;
-  st.global.v4.f32 [%out], {%r0,%r1,%r2,%r3};
-  ret;
-}
-"""
+  @staticmethod
+  def dwarf64_record(payload): return struct.pack("<IQ", 0xffffffff, len(payload)) + payload
 
-# SM86 SASS classes. Mirrors the Register/UniformRegister/Opcode tables in
-# denvdis/data11/sm86_1.txt and the assembler's CuAsm/InsAsmRepos sm_86
-# default repos. Each value is the 8-bit register index (or 16-bit opcode
-# field) as it appears in the SASS bundle.
-#
-# Register class: R0=0, R1=1, ..., RZ=255 (denvdis line 1865).
-class Reg:
-  RZ = 255
-  R0 = 0; R1 = 1; R2 = 2; R3 = 3; R4 = 4; R5 = 5; R6 = 6; R7 = 7
-  R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15
+  def cie_record(self):
+    cie_id, version, augmentation, address_size, segment_size = 0xffffffffffffffff, 3, 0, 4, 0x7c
+    code_align, data_align, return_register = 0xffffffff, 0x0f, 0x0c
+    frame_instructions = bytes((0x81, 0x80, 0x80, 0x28, 0x00, 0x08, 0xff, 0x81, 0x80, 0x28, 0x08, 0x81, 0x80, 0x80, 0x28, 0, 0, 0))
+    return self.dwarf64_record(struct.pack("<QBBBBIBB", cie_id, version, augmentation, address_size, segment_size, code_align, data_align, return_register) + frame_instructions)
 
-# Uniform Register class: UR0=0, UR1=1, ..., URZ=63.
-class UReg:
-  URZ = 63
-  UR4 = 4  # only UR4 is used in our cubin
+  def fde_record(self):
+    cie_pointer, initial_location, address_range = 0, 0, 512
+    frame_instructions = self.words_blob((0x404, 0x3c0400, 0x810c0000, 0x288080, 0xfffffc04, 0x3f, 0))
+    return self.dwarf64_record(struct.pack("<QQQ", cie_pointer, initial_location, address_range) + frame_instructions)
 
-# Opcode class: low 16 bits of word0. The high 4 bits of these (0x7000)
-# are a wait/yield opex field; the low 12 bits are the actual opcode.
-# Each value is cross-checked against:
-#   - cuobjdump -sass   (closed-source NVIDIA disassembler; mnemonic + bytes)
-#   - cuasm sm_86       (open-source assembler, CuAsm/InsAsmRepos)
-#   - denvdis data11    (open-source 128-bit SASS spec, denvdis/data11/sm86_1.txt)
-# Note: cuobjdump calls Op.LDC "MOV" (alias for the same SASS bytes on
-# SM86 — LDC and MOV are the same instruction, only the name differs).
-class Op:
-  LDC     = 0x7a02  # LDC / LDC.64 (alias: MOV).  denvdis 0xb82 family.
-  LDCU64  = 0x7ab9  # LDCU.64.                    denvdis ULDC_default 0xab9 — EXACT.
-  FADD    = 0x7221  # FADD / IMAD.WIDE.           denvdis FADD_Rb 0x221 — EXACT (low12).
-  FMUL    = 0x7220  # FMUL / IMAD.WIDE.           denvdis FMUL_v3 0x220 — EXACT (low12).
-  LDG     = 0x7981  # LDG descriptor pre-load.    denvdis LDG_R_dARI 0x981 — EXACT (low12).
-  STG     = 0x7986  # STG.E.                      denvdis STG_E 0xc86 family.
-  EXIT    = 0x794d  # EXIT.                       denvdis EXIT 0x94d — EXACT (low12).
-  BRA     = 0x7947  # BRA.                        denvdis BRA 0x947 — EXACT (low12).
-  NOP     = 0x7918  # NOP.                        denvdis NOP 0x918 — EXACT (low12).
+  def nv_info_attr(self, kind, selector, payload_words, format_byte=4): return self.words_blob(((kind << 12) | (selector << 8) | format_byte, *payload_words))
 
-# Bundle layout: each tuple is 4 little-endian u32 words forming one
-# 128-bit SASS instruction. Per-family field positions (per denvdis
-# sm86_1.txt):
-#   LDC / LDC.64 (Op.LDC):  word0 byte 2 = Rd, byte 3 = *Ra (offset reg)
-#   LDCU.64  (Op.LDCU64):   word0 byte 2 = URd
-#   FADD R_R_R (Op.FADD):   word0 byte 3 = Ra, byte 2 = Rd, word1 byte 0 = Rc
-#   LDG.E.128 (Op.LDG):     word0 byte 3 = Ra, byte 2 = Rd
-#   STG.E    (Op.STG):      word0 byte 3 = Rd
-#   EXIT/BRA/NOP:           no register field
-#
-# The PREFIX/LDC and ARITH/FADD comment names below reflect the
-# nvdisasm mnemonic and register list; the actual register byte values
-# are produced by the Reg.Rn / UReg.URn constants on the right side of
-# the shift expressions, so a name like "PREFIX_LDC_R1_C28" matches the
-# actual encoding (Rd = Reg.R1 = 1 at byte 2).
-PREFIX_LDC_R1_C28          = ((Reg.R1 << 16) | Op.LDC,    0x00000a00, 0x00000f00, 0x000fe400)  # MOV R1, c[0x0][0x28]
-PREFIX_LDC_R4_C170         = ((Reg.R4 << 16) | Op.LDC,    0x00005c00, 0x00000f00, 0x000fe200)  # MOV R4, c[0x0][0x170]
-PREFIX_LDCU64_UR4_C118     = ((UReg.UR4 << 16) | Op.LDCU64, 0x00004600, 0x00000a00, 0x000fe200)  # ULDC.64 UR4, c[0x0][0x118]
-PREFIX_LDC_R5_C174         = ((Reg.R5 << 16) | Op.LDC,    0x00005d00, 0x00000f00, 0x000fe400)  # MOV R5, c[0x0][0x174]
-PREFIX_LDC_R2_C168         = ((Reg.R2 << 16) | Op.LDC,    0x00005a00, 0x00000f00, 0x000fe400)  # MOV R2, c[0x0][0x168]
-PREFIX_LDC_R3_C16C         = ((Reg.R3 << 16) | Op.LDC,    0x00005b00, 0x00000f00, 0x000fe400)  # MOV R3, c[0x0][0x16c]
-PREFIX_LDG_R4_R4           = ((Reg.R4 << 24) | (Reg.R4 << 16) | Op.LDG, 0x00000004, 0x0c1e1d00, 0x000ea800)  # LDG.E.128 R4, [R4.64]
-PREFIX_LDG_R8_R2           = ((Reg.R2 << 24) | (Reg.R8 << 16) | Op.LDG, 0x00000004, 0x0c1e1d00, 0x000ea400)  # LDG.E.128 R8, [R2.64]
-ARITH_FADD_R11_R11_R7      = ((Reg.R11 << 24) | (Reg.R11 << 16) | Op.FADD, 0x00000007, 0x00000000, 0x004fe200)  # FADD R11, R11, R7
-ARITH_FADD_R10_R10_R6      = ((Reg.R10 << 24) | (Reg.R10 << 16) | Op.FADD, 0x00000006, 0x00000000, 0x000fe200)  # FADD R10, R10, R6
-ARITH_FADD_R9_R9_R5        = ((Reg.R9  << 24) | (Reg.R9  << 16) | Op.FADD, 0x00000005, 0x00000000, 0x000fe200)  # FADD R9, R9, R5
-ARITH_FADD_R8_R8_R4        = ((Reg.R8  << 24) | (Reg.R8 << 16) | Op.FADD, 0x00000004, 0x00000000, 0x000fe200)  # FADD R8, R8, R4              (the add)
-SUFFIX_LDC_R6_C160         = ((Reg.R6 << 16) | Op.LDC,    0x00005800, 0x00000f00, 0x000fc400)  # MOV R6, c[0x0][0x160]
-SUFFIX_LDC_R7_C164         = ((Reg.R7 << 16) | Op.LDC,    0x00005900, 0x00000f00, 0x000fca00)  # MOV R7, c[0x0][0x164]
-SUFFIX_STG_R6              = ((Reg.R6 << 24) | Op.STG,    0x00000008, 0x0c101d04, 0x000fe200)  # STG.E.128 [R6.64], R8
-SUFFIX_EXIT                = (Op.EXIT,                    0x00000000, 0x03800000, 0x000fea00)  # EXIT
-SUFFIX_BRA                 = (Op.BRA,                     0xfffffff0, 0x0383ffff, 0x000fc000)  # BRA .L_1
-NOP                        = (Op.NOP,                     0x00000000, 0x00000000, 0x000fc000)  # NOP
+  def section_header(self, name, typ, flags, addr, offset, size, link=0, info=0, align=1, entsize=0): return (self.SHN[name] if name else 0, typ, flags, addr, offset, size, link, info, align, entsize)
 
-SASS_COMMON_PREFIX = (
-  PREFIX_LDC_R1_C28,
-  PREFIX_LDC_R4_C170,
-  PREFIX_LDCU64_UR4_C118,
-  PREFIX_LDC_R5_C174,
-  PREFIX_LDC_R2_C168,
-  PREFIX_LDC_R3_C16C,
-  PREFIX_LDG_R4_R4,
-  PREFIX_LDG_R8_R2,
-)
-SASS_COMMON_SUFFIX = (
-  SUFFIX_LDC_R6_C160,
-  SUFFIX_LDC_R7_C164,
-  SUFFIX_STG_R6,
-  SUFFIX_EXIT,
-  SUFFIX_BRA,
-)
-SASS_ARITHMETIC = (ARITH_FADD_R11_R11_R7, ARITH_FADD_R10_R10_R6, ARITH_FADD_R9_R9_R5, ARITH_FADD_R8_R8_R4)  # add: FADD
+  def program_header(self, typ, flags, offset, filesz, memsz=None, vaddr=0, paddr=0, align=8): return (typ, flags, offset, vaddr, paddr, filesz, filesz if memsz is None else memsz, align)
+
+  def __init__(self):
+    self.SHSTRTAB, self.SHN = self.string_table(self.SECTION_NAMES)
+    self.STRTAB, self.STN = self.string_table(self.SYMBOL_NAMES)
+    self.SYMTAB = b"".join((
+      self.symtab_entry(0, 0, 0, 0, 0),
+      self.symtab_entry(self.STN[".text.E_4"], 0, self.STT_SECTION, 0, 11),
+      self.symtab_entry(self.STN[".nv.constant0.E_4"], 0, self.STT_SECTION, 0, 10),
+      self.symtab_entry(self.STN[".debug_frame"], 0, self.STT_SECTION, 0, 4),
+      self.symtab_entry(self.STN[".nv.callgraph"], 0, self.STT_SECTION, 0, 7),
+      self.symtab_entry(self.STN[".nv.rel.action"], 0, self.STT_SECTION, 0, 8),
+      self.symtab_entry(self.STN["E_4"], self.STB_GLOBAL, self.STT_FUNC, 0x10, 11, size=512),
+    ))
+    self.DEBUG_FRAME = self.cie_record() + self.fde_record()
+    self.NV_INFO = b"".join((
+      self.nv_info_attr(0x82, 0xf, (6, 14)),
+      self.nv_info_attr(0x81, 0x1, (6, 0)),
+      self.nv_info_attr(0x81, 0x2, (6, 0)),
+    ))
+    self.NV_INFO_E4 = b"".join((
+      self.nv_info_attr(0x43, 0x7, (128, 0x3501)),
+      self.nv_info_attr(0x80, 0xa, (2, 0x180160, 0x181903)),
+      self.nv_info_attr(0xc1, 0x7, (0, 0x100002, 0x21f000)),
+      self.nv_info_attr(0xc1, 0x7, (0, 0x80001, 0x21f000)),
+      self.nv_info_attr(0xc1, 0x7, (0, 0, 0x21f000)),
+      self.nv_info_attr(0xff1, 0xb, ((0x41 << 12) | (0xc << 8) | 4, 240), format_byte=3),
+      self.nv_info_attr(0xc0, 0x5, (1, 1, 1)),
+    ))
+    self.NV_CALLGRAPH = b"".join(struct.pack("<II", 0, target) for target in (0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc))
+    self.NV_REL_ACTION = struct.pack("<IIHHHH", 115, 0, 0, 0x1100, 0x0025, 0x3605)
+    self.REL_DEBUG_FRAME = struct.pack("<QQ", 68, (6 << 32) | 2)
+    self.SECTION_HEADERS = (
+      self.section_header("", 0, 0, 0, 0, 0, align=0),
+      self.section_header(".shstrtab", self.SHT_STRTAB, 0, 0, self.SHSTRTAB_OFF, len(self.SHSTRTAB)),
+      self.section_header(".strtab", self.SHT_STRTAB, 0, 0, self.STRTAB_OFF, len(self.STRTAB)),
+      self.section_header(".symtab", self.SHT_SYMTAB, 0, 0, self.SYMTAB_OFF, len(self.SYMTAB), link=2, info=6, align=8, entsize=24),
+      self.section_header(".debug_frame", self.SHT_PROGBITS, 0, 0, self.DEBUG_FRAME_OFF, len(self.DEBUG_FRAME)),
+      self.section_header(".nv.info", self.SHT_CUDA_INFO, 0, 0, self.NV_INFO_OFF, len(self.NV_INFO), link=3, align=4),
+      self.section_header(".nv.info.E_4", self.SHT_CUDA_INFO, self.SHF_INFO_LINK, 0, self.NV_INFO_E4_OFF, len(self.NV_INFO_E4), link=3, info=11, align=4),
+      self.section_header(".nv.callgraph", self.SHT_CUDA_CALLGRAPH, 0, 0, self.NV_CALLGRAPH_OFF, len(self.NV_CALLGRAPH), link=3, align=4, entsize=8),
+      self.section_header(".nv.rel.action", self.SHT_CUDA_RELOCINFO, 0, 0, self.NV_REL_ACTION_OFF, len(self.NV_REL_ACTION), align=8, entsize=8),
+      self.section_header(".rel.debug_frame", self.SHT_REL, self.SHF_INFO_LINK, 0, self.REL_DEBUG_FRAME_OFF, len(self.REL_DEBUG_FRAME), link=3, info=4, align=8, entsize=16),
+      self.section_header(".nv.constant0.E_4", self.SHT_PROGBITS, self.SHF_ALLOC | self.SHF_INFO_LINK, 0, self.NV_CONSTANT0_OFF, self.NV_CONSTANT0_SIZE, info=11, align=4),
+      self.section_header(".text.E_4", self.SHT_PROGBITS, self.SHF_ALLOC | self.SHF_EXECINSTR, 0, self.TEXT_OFF, 512, link=3, info=0x0e000006, align=128),
+    )
+    self.PROGRAM_HEADERS = (
+      self.program_header(self.PT_PHDR, self.PF_R | self.PF_X, self.PROGRAM_HEADERS_OFF, 168),
+      self.program_header(self.PT_LOAD, self.PF_R | self.PF_X, self.NV_CONSTANT0_OFF, 920),
+      self.program_header(self.PT_LOAD, self.PF_R | self.PF_X, self.PROGRAM_HEADERS_OFF, 168),
+    )
 
 
-def words_blob(words): return b"".join(struct.pack("<I", w) for w in (words if isinstance(words, (list, tuple)) else (words,)))
-
-
-def build_text(arithmetic_words):
-  bundles = [*SASS_COMMON_PREFIX, *arithmetic_words, *SASS_COMMON_SUFFIX, *[NOP] * 15]
-  return b"".join(words_blob(bundle) for bundle in bundles)
-
-
-def build_cubin(arithmetic_words):
-  cubin = bytearray(2856)
-  cubin[:64] = struct.pack("<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01\x33\x07" + bytes(7), 2, 190, 128, 0, 2688, 1920, 5637462, 64, 56, 3, 64, 12, 1)
-  text = build_text(arithmetic_words) if not isinstance(arithmetic_words, (bytes, bytearray)) else arithmetic_words
-  sections = {
-    64: SHSTRTAB, 283: STRTAB, 512: words_blob(SYMTAB_WORDS), 680: words_blob(DEBUG_FRAME_WORDS), 792: words_blob(NV_INFO_WORDS),
-    828: words_blob(NV_INFO_E4_WORDS), 932: words_blob(NV_CALLGRAPH_WORDS), 968: words_blob(NV_REL_ACTION_WORDS),
-    984: words_blob(REL_DEBUG_FRAME_WORDS), 1000: bytes(376), 1408: text,
-  }
-  for offset, data in sections.items(): cubin[offset:offset+len(data)] = data
-  for index, header in enumerate(SECTION_HEADERS): cubin[1920 + index * 64:1920 + (index + 1) * 64] = struct.pack("<IIQQQQIIQQ", *header)
-  phdrs = ((6, 5, 2688, 0, 0, 168, 168, 8), (1, 5, 1000, 0, 0, 920, 920, 8), (1, 5, 2688, 0, 0, 168, 168, 8))
-  for index, header in enumerate(phdrs): cubin[2688 + index * 56:2688 + (index + 1) * 56] = struct.pack("<IIQQQQQQ", *header)
-  return bytes(cubin)
-
-
-build_cubin(SASS_ARITHMETIC)
-
+ch = CubinHelper()
 
 def trace_submits():
+  def decode_words(words):
+    index = 0
+    while index < len(words):
+      header = words[index]
+      typ, size, subc, method = (header >> 28) & 0xf, (header >> 16) & 0xfff, (header >> 13) & 0x7, (header << 2) & 0x7fff
+      args = words[index + 1:index + 1 + size]
+      yield index, typ, subc, method, METHOD_NAMES.get(method, f"UNKNOWN_0x{method:x}"), args
+      index += size + 1
+  def describe_args(method, args):
+    if method == 0x005c and len(args) == 5:
+      sem_addr = (args[1] << 32) | args[0]
+      payload = (args[3] << 32) | args[2]
+      return [f"sem_addr=0x{sem_addr:x}", f"payload={payload}", f"execute=0x{args[4]:08x}"]
+    if method == 0x1698 and len(args) == 1:
+      return [f"invalidate_flags=0x{args[0]:08x}"]
+    if method == 0x02b4 and len(args) == 1:
+      return [f"qmd_addr=0x{args[0] << 8:x}", f"qmd_addr_shifted8=0x{args[0]:x}"]
+    if method == 0x02c0 and len(args) == 1:
+      return [f"pcas2_action=0x{args[0]:x}"]
+    return [f"arg{i}=0x{arg:08x}" for i, arg in enumerate(args)]
+
   real_submit = HWQueue.submit
   count = 0
   def traced_submit(self, dev, var_vals=None):
@@ -228,6 +211,50 @@ def trace_submits():
   HWQueue.submit = traced_submit
   return real_submit
 
+def build_cubin(): # nvdisasm add.cubin
+  bundles = [
+    # SASS_COMMON_PREFIX
+    ((ch.Reg.R1 << 16) | ch.Op.LDC,    0x00000a00, 0x00000f00, 0x000fe400),  # MOV R1, c[0x0][0x28]
+    ((ch.Reg.R4 << 16) | ch.Op.LDC,    0x00005c00, 0x00000f00, 0x000fe200),  # MOV R4, c[0x0][0x170]
+    ((ch.UReg.UR4 << 16) | ch.Op.LDCU64, 0x00004600, 0x00000a00, 0x000fe200),  # ULDC.64 UR4, c[0x0][0x118]
+    ((ch.Reg.R5 << 16) | ch.Op.LDC,    0x00005d00, 0x00000f00, 0x000fe400),  # MOV R5, c[0x0][0x174]
+    ((ch.Reg.R2 << 16) | ch.Op.LDC,    0x00005a00, 0x00000f00, 0x000fe400),  # MOV R2, c[0x0][0x168]
+    ((ch.Reg.R3 << 16) | ch.Op.LDC,    0x00005b00, 0x00000f00, 0x000fe400),  # MOV R3, c[0x0][0x16c]
+    ((ch.Reg.R4 << 24) | (ch.Reg.R4 << 16) | ch.Op.LDG, 0x00000004, 0x0c1e1d00, 0x000ea800),  # LDG.E.128 R4, [R4.64]
+    ((ch.Reg.R2 << 24) | (ch.Reg.R8 << 16) | ch.Op.LDG, 0x00000004, 0x0c1e1d00, 0x000ea400),  # LDG.E.128 R8, [R2.64]
+
+    # SASS_ARITHMETIC
+    ((ch.Reg.R11 << 24) | (ch.Reg.R11 << 16) | ch.Op.FADD, 0x00000007, 0x00000000, 0x004fe200),  # FADD R11, R11, R7
+    ((ch.Reg.R10 << 24) | (ch.Reg.R10 << 16) | ch.Op.FADD, 0x00000006, 0x00000000, 0x000fe200),  # FADD R10, R10, R6
+    ((ch.Reg.R9  << 24) | (ch.Reg.R9  << 16) | ch.Op.FADD, 0x00000005, 0x00000000, 0x000fe200),  # FADD R9, R9, R5
+    ((ch.Reg.R8  << 24) | (ch.Reg.R8 << 16) | ch.Op.FADD, 0x00000004, 0x00000000, 0x000fe200),    # FADD R8, R8, R4
+
+    # SASS_COMMON_SUFFIX
+    ((ch.Reg.R6 << 16) | ch.Op.LDC,    0x00005800, 0x00000f00, 0x000fc400),  # MOV R6, c[0x0][0x160]
+    ((ch.Reg.R7 << 16) | ch.Op.LDC,    0x00005900, 0x00000f00, 0x000fca00),  # MOV R7, c[0x0][0x164]
+    ((ch.Reg.R6 << 24) | ch.Op.STG,    0x00000008, 0x0c101d04, 0x000fe200),  # STG.E.128 [R6.64], R8
+    (ch.Op.EXIT,                    0x00000000, 0x03800000, 0x000fea00),  # EXIT
+    (ch.Op.BRA,                     0xfffffff0, 0x0383ffff, 0x000fc000),  # BRA .
+    ]
+  text = b"".join(ch.words_blob(bundle) for bundle in bundles)
+
+  SECTIONS = {
+    ch.SHSTRTAB_OFF: ch.SHSTRTAB, ch.STRTAB_OFF: ch.STRTAB, ch.SYMTAB_OFF: ch.SYMTAB,
+    ch.DEBUG_FRAME_OFF: ch.DEBUG_FRAME,
+    ch.NV_INFO_OFF: ch.NV_INFO, ch.NV_INFO_E4_OFF: ch.NV_INFO_E4, ch.NV_CALLGRAPH_OFF: ch.NV_CALLGRAPH, ch.NV_REL_ACTION_OFF: ch.NV_REL_ACTION,
+    ch.REL_DEBUG_FRAME_OFF: ch.REL_DEBUG_FRAME,
+    ch.NV_CONSTANT0_OFF: bytes(ch.NV_CONSTANT0_SIZE), ch.TEXT_OFF: text,
+  }
+
+  cubin = bytearray(2856)
+  cubin[:ch.ELF_HEADER_SIZE] = ch.header(phoff=ch.PROGRAM_HEADERS_OFF, shoff=ch.SECTION_HEADERS_OFF, phnum=len(ch.PROGRAM_HEADERS), shnum=len(ch.SECTION_HEADERS), shstrndx=1)
+  for offset, data in SECTIONS.items():
+    cubin[offset:offset+len(data)] = data
+  for index, header in enumerate(ch.SECTION_HEADERS):
+    cubin[ch.SECTION_HEADERS_OFF + index * ch.SECTION_HEADER_SIZE:ch.SECTION_HEADERS_OFF + (index + 1) * ch.SECTION_HEADER_SIZE] = struct.pack("<IIQQQQIIQQ", *header)
+  for index, header in enumerate(ch.PROGRAM_HEADERS):
+    cubin[ch.PROGRAM_HEADERS_OFF + index * ch.PROGRAM_HEADER_SIZE:ch.PROGRAM_HEADERS_OFF + (index + 1) * ch.PROGRAM_HEADER_SIZE] = struct.pack("<IIQQQQQQ", *header)
+  return bytes(cubin)
 
 def main():
   dev = Device["NV"]
@@ -238,12 +265,13 @@ def main():
   dev.allocator._copyin(a, memoryview(struct.pack("4f", 1.0, 2.0, 3.0, 4.0)))
   dev.allocator._copyin(b, memoryview(struct.pack("4f", 10.0, 20.0, 30.0, 40.0)))
   dev.allocator._copyin(out, memoryview(bytes(16)))
-  program = dev.runtime("E_4", build_cubin(SASS_ARITHMETIC))
+  program = dev.runtime("E_4", build_cubin())
   real_submit = trace_submits()
   try:
     program(out, a, b, global_size=(1, 1, 1), local_size=(1, 1, 1), wait=True)
   finally:
     HWQueue.submit = real_submit
+
   result_bytes = bytearray(16)
   dev.allocator._copyout(memoryview(result_bytes), out)
   print(f"result={list(struct.unpack('4f', result_bytes))}")
