@@ -5,12 +5,28 @@ with simple python, not even tinygrad
 
 # examples
 
-Run the hand-built add cubin through the local example helper:
+Run the no-hardware validation suite for the hand-built add cubin and standalone backend:
+
+```bash
+python3 examples/add.py --validation-suite
+python3 examples/mul.py --validation-suite
+```
+
+Before a live eGPU run, use the strict transport preflight gate. It stops before GSP/RM work if TinyGPU or PCIe visibility is not ready:
+
+```bash
+NV_ADD_TRANSPORT=mac-egpu python3 examples/add.py --transport-preflight-plan --require-ready
+```
+
+When the preflight reports `ready-for-gsp`, run the hand-built add cubin through the local example helper:
 
 ```bash
 python3 examples/add.py
 # result=[11.0, 22.0, 33.0, 44.0]
 ```
+
+The default live run enables GSP boot plus golden-context preparation. Set `NV_ADD_BOOT_GSP=0` and
+`NV_ADD_PREPARE_GOLDEN_CTX=0` only when intentionally testing the narrower non-booted path.
 
 # cuda tools on macos
 

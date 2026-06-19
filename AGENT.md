@@ -10,3 +10,7 @@ sample reference repo ask with deepwiki mcp
 - SzymonOzog/GPU_Programming
 - gpuasm.com
 - redplait/denvdis
+- daadaada/turingas
+- hkust-adsl/gass
+- gpgpu-sim/gpgpu-sim_distribution
+- Tim453/ClusterSim
