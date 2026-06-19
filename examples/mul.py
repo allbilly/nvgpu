@@ -134,7 +134,7 @@ def main():
     assert "standalone_log_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1" in live_log_text
     assert "python3 examples/mul.py 2>&1 | tee standalone-golden.log" in live_log_text
     assert "compare_command python3 examples/mul.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in live_log_text
-    assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence" in live_log_text
+    assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence" in live_log_text
     live_stack_log_buf = io.StringIO()
     with contextlib.redirect_stdout(live_stack_log_buf): print_live_stack_log_workflow("examples/mul.py")
     live_stack_log_text = live_stack_log_buf.getvalue()
@@ -143,7 +143,7 @@ def main():
     assert "standalone_log_command NV_ADD_TRACE_RM_STACK=1 NV_ADD_TRACE_CHANNEL_STACK=1 NV_ADD_TRACE_LAUNCH_STACK=1 NV_ADD_TRACE_FALCON=1" in live_stack_log_text
     assert "python3 examples/mul.py 2>&1 | tee standalone-stack.log" in live_stack_log_text
     assert "compare_command python3 examples/mul.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log" in live_stack_log_text
-    assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence" in live_stack_log_text
+    assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence" in live_stack_log_text
     assert "workflow_check stack inspect trace_log_compare_stack, trace_log_compare_falcon" in live_stack_log_text
     old_argv = sys.argv[:]
     try:

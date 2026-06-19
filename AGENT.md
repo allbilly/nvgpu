@@ -1,4 +1,5 @@
 understand how tinygrad NV backend works, by reimplemetation simple add in pure python
+use ~/nvgpu
 
 sample reference repo ask with deepwiki mcp
 - allbilly/ane : examlpes/

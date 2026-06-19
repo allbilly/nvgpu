@@ -375,6 +375,75 @@
         "timestamp": 1781700659262
       },
       "focused": true
+    },
+    {
+      "goalId": "7eb8b6d9-9df8-4286-a477-0cdaef204ea1",
+      "condition": "contineue debug and implement all tasks in @TODO.md",
+      "successCriteria": "",
+      "constraints": "",
+      "mode": "normal",
+      "sessionID": "ses_1244b1f98ffeIFwTP1VQeTRZcn",
+      "turnCount": 0,
+      "startedAt": 1781813405368,
+      "totalTokens": 224957,
+      "options": {
+        "maxTurns": 10,
+        "maxDurationMs": 900000,
+        "maxTokens": 200000,
+        "minDelayMs": 1500,
+        "maxRecentMessages": 50,
+        "noProgressTokenThreshold": 50,
+        "noProgressTurnsBeforePause": 2,
+        "noToolCallTurnsBeforePause": 2,
+        "budgetWrapupRatio": 0.8,
+        "warnTurnsRemaining": 3,
+        "warnDurationMsRemaining": 60000,
+        "warnTokensRemaining": 25000,
+        "maxPromptFailures": 3,
+        "resultRetentionMs": 604800000,
+        "maxStoredResults": 200
+      },
+      "lastStatus": "max context tokens reached (200,000); requested final handoff.",
+      "lastAssistantText": "## Handoff Summary\n\n**Goal not yet achieved.** Live `python3 examples/add.py` still hangs at FECS PMU mutex timeout despite identical WPR meta, FRTS, booter, and GSP image to tinygrad's working run. All offline tests pass.\n\n### Verified passing offline\n- `python3 -m py_compile examples/add.py examples/mul.py examples/add_tiny.py` → ok\n- `python3 examples/add.py --selftest` → `selftest=ok`\n- `python3 examples/mul.py --selftest` → `selftest=ok`\n- `python3 examples/add_tiny.py --trace-selftest` → `trace_selftest=ok`\n\n### Code changes preserved from prior sessions (all in `~/nvgpu/examples/add.py`)\n- PMU FALCON constants at lines 809-811: `NV_PPMU_FALCON_ENGINE = 0x10A3C0`, `NV_FALCON_PMU_BASE = 0x10A000`\n- `FalconController.engine_reg` (1714-1720) and `FalconController.reset` (1791-1804) handle all three FALCONs\n- Opt-in PMU FALCON reset in `boot_ampere_ada` (3187-3194), gated by `NV_ADD_PMU_RESET=1` (default off; live testing showed it's a regression)\n- Selftest (11128-11160) verifies the PMU reset\n\n### Live test results (eGPU ready-for-gsp)\n- **Default (no PMU reset)**: stalls at `RMGpioPmuMutexTimeoutus|9b2w` after `FECS_A|FECS_B|FECS_C|GR_STATUS` POST_NOCAT events, then `ASSERT|...|BKD`. PMU FALCON never responds.\n- **PMU FALCON reset enabled (regression)**: PMU FALCON reads back as `cpuctl=0xbadf5720` before *and* after the engine reset, and the reset moves the failure *earlier* to `Falcon CPU did not halt` on the SEC2 booter.\n- **WPR2 BAR1 readback**: registers at `0x1FA828/0x1FA824` return values that don't decode cleanly to a valid WPR2 base; the readback was removed.\n\n### What remains\n1. The next concrete diagnostic is to compare GSP/RM init post_nocat event sequences between a working tinygrad run and the failing standalone run on the same eGPU. The existing `trace_log_compare` rows already print this.\n2. The FECS firmware in WPR2 runs but the PMU FALCON never responds to the handshake. PMU is initialized by FWSEC (not host code), so host-side PMU FALCON reset is not the right fix.\n3. **Live test command**: `NV_ADD_TRANSPORT=mac-egpu python3 examples/add.py --live-log-workflow`\n\n### Files to inspect\n- `~/nvgpu/examples/add.py:809-811` — PMU FALCON constants\n- `~/nvgpu/examples/add.py:3187-3194` — opt-in PMU FALCON reset\n- `~/nvgpu/examples/add.py:11128-11160` — PMU reset selftest\n- `~/nvgpu/TODO.md:218-220` — Current State\n\n[goal:blocked] Live test still hangs at FECS PMU mutex timeout. All offline tests pass. PMU FALCON reset (NV_ADD_PMU_RESET=1) regresses the boot to SEC2 failure. WPR2 BAR1 readback failed because the WPR2_ADDR_HI/LO registers return values that don't decode to valid VRAM addresses. Need a live eGPU session to compare GSP/RM init messages against tinygrad on the same hardware, or to extend the GSP RM VA allocator to read back the WPR2 region through a temporary VA mapping in BAR1.",
+      "lastAssistantMessageID": "msg_edc5b34960011WLspiGxYpIJBP",
+      "lastContinueAt": 0,
+      "lastProgressAt": 1781813458379,
+      "noProgressTurns": 0,
+      "noToolCallTurns": 0,
+      "blockedReason": "",
+      "budgetWrapupSent": true,
+      "stopped": true,
+      "stopReason": "max context tokens reached (200,000)",
+      "promptFailures": 0,
+      "messageIDs": [
+        "msg_edc5ae83e001Y1KQO8FbukFqxB",
+        "msg_edc5b34960011WLspiGxYpIJBP",
+        "msg_edc5b5e8c00102eW05ST3lYKTX",
+        "msg_edc5b9d7c001zzPkLVvXZU5oQj"
+      ],
+      "history": [
+        {
+          "type": "set",
+          "detail": "Goal created with limits: 10 auto-continues, 900s, 200,000 context tokens.",
+          "timestamp": 1781813405368
+        },
+        {
+          "type": "limit",
+          "detail": "max context tokens reached (200,000); requested a final handoff.",
+          "timestamp": 1781813435996
+        }
+      ],
+      "checkpoints": [
+        {
+          "summary": "## Handoff Summary **Goal not yet achieved.** Live `python3 examples/add.py` still hangs at FECS PMU mutex timeout despite identical WPR meta, FRTS, booter, and GSP image to tinygrad's working run. All offline tests pass. ### Verified passing offline - `python3 -m py_compile exa…",
+          "timestamp": 1781813435996
+        }
+      ],
+      "lastCheckpoint": {
+        "summary": "## Handoff Summary **Goal not yet achieved.** Live `python3 examples/add.py` still hangs at FECS PMU mutex timeout despite identical WPR meta, FRTS, booter, and GSP image to tinygrad's working run. All offline tests pass. ### Verified passing offline - `python3 -m py_compile exa…",
+        "timestamp": 1781813435996
+      },
+      "focused": true
     }
   ],
   "results": [],
