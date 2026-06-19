@@ -805,8 +805,16 @@ NV_PGSP_QUEUE_HEAD_0 = 0x110C00
 NV_PBUS_BAR1_BLOCK = 0x1704
 NV_PGSP_FALCON_ENGINE = 0x1103C0
 NV_PSEC_FALCON_ENGINE = 0x8403C0
+NV_PPMU_FALCON_ENGINE = 0x10A3C0
 NV_FALCON_GSP_BASE = 0x110000
 NV_FALCON_SEC2_BASE = 0x840000
+NV_FALCON_PMU_BASE = 0x10A000
+NV_FALCON_FECS_BASES = {
+  "ga102": 0xA04000,
+  "ad102": 0xA04000,
+  "gb202": 0xA04000,
+}
+NV_PFECS_FALCON_ENGINE_OFFSET = 0x3C0
 NV_PFALCON_FALCON_MAILBOX0 = 0x40
 NV_PFALCON_FALCON_MAILBOX1 = 0x44
 NV_PFALCON_FALCON_OS = 0x80
@@ -888,6 +896,7 @@ NV01_MEMORY_VIRTUAL = 0x70
 NV01_ROOT = 0x0
 NV01_DEVICE_0 = 0x80
 NV01_MEMORY_SYSTEM_OS_DESCRIPTOR = 0x71
+NV01_MEMORY_LIST_SYSTEM = 0x81
 NV20_SUBDEVICE_0 = 0x2080
 FERMI_VASPACE_A = 0x90F1
 FERMI_CONTEXT_SHARE_A = 0x9067
@@ -898,6 +907,7 @@ AMPERE_COMPUTE_B = 0xC7C0
 ADA_COMPUTE_A = 0xC9C0
 GT200_DEBUGGER = 0x83DE
 NV2080_ENGINE_TYPE_GRAPHICS = 1
+NV2080_ENGINE_TYPE_COMPUTE = 0
 NVA06C_CTRL_CMD_GPFIFO_SCHEDULE = 0xA06C0101
 NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN = 0xC36F0108
 NVC56F_CONTROL_GP_PUT_OFFSET = 140
@@ -1545,7 +1555,7 @@ class StandaloneNvShell:
     transport.write_config(PCI_COMMAND, pci_command | PCI_COMMAND_MASTER, 2)
     transport.read_config(PCI_COMMAND, 2)
     self.regs = NVRegisters(transport)
-    if self.regs.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI) != 0 and hasattr(self.transport, "reset"):
+    if self.regs.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI) != 0 and hasattr(self.transport, "reset") and os.environ.get("NV_ADD_SKIP_PCI_RESET") != "1":
       if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
         print("standalone WPR2 already initialized; resetting PCI device")
       self.transport.write_config(PCI_COMMAND, self.transport.read_config(PCI_COMMAND, 2) & ~PCI_COMMAND_MASTER, 2)
@@ -1577,6 +1587,12 @@ class StandaloneNvShell:
   def fw_name(self): return self.chip.fw_name
   @property
   def vram_size(self): return self.chip.vram_size
+
+  def fecs_falcon_base(self):
+    base = NV_FALCON_FECS_BASES.get(self.chip.fw_name)
+    if base is None: raise ValueError(f"FECS FALCON base is unknown for firmware {self.chip.fw_name}")
+    return base
+  def fecs_falcon_engine(self): return self.fecs_falcon_base() + NV_PFECS_FALCON_ENGINE_OFFSET
 
   def rreg(self, addr): return self.regs.rreg(addr)
   def wreg(self, addr, value): self.regs.wreg(addr, value)
@@ -1703,11 +1719,16 @@ class FalconController:
   def wreg(self, base, offset, value):
     addr = base + offset
     if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
-      base_name = "GSP" if base == NV_FALCON_GSP_BASE else ("SEC2" if base == NV_FALCON_SEC2_BASE else f"BASE_0x{base:x}")
+      base_name = "GSP" if base == NV_FALCON_GSP_BASE else ("SEC2" if base == NV_FALCON_SEC2_BASE else ("PMU" if base == NV_FALCON_PMU_BASE else ("FECS" if base in NV_FALCON_FECS_BASES.values() else f"BASE_0x{base:x}")))
       name = FALCON_WRITE_NAMES.get(offset, f"0x{offset:x}")
       print(f"falcon wreg {base_name}.{name} addr=0x{addr:x} value=0x{value:x}")
     self.shell.wreg(addr, value)
-  def engine_reg(self, base): return NV_PGSP_FALCON_ENGINE if base == NV_FALCON_GSP_BASE else NV_PSEC_FALCON_ENGINE
+  def engine_reg(self, base):
+    if base == NV_FALCON_GSP_BASE: return NV_PGSP_FALCON_ENGINE
+    if base == NV_FALCON_SEC2_BASE: return NV_PSEC_FALCON_ENGINE
+    if base == NV_FALCON_PMU_BASE: return NV_PPMU_FALCON_ENGINE
+    if base in NV_FALCON_FECS_BASES.values(): return base + NV_PFECS_FALCON_ENGINE_OFFSET
+    raise ValueError(f"unknown Falcon base 0x{base:x}")
   def state_snapshot(self, base):
     regs = {
       "engine": self.shell.rreg(self.engine_reg(base)),
@@ -1784,8 +1805,17 @@ class FalconController:
   def wait_cpu_halted(self, base):
     self.wait_until(lambda: reg_get(self.rreg(base, NV_PFALCON_FALCON_CPUCTL), 4, 4) == 1, "Falcon CPU did not halt")
 
-  def reset(self, base, riscv=False):
-    engine = NV_PGSP_FALCON_ENGINE if base == NV_FALCON_GSP_BASE else NV_PSEC_FALCON_ENGINE
+  def reset(self, base, riscv=False, force=False):
+    if not hasattr(self.shell, "chip") or self.shell.chip is None: raise RuntimeError("Falcon reset requires chip info")
+    engine = self.engine_reg(base)
+    if force:
+      cpuctl = self.rreg(base, NV_PFALCON_FALCON_CPUCTL)
+      if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
+        print(f"falcon reset force pre cpuctl=0x{cpuctl:x} base=0x{base:x}")
+      self.wreg(base, NV_PFALCON_FALCON_CPUCTL, 0)
+      self.shell.transport.sleep(10)
+      self.wreg(base, NV_PFALCON_FALCON_DMACTL, 0)
+      self.wreg(base, NV_PFALCON_FALCON_DMATRFCMD, 0)
     self.shell.wreg(engine, 1)
     self.shell.transport.sleep(100)
     self.shell.wreg(engine, 0)
@@ -1796,6 +1826,10 @@ class FalconController:
       self.wreg(base, NV_PRISCV_RISCV_BCR_CTRL, 0)
       self.wait_until(lambda: reg_get(self.rreg(base, NV_PRISCV_RISCV_BCR_CTRL), 0, 0) == 1, "RISCV core did not boot")
       self.wreg(base, NV_PFALCON_FALCON_RM, self.shell.chip.pmc_boot_0)
+    if force:
+      post_cpuctl = self.rreg(base, NV_PFALCON_FALCON_CPUCTL)
+      if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
+        print(f"falcon reset force post cpuctl=0x{post_cpuctl:x} base=0x{base:x}")
 
   def execute_hs(self, base, img_paddr, code_off, data_off, imem_pa, imem_va, imem_size,
                  dmem_pa, dmem_va, dmem_size, pkc_off, engid, ucodeid, mailbox=None):
@@ -3176,6 +3210,35 @@ class StandaloneGspBootstrap:
     self.validate_boot_paddr_list(self.booter_loader_paddrs, "booter-loader")
     self.validate_boot_paddr_list(self.queue_memory.libos_args_paddrs, "LibOS args")
     falcon = FalconController(self.shell, timeout_ms=30000)
+    if os.environ.get("NV_ADD_PMU_RESET") == "1":
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone pmu-reset pre state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+      try:
+        falcon.reset(NV_FALCON_PMU_BASE, riscv=True, force=os.environ.get("NV_ADD_PMU_RESET_FORCE") == "1")
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone pmu-reset post state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+      except Exception as exc:
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone pmu-reset skipped reason={type(exc).__name__}: {exc}")
+    if os.environ.get("NV_ADD_CLEAR_WPR2_FECS") == "1" and hasattr(self, "frts_offset"):
+      clear_paddr = self.shell.vram_size - (1 << 20) - 0x100000
+      _, clear_bar1_size = self.shell.transport.bar_info(1)
+      if clear_paddr + 0x100000 <= clear_bar1_size and self.shell.mm is not None:
+        clear_view = self.shell.transport.map_bar(1).view(clear_paddr, 0x100000)
+        clear_view[:] = bytes(0x100000)
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone wpr2-fecs cleared vram=0x{clear_paddr:x} size=0x100000")
+    if os.environ.get("NV_ADD_FECS_RESET") == "1":
+      fecs_base = self.shell.fecs_falcon_base()
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone fecs-reset pre state=({falcon.format_state(fecs_base)})")
+      try:
+        falcon.reset(fecs_base, riscv=True, force=os.environ.get("NV_ADD_FECS_RESET_FORCE") == "1")
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone fecs-reset post state=({falcon.format_state(fecs_base)})")
+      except Exception as exc:
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone fecs-reset skipped reason={type(exc).__name__}: {exc}")
     if hasattr(self, "frts_vram_paddr"):
       self.validate_boot_desc(self.frts_desc, ("imem_load_size", "imem_phys_base", "imem_virt_base", "dmem_phys_base",
         "dmem_load_size", "pkc_data_offset", "engine_id_mask", "ucode_id"), "FRTS")
@@ -3187,6 +3250,16 @@ class StandaloneGspBootstrap:
         dmem_size=self.frts_desc["dmem_load_size"], pkc_off=self.frts_desc["pkc_data_offset"],
         engid=self.frts_desc["engine_id_mask"], ucodeid=self.frts_desc["ucode_id"])
       if self.shell.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI) == 0: raise RuntimeError("WPR2 is not initialized")
+      if os.environ.get("NV_ADD_VERIFY_WPR2_AFTER_FRTS") == "1" and hasattr(self, "frts_offset"):
+        verify_paddr = self.shell.vram_size - (1 << 20) - 0x100000
+        _, verify_bar1_size = self.shell.transport.bar_info(1)
+        if verify_paddr + 0x100000 <= verify_bar1_size:
+          verify_view = self.shell.transport.map_bar(1).view(verify_paddr, 0x100000)
+          verify_bytes = bytes(verify_view[:])
+          nonzero_pages = sum(1 for off in range(0, len(verify_bytes), 0x1000) if any(verify_bytes[off:off + 0x1000]))
+          verify_digest = hashlib.sha256(verify_bytes).hexdigest()
+          if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+            print(f"standalone wpr2-fecs-after-frts vram=0x{verify_paddr:x} nonzero_pages={nonzero_pages} sha256={verify_digest}")
     falcon.reset(NV_FALCON_GSP_BASE, riscv=True)
     self.shell.wreg(NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_MAILBOX0, lo32(self.queue_memory.libos_args_paddrs[0]))
     self.shell.wreg(NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_MAILBOX1, hi32(self.queue_memory.libos_args_paddrs[0]))
@@ -3217,11 +3290,41 @@ class StandaloneGspBootstrap:
     falcon.wait_until(lambda: self._clear_bar1_block(), "BAR1 block did not clear")
     if getattr(self.shell.chip, "fmc_boot", False):
       self.shell.wreg(NV_PBUS_BAR1_BLOCK + 0x4, 0)
+    self.post_init_fecs_reset()
     return init_done
 
   def _clear_bar1_block(self):
     self.shell.wreg(NV_PBUS_BAR1_BLOCK, 0)
     return self.shell.rreg(NV_PBUS_BAR1_BLOCK) == 0
+
+  def post_init_fecs_reset(self, force=False):
+    if os.environ.get("NV_ADD_FECS_RESET_POSTINIT") != "1": return False
+    if not hasattr(self.shell, "fecs_falcon_base"): return False
+    if not hasattr(self.shell, "chip") or self.shell.chip is None: return False
+    falcon = FalconController(self.shell, timeout_ms=30000)
+    pmu_forced = os.environ.get("NV_ADD_PMU_RESET_POSTINIT_FORCE") == "1" or os.environ.get("NV_ADD_PMU_RESET_POSTINIT") == "1"
+    if os.environ.get("NV_ADD_PMU_RESET_POSTINIT") == "1":
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone pmu-reset-postinit pre state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+      try:
+        falcon.reset(NV_FALCON_PMU_BASE, riscv=True, force=pmu_forced)
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone pmu-reset-postinit post state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+      except Exception as exc:
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone pmu-reset-postinit skipped reason={type(exc).__name__}: {exc}")
+    fecs_base = self.shell.fecs_falcon_base()
+    if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+      print(f"standalone fecs-reset-postinit pre state=({falcon.format_state(fecs_base)})")
+    try:
+      falcon.reset(fecs_base, riscv=True, force=force or os.environ.get("NV_ADD_FECS_RESET_POSTINIT_FORCE") == "1")
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone fecs-reset-postinit post state=({falcon.format_state(fecs_base)})")
+      return True
+    except Exception as exc:
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone fecs-reset-postinit skipped reason={type(exc).__name__}: {exc}")
+      return False
 
   def make_rm_client(self):
     if self.cmd_q is None: raise RuntimeError("prepare_queues must run first")
@@ -3465,11 +3568,17 @@ class StandaloneChannelBuilder:
   def __init__(self, shell, rm):
     self.shell, self.rm = shell, rm
 
-  def allocate_base_objects(self):
+  def allocate_base_objects(self, reserved_size=512 << 20):
+    validate_positive_size(reserved_size, "user reserved size")
+    validate_u64(reserved_size, "user reserved size")
     h_device = self.rm.rm_alloc(self.rm.priv_root, NV01_DEVICE_0, pack_nv0080_alloc_parameters(h_client_share=self.rm.priv_root))
     h_subdevice = self.rm.rm_alloc(h_device, NV20_SUBDEVICE_0, pack_nv2080_alloc_parameters())
     h_virtmem = self.rm.rm_alloc(h_device, NV01_MEMORY_VIRTUAL, pack_nv_memory_virtual_allocation_params())
     h_vaspace = self.rm.rm_alloc(h_device, FERMI_VASPACE_A, pack_nv_vaspace_allocation_params(flags=1 | 2))
+    res_va = self.shell.mm.alloc_vaddr(reserved_size)
+    levels = self.shell.mm.reserved_pde_levels(res_va, 3, reserved_size)
+    pde_payload = pack_nv90f1_copy_server_reserved_pdes(reserved_size, res_va, res_va + reserved_size - 1, levels)
+    self.rm.rm_control(h_vaspace, NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES, pde_payload)
     return h_device, h_subdevice, h_virtmem, h_vaspace
 
   def prepare_golden_image_context(self, allocator, reserved_size=512 << 20):
@@ -3609,7 +3718,8 @@ class StandaloneChannelBuilder:
       userd_paddr = gpfifo_paddr + entries * 8 + offset
       gpfifo_params = pack_nv_channel_gpfifo_allocation_params(gpfifo_area.va_addr + offset, entries, h_ctxshare, h_vaspace,
         h_virtmem, gpfifo_area.meta.hMemory, entries * 8 + offset, ramfc_paddr, method_paddr,
-        error_paddr=notifier_paddr, h_object_error=notifier_buf.meta.hMemory, userd_paddr=userd_paddr)
+        error_paddr=notifier_paddr, h_object_error=notifier_buf.meta.hMemory, userd_paddr=userd_paddr,
+        engine_type=NV2080_ENGINE_TYPE_COMPUTE, cid=0, flags=0)
       gpfifo_desc = gpfifo_memory_desc_summary(gpfifo_params)
       trace_channel_step("compute_gpfifo_alloc", parent=hex(h_channel_group), channel_group=hex(h_channel_group),
         ctxshare=hex(h_ctxshare), entries=entries, area=hex(gpfifo_area.va_addr + offset),
@@ -3793,8 +3903,14 @@ class GspRmClient:
       except Exception as exc: gsp_state = f"unavailable:{type(exc).__name__}"
       try: sec2_state = falcon.format_state(NV_FALCON_SEC2_BASE)
       except Exception as exc: sec2_state = f"unavailable:{type(exc).__name__}"
+      try: pmu_state = falcon.format_state(NV_FALCON_PMU_BASE)
+      except Exception as exc: pmu_state = f"unavailable:{type(exc).__name__}"
+      try:
+        fecs_base = shell.fecs_falcon_base()
+        fecs_state = falcon.format_state(fecs_base)
+      except Exception as exc: fecs_state = f"unavailable:{type(exc).__name__}"
     else:
-      gsp_state = sec2_state = "unavailable"
+      gsp_state = sec2_state = pmu_state = fecs_state = "unavailable"
     detail = "".join(f" {name}={value}" for name, value in fields.items())
     cmd_queue_state = self.queue_debug_state(self.cmd_q)
     stat_queue_state = self.queue_debug_state(self.stat_q) if self.stat_q is not self.cmd_q else cmd_queue_state
@@ -3815,7 +3931,7 @@ class GspRmClient:
           f"class=0x{h_class:x} class_name={rm_class_name(h_class)} bar1={reg(NV_PBUS_BAR1_BLOCK)} "
           f"wpr2_hi={reg(NV_PFB_PRI_MMU_WPR2_ADDR_HI)} cmd_wp={view_word(getattr(self.cmd_q, 'tx_view', None), 4)} "
           f"stat_rp={view_word(getattr(self.stat_q, 'rx_view', None), 0)}{detail}{qtrace} "
-          f"gsp=({gsp_state}) sec2=({sec2_state})")
+          f"gsp=({gsp_state}) sec2=({sec2_state}) pmu=({pmu_state}) fecs=({fecs_state})")
 
   def alloc_root(self, wait=True):
     validate_wait_flag(wait, "RM alloc wait flag")
@@ -4348,9 +4464,18 @@ def print_runtime_summary():
 def print_reconnect_command(script="examples/add.py"):
   print(f"reconnect_command {recommended_reconnect_command(script)}")
 
+def recommended_fecs_reset_reconnect_command(script="examples/add.py"):
+  fecs_flags = ["NV_ADD_PREPARE_GOLDEN_CTX=1", "NV_ADD_BOOT_GSP=1", "NV_ADD_CLEAR_WPR2_FECS=1", "NV_ADD_FECS_RESET=1", "NV_ADD_FECS_RESET_FORCE=1",
+    "NV_ADD_FECS_RESET_POSTINIT=1", "NV_ADD_FECS_RESET_POSTINIT_FORCE=1", "NV_ADD_PMU_RESET_POSTINIT=1", "NV_ADD_PMU_RESET_POSTINIT_FORCE=1",
+    "NV_ADD_VERIFY_WPR2_AFTER_FRTS=1", "NV_ADD_SUMMARY=1", "NV_ADD_CHECK_FRTS_BAR1=1", "NV_ADD_TRACE_GSP_BOOT=1",
+    "NV_ADD_VERIFY_SEC2_INPUTS=1", "NV_ADD_TRACE_RM_ALLOC=1", "NV_ADD_TRACE_RM_STATE=1", "NV_ADD_TRACE_RPC=1",
+    "NV_ADD_TRACE_RPC_READ=1", "NV_ADD_TRACE_CHANNEL=1", "NV_ADD_TRACE_MM_ALLOC=1", "NV_ADD_TRACE_LAUNCH_STEPS=1", "NV_ADD_TRACE_FALCON=1"]
+  return " ".join(["NV_ADD_TRANSPORT=mac-egpu"] + fecs_flags + ["python3", script])
+
 def print_reconnect_commands(script="examples/add.py"):
   print(f"reconnect_command fixed-gpfifo {recommended_reconnect_command(script, golden=False)}")
   print(f"reconnect_command golden-context {recommended_reconnect_command(script, golden=True)}")
+  print(f"reconnect_command fecs-reset {recommended_fecs_reset_reconnect_command(script)}")
 
 def print_live_debug_commands(script="examples/add.py", tiny_script="examples/add_tiny.py"):
   print(f"preflight_plan_command {recommended_preflight_plan_command(script)}")
@@ -4368,7 +4493,7 @@ def live_log_workflow_lines(script="examples/add.py", tiny_script="examples/add_
     f"standalone_log_command {recommended_reconnect_command(script, golden=True)} 2>&1 | tee {standalone_log}",
     f"tiny_log_command {recommended_tiny_trace_command(tiny_script)} 2>&1 | tee {tiny_log}",
     f"compare_command python3 {script} --compare-trace-logs --standalone-log {standalone_log} --tiny-log {tiny_log}",
-    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence",
+    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence",
     "workflow_rule run standalone_log_command only after gate result is ready-for-gsp",
     "workflow_rule run tiny_log_command in the same eGPU session if standalone stalls or times out",
   ]
@@ -4387,7 +4512,7 @@ def live_stack_log_workflow_lines(script="examples/add.py", tiny_script="example
     f"standalone_log_command {recommended_stack_reconnect_command(script, golden=True)} 2>&1 | tee {standalone_log}",
     f"tiny_log_command {recommended_tiny_trace_command(tiny_script)} 2>&1 | tee {tiny_log}",
     f"compare_command python3 {script} --compare-trace-logs --standalone-log {standalone_log} --tiny-log {tiny_log}",
-    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence",
+    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence",
     "workflow_check stack inspect trace_log_compare_stack, trace_log_compare_falcon",
     "workflow_rule use this only when Python call-path stacks are needed; it is verbose",
     "workflow_rule run standalone_log_command only after gate result is ready-for-gsp",
@@ -5415,6 +5540,67 @@ def compute_rpc_trace_sha(text, side):
   line = first_trace_line(text, ("tiny compute_alloc",))
   return extract_trace_field(line, "rpc_sha256") if line else None
 
+def extract_post_nocat_event_entries(text, side):
+  entries = []
+  if side == "standalone":
+    response_prefix = "standalone read_rpc "
+    log_prefix = "GSP EVENT post_nocat "
+  else:
+    response_prefix = "tiny read_rpc "
+    response_yield_prefix = "tiny read_rpc_yield "
+    log_prefix = None
+  event_func = "EVENT_GSP_POST_NOCAT_RECORD"
+  for line in text.splitlines():
+    matched = False
+    if line.startswith(response_prefix) or (side == "tiny" and line.startswith(response_yield_prefix)):
+      func_name = extract_trace_field(line, "func_name")
+      func = extract_trace_field(line, "func")
+      if (func_name or func) == event_func:
+        matched = True
+    elif log_prefix is not None and line.startswith(log_prefix):
+      matched = True
+    if not matched: continue
+    decode = extract_line_post_nocat_decode(line)
+    if decode is None: continue
+    entries.append({"decode": decode, "kind": decode.get("kind", "missing"),
+                    "strings": decode.get("strings", "missing"),
+                    "qwords": decode.get("qwords", "missing")})
+  return entries
+
+def format_post_nocat_event_sequence(entries, field):
+  if not entries: return None
+  return ">".join(entry.get(field) or "missing" for entry in entries)
+
+def compare_trace_log_gsp_post_nocat_sequence(standalone_text, tiny_text):
+  standalone_entries = extract_post_nocat_event_entries(standalone_text, "standalone")
+  tiny_entries = extract_post_nocat_event_entries(tiny_text, "tiny")
+  standalone_kinds = [entry["kind"] for entry in standalone_entries]
+  tiny_kinds = [entry["kind"] for entry in tiny_entries]
+  prefix = common_prefix(standalone_kinds, tiny_kinds)
+  standalone_strings = format_post_nocat_event_sequence(standalone_entries, "strings")
+  tiny_strings = format_post_nocat_event_sequence(tiny_entries, "strings")
+  standalone_kinds_seq = format_post_nocat_event_sequence(standalone_entries, "kind")
+  tiny_kinds_seq = format_post_nocat_event_sequence(tiny_entries, "kind")
+  standalone_qwords = format_post_nocat_event_sequence(standalone_entries, "qwords")
+  tiny_qwords = format_post_nocat_event_sequence(tiny_entries, "qwords")
+  return {
+    "label": "gsp_post_nocat_sequence",
+    "standalone_value": standalone_kinds_seq,
+    "tiny_value": tiny_kinds_seq,
+    "standalone_strings": standalone_strings,
+    "tiny_strings": tiny_strings,
+    "standalone_qwords": standalone_qwords,
+    "tiny_qwords": tiny_qwords,
+    "common_prefix": ">".join(prefix) if prefix else None,
+    "standalone_next": standalone_kinds[len(prefix)] if len(standalone_kinds) > len(prefix) else None,
+    "tiny_next": tiny_kinds[len(prefix)] if len(tiny_kinds) > len(prefix) else None,
+    "prefix_len": len(prefix),
+    "standalone_count": len(standalone_kinds),
+    "tiny_count": len(tiny_kinds),
+    "match": standalone_kinds == tiny_kinds,
+    "required": False,
+  }
+
 def next_gsp_rpc_observation_after_send(text, send_prefix, read_prefix, send_sha256, include_tiny_yield=False):
   if not send_sha256: return None
   lines = text.splitlines()
@@ -6090,6 +6276,18 @@ def format_trace_log_gsp_rpc_response_sequence_comparison(row):
           f"result_match={row['result_match']} hash_match={row['hash_match']} "
           f"status={status}")
 
+def format_trace_log_gsp_post_nocat_sequence_comparison(row):
+  if row["standalone_value"] and row["tiny_value"]:
+    status = "match" if row["match"] else "diverge"
+  else:
+    status = "optional-missing"
+  return (f"trace_log_compare_gsp_post_nocat_sequence standalone={row['standalone_value'] or 'missing'} "
+          f"tiny={row['tiny_value'] or 'missing'} common_prefix={row['common_prefix'] or 'none'} "
+          f"standalone_next={row['standalone_next'] or 'none'} tiny_next={row['tiny_next'] or 'none'} "
+          f"prefix_len={row['prefix_len']} standalone_count={row['standalone_count']} tiny_count={row['tiny_count']} "
+          f"standalone_strings={row['standalone_strings'] or 'missing'} tiny_strings={row['tiny_strings'] or 'missing'} "
+          f"status={status}")
+
 def format_trace_log_compute_rpc_response_comparison(row):
   if row["standalone_value"] and row["tiny_value"]:
     status = "match" if row["match"] else "diverge"
@@ -6176,6 +6374,8 @@ def print_trace_log_comparison(standalone_log, tiny_log):
   for line in format_trace_log_gsp_system_info_comparison(gsp_system_info_rows):
     print(line)
   print(format_trace_log_gsp_rpc_response_sequence_comparison(gsp_rpc_response_sequence_row))
+  gsp_post_nocat_row = compare_trace_log_gsp_post_nocat_sequence(standalone_text, tiny_text)
+  print(format_trace_log_gsp_post_nocat_sequence_comparison(gsp_post_nocat_row))
   print(format_trace_log_compute_rpc_response_comparison(compute_rpc_response_row))
   for line in comparison_lines[1:]:
     print(line)
@@ -9195,6 +9395,7 @@ def selftest():
     assert reconnect_lines == [
       f"reconnect_command fixed-gpfifo {recommended_reconnect_command(golden=False)}",
       f"reconnect_command golden-context {recommended_reconnect_command(golden=True)}",
+      f"reconnect_command fecs-reset {recommended_fecs_reset_reconnect_command()}",
     ]
     reconnect_buf = io.StringIO()
     with contextlib.redirect_stdout(reconnect_buf): print_reconnect_commands("examples/mul.py")
@@ -9206,6 +9407,7 @@ def selftest():
       f"preflight_plan_command {recommended_preflight_plan_command()}",
       f"reconnect_command fixed-gpfifo {recommended_reconnect_command(golden=False)}",
       f"reconnect_command golden-context {recommended_reconnect_command(golden=True)}",
+      f"reconnect_command fecs-reset {recommended_fecs_reset_reconnect_command()}",
       "live_log_workflow_command python3 examples/add.py --live-log-workflow",
       "live_stack_log_workflow_command python3 examples/add.py --live-stack-log-workflow",
       "tiny_live_stack_log_workflow_command python3 examples/add_tiny.py --live-stack-log-workflow --standalone-script examples/add.py",
@@ -9220,7 +9422,7 @@ def selftest():
       f"standalone_log_command {recommended_reconnect_command(golden=True)} 2>&1 | tee standalone-golden.log",
       f"tiny_log_command {recommended_tiny_trace_command()} 2>&1 | tee tiny-golden.log",
       "compare_command python3 examples/add.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log",
-      "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence",
+      "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence",
       "workflow_rule run standalone_log_command only after gate result is ready-for-gsp",
       "workflow_rule run tiny_log_command in the same eGPU session if standalone stalls or times out",
     ]
@@ -9233,7 +9435,7 @@ def selftest():
       f"standalone_log_command {recommended_stack_reconnect_command(golden=True)} 2>&1 | tee standalone-stack.log",
       f"tiny_log_command {recommended_tiny_trace_command()} 2>&1 | tee tiny-stack.log",
       "compare_command python3 examples/add.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log",
-      "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence",
+      "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence",
       "workflow_check stack inspect trace_log_compare_stack, trace_log_compare_falcon",
       "workflow_rule use this only when Python call-path stacks are needed; it is verbose",
       "workflow_rule run standalone_log_command only after gate result is ready-for-gsp",
@@ -9657,6 +9859,55 @@ def selftest():
       compare_trace_log_text(standalone_sample, tiny_sample),
       compare_trace_log_fields(standalone_sample, tiny_sample),
       [[compute_rpc_response]])[0] == "trace_log_compare result=mismatch missing=compute_rpc_response"
+    gsp_post_nocat_standalone = "\n".join([
+      "standalone read_rpc rp=0 wp=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 advance=1 result=0x0 private=0x0 sha256=ev1 post_nocat=qwords=0x0,0xa179f300,0x5 kind=0x5 strings=ASSERT|GFW_BOOT_PROGRESS_N",
+      "GSP EVENT post_nocat len=0x4bc qwords=0x0,0xd09d5180,0x2 kind=0x2 strings=Display Subsystem|FECS_A|PCIe Engine",
+      "standalone read_rpc rp=3 wp=4 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 advance=1 result=0x0 private=0x0 sha256=ev2 post_nocat=qwords=0x0,0xf9a24560,0x3 kind=0x3 strings=FECS_A|FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus|0%",
+      "standalone read_rpc rp=4 wp=5 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 advance=1 result=0x0 private=0x0 sha256=ev3 post_nocat=qwords=0x0,0xf9a3b6a0,0x3 kind=0x3 strings=FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus|9b2w",
+    ])
+    gsp_post_nocat_tiny = "\n".join([
+      "tiny read_rpc rp=0 wp=1 advance=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 result=0x0 private=0x0 sha256=ev1 post_nocat=qwords=0x0,0xa179f300,0x5 kind=0x5 strings=ASSERT|GFW_BOOT_PROGRESS_N",
+      "tiny read_rpc_yield rp=0 wp=1 advance=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 result=0x0 private=0x0 sha256=ev1 post_nocat=qwords=0x0,0xa179f300,0x5 kind=0x5 strings=ASSERT|GFW_BOOT_PROGRESS_N",
+      "tiny read_rpc rp=1 wp=2 advance=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 result=0x0 private=0x0 sha256=ev2 post_nocat=qwords=0x0,0xd09d5180,0x2 kind=0x2 strings=Display Subsystem|FECS_A|PCIe Engine",
+      "tiny read_rpc_yield rp=2 wp=3 advance=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 result=0x0 private=0x0 sha256=ev3 post_nocat=qwords=0x0,0xbee42860,0x2 kind=0x2 strings=Display Subsystem|PCIe",
+    ])
+    gsp_post_nocat_row = compare_trace_log_gsp_post_nocat_sequence(gsp_post_nocat_standalone, gsp_post_nocat_tiny)
+    gsp_post_nocat_line = format_trace_log_gsp_post_nocat_sequence_comparison(gsp_post_nocat_row)
+    assert "trace_log_compare_gsp_post_nocat_sequence " in gsp_post_nocat_line
+    assert gsp_post_nocat_row["standalone_count"] == 4
+    assert gsp_post_nocat_row["tiny_count"] == 4
+    assert gsp_post_nocat_row["prefix_len"] == 1
+    assert gsp_post_nocat_row["standalone_strings"].startswith("ASSERT|GFW_BOOT_PROGRESS_N>Display")
+    assert gsp_post_nocat_row["tiny_strings"].startswith("ASSERT|GFW_BOOT_PROGRESS_N>ASSERT")
+    assert "RMGpioPmuMutexTimeoutus" in (gsp_post_nocat_row["standalone_strings"] or "")
+    assert "RMGpioPmuMutexTimeoutus" not in (gsp_post_nocat_row["tiny_strings"] or "")
+    assert gsp_post_nocat_row["match"] is False
+    assert gsp_post_nocat_row["standalone_next"] == "0x2"
+    assert gsp_post_nocat_row["tiny_next"] == "0x5"
+    gsp_post_nocat_standalone_dup = "\n".join([
+      "standalone read_rpc rp=0 wp=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 advance=1 result=0x0 private=0x0 sha256=ev1 post_nocat=qwords=0x0,0xa179f300,0x5 kind=0x5 strings=ASSERT|GFW_BOOT_PROGRESS_N",
+      "standalone read_rpc rp=1 wp=2 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 advance=1 result=0x0 private=0x0 sha256=ev2 post_nocat=qwords=0x0,0xbee42860,0x2 kind=0x2 strings=Display|PCIe",
+    ])
+    gsp_post_nocat_tiny_dup = "\n".join([
+      "tiny read_rpc rp=0 wp=1 advance=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 result=0x0 private=0x0 sha256=ev1 post_nocat=qwords=0x0,0xa179f300,0x5 kind=0x5 strings=ASSERT|GFW_BOOT_PROGRESS_N",
+      "tiny read_rpc rp=1 wp=2 advance=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD len=1244 result=0x0 private=0x0 sha256=ev2 post_nocat=qwords=0x0,0xbee42860,0x2 kind=0x2 strings=Display|PCIe",
+    ])
+    gsp_post_nocat_match = compare_trace_log_gsp_post_nocat_sequence(gsp_post_nocat_standalone_dup, gsp_post_nocat_tiny_dup)
+    assert gsp_post_nocat_match["match"] is True and gsp_post_nocat_match["prefix_len"] == 2
+    gsp_post_nocat_empty = compare_trace_log_gsp_post_nocat_sequence("", "")
+    assert gsp_post_nocat_empty["standalone_count"] == 0 and gsp_post_nocat_empty["tiny_count"] == 0
+    assert gsp_post_nocat_empty["match"] is True and gsp_post_nocat_empty["prefix_len"] == 0
+    assert format_trace_log_gsp_post_nocat_sequence_comparison(gsp_post_nocat_empty).startswith(
+      "trace_log_compare_gsp_post_nocat_sequence standalone=missing tiny=missing ")
+    gsp_post_nocat_only_standalone = compare_trace_log_gsp_post_nocat_sequence(gsp_post_nocat_standalone, "")
+    assert gsp_post_nocat_only_standalone["standalone_count"] == 4 and gsp_post_nocat_only_standalone["tiny_count"] == 0
+    assert gsp_post_nocat_only_standalone["match"] is False and gsp_post_nocat_only_standalone["prefix_len"] == 0
+    gsp_post_nocat_only_tiny = compare_trace_log_gsp_post_nocat_sequence("", gsp_post_nocat_tiny)
+    assert gsp_post_nocat_only_tiny["match"] is False and gsp_post_nocat_only_tiny["prefix_len"] == 0
+    gsp_post_nocat_no_events = compare_trace_log_gsp_post_nocat_sequence(
+      "standalone read_rpc rp=0 wp=1 func=103 func_name=GSP_RM_ALLOC len=64 advance=1 result=0x0 private=0x0 sha256=r0",
+      "tiny read_rpc rp=0 wp=1 func=103 func_name=GSP_RM_ALLOC len=64 advance=1 result=0x0 private=0x0 sha256=r0")
+    assert gsp_post_nocat_no_events["match"] is True and gsp_post_nocat_no_events["standalone_count"] == 0
     standalone_stack_sample = standalone_sample + "\n" + "\n".join([
       "channel golden_start: reserved_size=536870912",
       '  File "/Users/yeren/nvgpu/examples/add.py", line 1, in main',
@@ -9897,7 +10148,7 @@ def selftest():
     assert "standalone golden_compute_alloc parent=0xcf000004 object=0xcf000005" in offline_debug_text
     assert "standalone context_promote label=user_phys entries=3 ids=[0, 1, 2]" in offline_debug_text
     assert "standalone gpfifo_constructor parent=0xcf000000 object=0xcf000002 gpfifo_class=0xc56f" in offline_debug_text
-    assert "gpfifo_va=0x1000000000 entries=4 flags=0x200320" in offline_debug_text
+    assert "gpfifo_va=0x1000000000 entries=4 flags=0x0" in offline_debug_text
     assert "standalone gpfifo_desc name=userd base=0x90000020 size=0x20" in offline_debug_text
     assert "standalone runtime_compute_alloc parent=0xcf000002 object=0xcf000003" in offline_debug_text
     assert "standalone launch arithmetic=add result=[11.0, 22.0, 33.0, 44.0]" in offline_debug_text
@@ -10967,6 +11218,8 @@ def selftest():
     def sleep(self, timeout_ms): pass
   class FakeChip:
     chip_id = 0x12345678
+    pmc_boot_0 = 0x12345678
+    fw_name = "ga102"
   class FakeShell:
     def __init__(self):
       self.transport, self.chip, self.regs, self.writes = FakeTransport(), FakeChip(), {}, []
@@ -10976,6 +11229,11 @@ def selftest():
       self.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FBIF_CTL] = 0x110
       self.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FBIF_TRANSCFG0] = 0x110
       self.regs[NV_FALCON_GSP_BASE + NV_PRISCV_RISCV_BCR_CTRL] = 1
+    def fecs_falcon_base(self):
+      base = NV_FALCON_FECS_BASES.get(self.chip.fw_name)
+      if base is None: raise ValueError(f"FECS FALCON base is unknown for firmware {self.chip.fw_name}")
+      return base
+    def fecs_falcon_engine(self): return self.fecs_falcon_base() + NV_PFECS_FALCON_ENGINE_OFFSET
     def rreg(self, addr): return self.regs.get(addr, 0)
     def wreg(self, addr, value):
       self.writes.append((addr, value))
@@ -11092,6 +11350,394 @@ def selftest():
   boot.booter_loader_vram_paddr = 0x456000
   boot.booter_loader_paddrs = [0x300000]
   boot.booter_loader_desc = {"code_offset": 0x110, "data_offset": 0x220, "code_size": 0x330, "data_size": 0x440}
+  pmu_fake = FakeShell()
+  pmu_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+  pmu_falcon = FalconController(pmu_fake)
+  pmu_falcon.reset(NV_FALCON_PMU_BASE, riscv=True)
+  assert (NV_PPMU_FALCON_ENGINE, 1) in pmu_fake.writes
+  assert (NV_PPMU_FALCON_ENGINE, 0) in pmu_fake.writes
+  assert (NV_FALCON_PMU_BASE + NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8)) in pmu_fake.writes
+
+  pmu_fake_force = FakeShell()
+  pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+  pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+  pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMACTL] = 0x40
+  pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x10
+  pmu_falcon_force = FalconController(pmu_fake_force)
+  pmu_falcon_force.reset(NV_FALCON_PMU_BASE, riscv=True, force=True)
+  force_writes = pmu_fake_force.writes
+  assert (NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL, 0) in force_writes
+  assert (NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMACTL, 0) in force_writes
+  assert (NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD, 0) in force_writes
+  assert (NV_PPMU_FALCON_ENGINE, 1) in force_writes
+  assert (NV_PPMU_FALCON_ENGINE, 0) in force_writes
+  assert (NV_FALCON_PMU_BASE + NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8)) in force_writes
+  cpuctl_idx = force_writes.index((NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL, 0))
+  engine_set_idx = force_writes.index((NV_PPMU_FALCON_ENGINE, 1))
+  assert cpuctl_idx < engine_set_idx
+  engine_clear_idx = force_writes.index((NV_PPMU_FALCON_ENGINE, 0))
+  bcr_idx = force_writes.index((NV_FALCON_PMU_BASE + NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8)))
+  assert engine_clear_idx < bcr_idx
+  pmu_fake_no_force = FakeShell()
+  pmu_fake_no_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+  pmu_fake_no_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+  pmu_falcon_no_force = FalconController(pmu_fake_no_force)
+  pmu_falcon_no_force.reset(NV_FALCON_PMU_BASE, riscv=True)
+  no_force_writes = pmu_fake_no_force.writes
+  assert (NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL, 0) not in no_force_writes
+  assert (NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMACTL, 0) not in no_force_writes
+  assert (NV_PPMU_FALCON_ENGINE, 1) in no_force_writes
+  assert (NV_PPMU_FALCON_ENGINE, 0) in no_force_writes
+  try:
+    no_chip_fake = FakeShell()
+    no_chip_fake.chip = None
+    no_chip_falcon = FalconController(no_chip_fake)
+    no_chip_falcon.reset(NV_FALCON_PMU_BASE, riscv=True, force=True)
+    raise AssertionError("force reset without chip info was accepted")
+  except RuntimeError as exc:
+    assert "chip" in str(exc)
+
+  ga102_fake = FakeShell()
+  assert ga102_fake.fecs_falcon_base() == 0xA04000
+  assert ga102_fake.fecs_falcon_engine() == 0xA04000 + NV_PFECS_FALCON_ENGINE_OFFSET
+  ad102_fake = FakeShell()
+  ad102_fake.chip.fw_name = "ad102"
+  assert ad102_fake.fecs_falcon_base() == 0xA04000
+  gb202_fake = FakeShell()
+  gb202_fake.chip.fw_name = "gb202"
+  assert gb202_fake.fecs_falcon_base() == 0xA04000
+  unknown_fake = FakeShell()
+  unknown_fake.chip.fw_name = "unknown"
+  try:
+    unknown_fake.fecs_falcon_base()
+    raise AssertionError("unknown firmware FECS FALCON base was accepted")
+  except ValueError as exc:
+    assert "FECS FALCON base" in str(exc)
+  fecs_fake = FakeShell()
+  fecs_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+  fecs_falcon = FalconController(fecs_fake)
+  fecs_base = NV_FALCON_FECS_BASES["ga102"]
+  fecs_falcon.format_state(fecs_base)
+  assert fecs_falcon.engine_reg(fecs_base) == fecs_base + NV_PFECS_FALCON_ENGINE_OFFSET
+
+  fecs_fenced = FakeShell()
+  fecs_fenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+  fecs_fenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+  fecs_fenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMACTL] = 0x40
+  fecs_fenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMATRFCMD] = 0x10
+  fecs_fenced_falcon = FalconController(fecs_fenced)
+  fecs_fenced_falcon.reset(NV_FALCON_FECS_BASES["ga102"], riscv=True, force=True)
+  fenced_writes = fecs_fenced.writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL, 0) in fenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMACTL, 0) in fenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMATRFCMD, 0) in fenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 1) in fenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 0) in fenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8)) in fenced_writes
+  fecs_cpuctl_idx = fenced_writes.index((NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL, 0))
+  fecs_engine_set_idx = fenced_writes.index((NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 1))
+  assert fecs_cpuctl_idx < fecs_engine_set_idx
+
+  fecs_unfenced = FakeShell()
+  fecs_unfenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+  fecs_unfenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+  fecs_unfenced_falcon = FalconController(fecs_unfenced)
+  fecs_unfenced_falcon.reset(NV_FALCON_FECS_BASES["ga102"], riscv=True)
+  unfenced_writes = fecs_unfenced.writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL, 0) not in unfenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMACTL, 0) not in unfenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMATRFCMD, 0) not in unfenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 1) in unfenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 0) in unfenced_writes
+
+  old_fecs_reset = os.environ.get("NV_ADD_FECS_RESET")
+  try:
+    fecs_skip_fake = FakeShell()
+    fecs_skip_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+    os.environ.pop("NV_ADD_FECS_RESET", None)
+    fecs_skip_outer = object.__new__(StandaloneGspBootstrap)
+    fecs_skip_outer.shell, fecs_skip_outer.queue_memory = fecs_skip_fake, boot.queue_memory
+    fecs_skip_outer.wpr_meta_sysmem = boot.wpr_meta_sysmem
+    fecs_skip_outer.booter_loader_vram_paddr, fecs_skip_outer.booter_loader_paddrs = boot.booter_loader_vram_paddr, boot.booter_loader_paddrs
+    fecs_skip_outer.booter_loader_desc = dict(boot.booter_loader_desc)
+    fecs_skip_outer.booter_loader_image, fecs_skip_outer.booter_loader_view = b"", MMIOView(bytearray(b""))
+    fecs_skip_outer.booter_image, fecs_skip_outer.booter_view = b"", MMIOView(bytearray(b""))
+    fecs_skip_outer.gsp_radix3_view, fecs_skip_outer.gsp_signature_view = MMIOView(bytearray(b"")), MMIOView(bytearray(b""))
+    fecs_skip_outer.wpr_meta_view, fecs_skip_outer.wpr_meta_blob = MMIOView(bytearray(b"")), b""
+    fecs_engine_addr = NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET
+    fecs_skip_fake.regs[fecs_engine_addr] = 0
+    fecs_skip_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+    fecs_skip_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+    fecs_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_skip_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PRISCV_RISCV_CPUCTL] = 0x80
+    fecs_skip_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_skip_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_skip_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_skip_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_skip_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    old_hs, old_wait = FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done
+    try:
+      FalconController.execute_hs = lambda self, *a, **kw: (0, 0)
+      StandaloneGspBootstrap.wait_init_done = lambda self: b""
+      writes_before = len(fecs_skip_fake.writes)
+      with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+        StandaloneGspBootstrap.boot_ampere_ada(fecs_skip_outer)
+      fecs_engine_writes = [w for w in fecs_skip_fake.writes[writes_before:] if w[0] == fecs_engine_addr]
+      assert fecs_engine_writes == [], f"FECS reset was not skipped when NV_ADD_FECS_RESET is unset (got {fecs_engine_writes})"
+    finally:
+      FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done = old_hs, old_wait
+  finally:
+    if old_fecs_reset is None: os.environ.pop("NV_ADD_FECS_RESET", None)
+    else: os.environ["NV_ADD_FECS_RESET"] = old_fecs_reset
+
+  old_fecs_reset, old_fecs_reset_force = os.environ.get("NV_ADD_FECS_RESET"), os.environ.get("NV_ADD_FECS_RESET_FORCE")
+  try:
+    fecs_active_fake = FakeShell()
+    fecs_active_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_active_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+    fecs_active_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+    fecs_active_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_active_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_active_fake.regs[NV_FALCON_GSP_BASE + NV_PRISCV_RISCV_CPUCTL] = 0x80
+    fecs_active_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_active_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_active_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_active_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_active_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_active_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_active_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_active_outer = object.__new__(StandaloneGspBootstrap)
+    fecs_active_outer.shell, fecs_active_outer.queue_memory = fecs_active_fake, boot.queue_memory
+    fecs_active_outer.wpr_meta_sysmem = boot.wpr_meta_sysmem
+    fecs_active_outer.booter_loader_vram_paddr, fecs_active_outer.booter_loader_paddrs = boot.booter_loader_vram_paddr, boot.booter_loader_paddrs
+    fecs_active_outer.booter_loader_desc = dict(boot.booter_loader_desc)
+    fecs_active_outer.booter_loader_image, fecs_active_outer.booter_loader_view = b"", MMIOView(bytearray(b""))
+    fecs_active_outer.booter_image, fecs_active_outer.booter_view = b"", MMIOView(bytearray(b""))
+    fecs_active_outer.gsp_radix3_view, fecs_active_outer.gsp_signature_view = MMIOView(bytearray(b"")), MMIOView(bytearray(b""))
+    fecs_active_outer.wpr_meta_view, fecs_active_outer.wpr_meta_blob = MMIOView(bytearray(b"")), b""
+    os.environ["NV_ADD_FECS_RESET"], os.environ["NV_ADD_FECS_RESET_FORCE"] = "1", "1"
+    old_hs, old_wait = FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done
+    try:
+      FalconController.execute_hs = lambda self, *a, **kw: (0, 0)
+      StandaloneGspBootstrap.wait_init_done = lambda self: b""
+      writes_before = len(fecs_active_fake.writes)
+      with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+        StandaloneGspBootstrap.boot_ampere_ada(fecs_active_outer)
+      fecs_active_engine_writes = [w for w in fecs_active_fake.writes[writes_before:]
+        if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
+      assert fecs_active_engine_writes, "FECS reset was not executed when NV_ADD_FECS_RESET_FORCE=1"
+      assert (1, 0) in [(w[1], fecs_active_fake.writes[i + 1][1]) for i, w in enumerate(fecs_active_fake.writes[writes_before:]) if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET], "FECS engine toggle did not go 1->0"
+    finally:
+      FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done = old_hs, old_wait
+  finally:
+    if old_fecs_reset is None: os.environ.pop("NV_ADD_FECS_RESET", None)
+    else: os.environ["NV_ADD_FECS_RESET"] = old_fecs_reset
+    if old_fecs_reset_force is None: os.environ.pop("NV_ADD_FECS_RESET_FORCE", None)
+    else: os.environ["NV_ADD_FECS_RESET_FORCE"] = old_fecs_reset_force
+
+  old_postinit, old_postinit_force = os.environ.get("NV_ADD_FECS_RESET_POSTINIT"), os.environ.get("NV_ADD_FECS_RESET_POSTINIT_FORCE")
+  try:
+    fecs_postinit_fake = FakeShell()
+    fecs_postinit_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_postinit_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+    fecs_postinit_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+    fecs_postinit_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_postinit_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    fecs_postinit_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_postinit_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_postinit_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_postinit_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    fecs_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    fecs_postinit_outer = object.__new__(StandaloneGspBootstrap)
+    fecs_postinit_outer.shell, fecs_postinit_outer.queue_memory = fecs_postinit_fake, boot.queue_memory
+    os.environ["NV_ADD_FECS_RESET_POSTINIT"] = "1"
+    os.environ["NV_ADD_FECS_RESET_POSTINIT_FORCE"] = "1"
+    old_hs, old_wait = FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done
+    try:
+      FalconController.execute_hs = lambda self, *a, **kw: (0, 0)
+      StandaloneGspBootstrap.wait_init_done = lambda self: b""
+      writes_before = len(fecs_postinit_fake.writes)
+      with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+        StandaloneGspBootstrap.post_init_fecs_reset(fecs_postinit_outer)
+      fecs_postinit_writes = [w for w in fecs_postinit_fake.writes[writes_before:]
+        if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
+      assert fecs_postinit_writes, "FECS post-init reset was not executed when NV_ADD_FECS_RESET_POSTINIT=1"
+      assert (1, 0) in [(w[1], fecs_postinit_fake.writes[i + 1][1]) for i, w in enumerate(fecs_postinit_fake.writes[writes_before:]) if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET], "FECS engine toggle did not go 1->0 in post-init reset"
+      fecs_postinit_cpuctl = [w for w in fecs_postinit_fake.writes[writes_before:]
+        if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL]
+      assert fecs_postinit_cpuctl, "FECS post-init force reset did not clear CPUCTL"
+    finally:
+      FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done = old_hs, old_wait
+  finally:
+    if old_postinit is None: os.environ.pop("NV_ADD_FECS_RESET_POSTINIT", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTINIT"] = old_postinit
+    if old_postinit_force is None: os.environ.pop("NV_ADD_FECS_RESET_POSTINIT_FORCE", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTINIT_FORCE"] = old_postinit_force
+
+  fecs_postinit_off_fake = FakeShell()
+  fecs_postinit_off_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+  fecs_postinit_off_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+  fecs_postinit_off_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+  fecs_postinit_off_outer = object.__new__(StandaloneGspBootstrap)
+  fecs_postinit_off_outer.shell, fecs_postinit_off_outer.queue_memory = fecs_postinit_off_fake, boot.queue_memory
+  saved_postinit = os.environ.get("NV_ADD_FECS_RESET_POSTINIT")
+  try:
+    os.environ.pop("NV_ADD_FECS_RESET_POSTINIT", None)
+    writes_before = len(fecs_postinit_off_fake.writes)
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+      result = StandaloneGspBootstrap.post_init_fecs_reset(fecs_postinit_off_outer)
+    fecs_postinit_off_writes = [w for w in fecs_postinit_off_fake.writes[writes_before:]
+      if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
+    assert not fecs_postinit_off_writes, "FECS post-init reset was executed when NV_ADD_FECS_RESET_POSTINIT is unset"
+    assert result is False, "post_init_fecs_reset returned True when env var was unset"
+  finally:
+    if saved_postinit is not None: os.environ["NV_ADD_FECS_RESET_POSTINIT"] = saved_postinit
+
+  old_pmu_postinit, old_pmu_postinit_force = os.environ.get("NV_ADD_PMU_RESET_POSTINIT"), os.environ.get("NV_ADD_PMU_RESET_POSTINIT_FORCE")
+  old_fecs_postinit, old_fecs_postinit_force = os.environ.get("NV_ADD_FECS_RESET_POSTINIT"), os.environ.get("NV_ADD_FECS_RESET_POSTINIT_FORCE")
+  try:
+    pmu_postinit_fake = FakeShell()
+    pmu_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    pmu_postinit_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+    pmu_postinit_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+    pmu_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+    pmu_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMACTL] = 0x40
+    pmu_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x10
+    pmu_postinit_outer = object.__new__(StandaloneGspBootstrap)
+    pmu_postinit_outer.shell, pmu_postinit_outer.queue_memory = pmu_postinit_fake, boot.queue_memory
+    os.environ["NV_ADD_PMU_RESET_POSTINIT"] = "1"
+    os.environ["NV_ADD_PMU_RESET_POSTINIT_FORCE"] = "1"
+    os.environ["NV_ADD_FECS_RESET_POSTINIT"] = "1"
+    os.environ["NV_ADD_FECS_RESET_POSTINIT_FORCE"] = "1"
+    writes_before = len(pmu_postinit_fake.writes)
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+      result = StandaloneGspBootstrap.post_init_fecs_reset(pmu_postinit_outer)
+    pmu_postinit_engine_writes = [w for w in pmu_postinit_fake.writes[writes_before:]
+      if w[0] == NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL]
+    assert pmu_postinit_engine_writes, "PMU post-init reset did not clear CPUCTL"
+    assert pmu_postinit_engine_writes[0][1] == 0, f"PMU post-init CPUCTL was not cleared to 0 (got {pmu_postinit_engine_writes[0][1]:#x})"
+    assert result is True, "post_init_fecs_reset returned False when PMU postinit env var was set"
+  finally:
+    if old_pmu_postinit is None: os.environ.pop("NV_ADD_PMU_RESET_POSTINIT", None)
+    else: os.environ["NV_ADD_PMU_RESET_POSTINIT"] = old_pmu_postinit
+    if old_pmu_postinit_force is None: os.environ.pop("NV_ADD_PMU_RESET_POSTINIT_FORCE", None)
+    else: os.environ["NV_ADD_PMU_RESET_POSTINIT_FORCE"] = old_pmu_postinit_force
+    if old_fecs_postinit is None: os.environ.pop("NV_ADD_FECS_RESET_POSTINIT", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTINIT"] = old_fecs_postinit
+    if old_fecs_postinit_force is None: os.environ.pop("NV_ADD_FECS_RESET_POSTINIT_FORCE", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTINIT_FORCE"] = old_fecs_postinit_force
+
+  pmu_postinit_off_fake = FakeShell()
+  pmu_postinit_off_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+  pmu_postinit_off_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+  pmu_postinit_off_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+  pmu_postinit_off_outer = object.__new__(StandaloneGspBootstrap)
+  pmu_postinit_off_outer.shell, pmu_postinit_off_outer.queue_memory = pmu_postinit_off_fake, boot.queue_memory
+  saved_pmu_postinit = os.environ.get("NV_ADD_PMU_RESET_POSTINIT")
+  try:
+    os.environ.pop("NV_ADD_PMU_RESET_POSTINIT", None)
+    writes_before = len(pmu_postinit_off_fake.writes)
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+      StandaloneGspBootstrap.post_init_fecs_reset(pmu_postinit_off_outer)
+    pmu_postinit_off_writes = [w for w in pmu_postinit_off_fake.writes[writes_before:]
+      if w[0] == NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL]
+    assert not pmu_postinit_off_writes, "PMU post-init reset was executed when NV_ADD_PMU_RESET_POSTINIT is unset"
+  finally:
+    if saved_pmu_postinit is not None: os.environ["NV_ADD_PMU_RESET_POSTINIT"] = saved_pmu_postinit
+
+  old_fecs_reset, old_fecs_reset_force = os.environ.get("NV_ADD_FECS_RESET"), os.environ.get("NV_ADD_FECS_RESET_FORCE")
+  old_postinit, old_postinit_force = os.environ.get("NV_ADD_FECS_RESET_POSTINIT"), os.environ.get("NV_ADD_FECS_RESET_POSTINIT_FORCE")
+  try:
+    os.environ["NV_ADD_FECS_RESET_POSTINIT"] = "1"
+    os.environ["NV_ADD_FECS_RESET_POSTINIT_FORCE"] = "1"
+    boot_postinit_fake = FakeShell()
+    boot_postinit_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+    boot_postinit_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+    boot_postinit_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+    boot_postinit_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    boot_postinit_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    boot_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    boot_postinit_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    boot_postinit_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    boot_postinit_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    boot_postinit_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    boot_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    boot_postinit_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    boot_postinit_fake.regs[NV_FALCON_GSP_BASE + NV_PRISCV_RISCV_CPUCTL] = 0x80
+    boot_postinit_outer = object.__new__(StandaloneGspBootstrap)
+    boot_postinit_outer.shell, boot_postinit_outer.queue_memory = boot_postinit_fake, boot.queue_memory
+    boot_postinit_outer.wpr_meta_sysmem = boot.wpr_meta_sysmem
+    boot_postinit_outer.booter_loader_vram_paddr, boot_postinit_outer.booter_loader_paddrs = boot.booter_loader_vram_paddr, boot.booter_loader_paddrs
+    boot_postinit_outer.booter_loader_desc = dict(boot.booter_loader_desc)
+    boot_postinit_outer.booter_loader_image, boot_postinit_outer.booter_loader_view = b"", MMIOView(bytearray(b""))
+    boot_postinit_outer.booter_image, boot_postinit_outer.booter_view = b"", MMIOView(bytearray(b""))
+    boot_postinit_outer.gsp_radix3_view, boot_postinit_outer.gsp_signature_view = MMIOView(bytearray(b"")), MMIOView(bytearray(b""))
+    boot_postinit_outer.wpr_meta_view, boot_postinit_outer.wpr_meta_blob = MMIOView(bytearray(b"")), b""
+    old_hs, old_wait = FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done
+    try:
+      FalconController.execute_hs = lambda self, *a, **kw: (0, 0)
+      StandaloneGspBootstrap.wait_init_done = lambda self: b""
+      writes_before = len(boot_postinit_fake.writes)
+      with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+        StandaloneGspBootstrap.boot_ampere_ada(boot_postinit_outer)
+      boot_postinit_engine_writes = [w for w in boot_postinit_fake.writes[writes_before:]
+        if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
+      assert boot_postinit_engine_writes, "FECS post-init reset was not triggered during boot_ampere_ada"
+    finally:
+      FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done = old_hs, old_wait
+  finally:
+    if old_fecs_reset is None: os.environ.pop("NV_ADD_FECS_RESET", None)
+    else: os.environ["NV_ADD_FECS_RESET"] = old_fecs_reset
+    if old_fecs_reset_force is None: os.environ.pop("NV_ADD_FECS_RESET_FORCE", None)
+    else: os.environ["NV_ADD_FECS_RESET_FORCE"] = old_fecs_reset_force
+    if old_postinit is None: os.environ.pop("NV_ADD_FECS_RESET_POSTINIT", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTINIT"] = old_postinit
+    if old_postinit_force is None: os.environ.pop("NV_ADD_FECS_RESET_POSTINIT_FORCE", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTINIT_FORCE"] = old_postinit_force
+
+  old_pmu_reset = os.environ.get("NV_ADD_PMU_RESET")
+  try:
+    os.environ["NV_ADD_PMU_RESET"] = "0"
+    pmu_skip_fake = FakeShell()
+    pmu_skip_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+    pmu_skip_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+    pmu_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    pmu_skip_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    pmu_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PRISCV_RISCV_CPUCTL] = 0x80
+    pmu_skip_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    pmu_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    pmu_skip_fake.regs[NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    pmu_skip_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    pmu_skip_fake.regs[NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    pmu_skip_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x2
+    pmu_skip_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x10
+    boot_pmu_skip = object.__new__(StandaloneGspBootstrap)
+    boot_pmu_skip.shell, boot_pmu_skip.queue_memory = pmu_skip_fake, boot.queue_memory
+    boot_pmu_skip.wpr_meta_sysmem = boot.wpr_meta_sysmem
+    boot_pmu_skip.booter_loader_vram_paddr, boot_pmu_skip.booter_loader_paddrs = boot.booter_loader_vram_paddr, boot.booter_loader_paddrs
+    boot_pmu_skip.booter_loader_desc = dict(boot.booter_loader_desc)
+    boot_pmu_skip.booter_loader_image, boot_pmu_skip.booter_loader_view = b"", MMIOView(bytearray(b""))
+    boot_pmu_skip.booter_image, boot_pmu_skip.booter_view = b"", MMIOView(bytearray(b""))
+    boot_pmu_skip.gsp_radix3_view, boot_pmu_skip.gsp_signature_view = MMIOView(bytearray(b"")), MMIOView(bytearray(b""))
+    boot_pmu_skip.wpr_meta_view, boot_pmu_skip.wpr_meta_blob = MMIOView(bytearray(b"")), b""
+    old_hs, old_wait = FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done
+    try:
+      FalconController.execute_hs = lambda self, *a, **kw: (0, 0)
+      StandaloneGspBootstrap.wait_init_done = lambda self: b""
+      writes_before = len(pmu_skip_fake.writes)
+      StandaloneGspBootstrap.boot_ampere_ada(boot_pmu_skip)
+      pmu_engine_writes = [w for w in pmu_skip_fake.writes[writes_before:] if w[0] == NV_PPMU_FALCON_ENGINE]
+      assert pmu_engine_writes == [], f"PMU reset was not skipped when NV_ADD_PMU_RESET=0 (got {pmu_engine_writes})"
+    finally:
+      FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done = old_hs, old_wait
+  finally:
+    if old_pmu_reset is None: os.environ.pop("NV_ADD_PMU_RESET", None)
+    else: os.environ["NV_ADD_PMU_RESET"] = old_pmu_reset
   for attr, data in [
     ("booter_loader", b"loader"),
     ("wpr_meta", b"meta"),
@@ -12139,7 +12785,7 @@ def selftest():
     else: os.environ["NV_ADD_TRACE_CHANNEL"] = old_trace_channel
   runtime_fingerprint = runtime_channel_fingerprint_state()
   assert runtime_fingerprint["gpfifo_alloc"][:3] == (0xcf000000, AMPERE_CHANNEL_GPFIFO_A, 0xcf000002)
-  assert runtime_fingerprint["gpfifo_params_sha256"] == "3b873280d9a75bdcf5a912541738ab5fa2b5a366d7413812277d956d36481b26"
+  assert runtime_fingerprint["gpfifo_params_sha256"] == "71f277d0dbc64b494a040f44687e00a0ef1e4ac6d6db21b0aafea268aa57fc2f"
   assert runtime_fingerprint["compute_alloc"][:3] == (0xcf000002, AMPERE_COMPUTE_B, 0xcf000003)
   assert runtime_fingerprint["compute_rpc_sha256"] == "ed200b308f64d1cd65ba56473eeaa1249595a527465238eaecc7c16b8662c75f"
   assert runtime_fingerprint["debugger_alloc"][:3] == (0x80, GT200_DEBUGGER, 0xcf000004)

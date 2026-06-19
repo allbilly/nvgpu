@@ -152,7 +152,7 @@ def tiny_live_log_workflow_lines(script="examples/add_tiny.py", standalone_scrip
     f"standalone_log_command {recommended_standalone_golden_command(standalone_script)} 2>&1 | tee {standalone_log}",
     f"tiny_log_command {recommended_tiny_trace_command(script)} 2>&1 | tee {tiny_log}",
     f"compare_command python3 {standalone_script} --compare-trace-logs --standalone-log {standalone_log} --tiny-log {tiny_log}",
-    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence",
+    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence",
     "workflow_rule run standalone_log_command only after gate result is ready-for-gsp",
     "workflow_rule run tiny_log_command in the same eGPU session if standalone stalls or times out",
   ]
@@ -166,7 +166,7 @@ def tiny_live_stack_log_workflow_lines(script="examples/add_tiny.py", standalone
     f"standalone_log_command {recommended_standalone_stack_command(standalone_script)} 2>&1 | tee {standalone_log}",
     f"tiny_log_command {recommended_tiny_trace_command(script)} 2>&1 | tee {tiny_log}",
     f"compare_command python3 {standalone_script} --compare-trace-logs --standalone-log {standalone_log} --tiny-log {tiny_log}",
-    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence",
+    "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence",
     "workflow_check stack inspect trace_log_compare_stack, trace_log_compare_falcon",
     "workflow_rule use this only when Python call-path stacks are needed; it is verbose",
     "workflow_rule run standalone_log_command only after gate result is ready-for-gsp",
@@ -809,7 +809,7 @@ def trace_selftest():
     assert "NV_ADD_TRACE_RPC=1 NV_ADD_TRACE_RPC_READ=1" in text
     assert "tiny_log_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py 2>&1 | tee tiny-golden.log" in text
     assert "compare_command python3 examples/add.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in text
-    assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_rpc_response_sequence" in text
+    assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence" in text
     assert "bar_info python3 examples/add_tiny.py --bar-info" in text
     stack_text = "\n".join(tiny_live_stack_log_workflow_lines())
     assert "live_stack_log_workflow script=examples/add_tiny.py standalone_script=examples/add.py standalone_log=standalone-stack.log tiny_log=tiny-stack.log" in stack_text
