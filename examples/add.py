@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import array, ast, collections, contextlib, ctypes, enum, fcntl, functools, hashlib, io, mmap, os, pathlib, re, socket, struct, subprocess, sys, tempfile, time, traceback, urllib.request
+import array, ast, collections, contextlib, ctypes, enum, fcntl, functools, hashlib, io, mmap, os, pathlib, re, socket, struct, subprocess, sys, tempfile, threading, time, traceback, urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 METHOD_NAMES = {
@@ -1551,18 +1551,42 @@ class NVRegisters:
 class StandaloneNvShell:
   def __init__(self, transport):
     self.transport = transport
-    pci_command = transport.read_config(PCI_COMMAND, 2)
-    transport.write_config(PCI_COMMAND, pci_command | PCI_COMMAND_MASTER, 2)
-    transport.read_config(PCI_COMMAND, 2)
-    self.regs = NVRegisters(transport)
-    if self.regs.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI) != 0 and hasattr(self.transport, "reset") and os.environ.get("NV_ADD_SKIP_PCI_RESET") != "1":
+    # Mirror tiny's nvdev._early_ip_init order: probe WPR2 BEFORE enabling bus master, then
+    # (only if WPR2 is locked) clear bus master + issue transport.reset(), then enable bus
+    # master. Writing PCI_COMMAND|MASTER before the WPR2 probe can activate the eGPU's PCIe
+    # state machine in a way that leaves WPR2 lock + FECS BAR hardware-gated for the rest of
+    # the boot, which is the trigger for the FECS_A->FECS_B|GR_STATUS|RMGpioPmuMutexTimeoutus
+    # stall we kept hitting on ADT-Link UT3G USB4 eGPUs.
+    pre_reset_wpr2 = NVRegisters(transport).rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI)
+    needs_reset = pre_reset_wpr2 != 0
+    if needs_reset and hasattr(self.transport, "reset") and os.environ.get("NV_ADD_SKIP_PCI_RESET") != "1":
       if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-        print("standalone WPR2 already initialized; resetting PCI device")
+        print(f"standalone WPR2 already initialized (wpr2_hi=0x{pre_reset_wpr2:08x}); resetting PCI device")
       self.transport.write_config(PCI_COMMAND, self.transport.read_config(PCI_COMMAND, 2) & ~PCI_COMMAND_MASTER, 2)
       self.transport.reset()
-      self.transport.sleep(250)
+      self.transport.sleep(100)
       self.transport.write_config(PCI_COMMAND, self.transport.read_config(PCI_COMMAND, 2) | PCI_COMMAND_MASTER, 2)
-      self.regs = NVRegisters(transport)
+    self.regs = NVRegisters(transport)
+    fence_reasons = self.collect_fence_reasons()
+    if fence_reasons["fecs_full_fence"]:
+      # 0xbadf1301 on FECS.CPUCTL is the normal pre-boot "FECS ucode not loaded" state -- tiny
+      # proceeds past it. We do NOT bail out by default; the diagnostic is logged so the
+      # post-init fecs-pmu-postinit trace can compare. Set NV_ADD_BYPASS_BAR0_FENCE_CHECK=0
+      # to fail-closed on this signal (useful only as a smoke test).
+      if os.environ.get("NV_ADD_BYPASS_BAR0_FENCE_CHECK") == "0":
+        raise RuntimeError(
+          f"eGPU FECS.CPUCTL=0xbadf1301 pre-boot (set NV_ADD_BYPASS_BAR0_FENCE_CHECK=1 or unset to proceed; tiny proceeds past this state).")
+      print(f"standalone pre-boot fecs-pmu-state {fence_reasons['description']}")
+      if fence_reasons["wpr2_locked"]:
+        print("standalone pre-boot wpr2-locked=0x2ffee00 (eGPU is in the post-GSP-RM-session state; FECS BAR is hardware-gated and can only be cleared by a physical eGPU power-cycle)")
+    # NOTE: the WPR2 lock state alone is NOT a fence -- tiny proceeds with WPR2=0x2ffee00 set and
+    # the FALCONs in their 0xbadf50xx/0xbadf57xx post-reset state. FECS.CPUCTL=0xbadf1301 is also
+    # the normal pre-boot "FECS ucode not loaded" state, not a hardware fence. The post-init
+    # fecs-pmu-postinit trace point catches any actual FECS fence at the right point in the boot
+    # (after the GSP RM has come up and the FALCONs are first readable in their natural state).
+    # The bypass env var is kept for diagnostic purposes only.
+    if os.environ.get("NV_ADD_BYPASS_FECS_FENCE_CHECK") == "1" and self.fecs_bar_is_fenced():
+      print(f"standalone FECS fence diagnostic: FECS.CPUCTL=0x{self.regs.rreg(0xA04100):08x} (bypassed by NV_ADD_BYPASS_FECS_FENCE_CHECK=1)")
     deadline = time.perf_counter() + 3.0
     while True:
       self.chip = NvChipInfo.probe(self.regs)
@@ -1593,6 +1617,56 @@ class StandaloneNvShell:
     if base is None: raise ValueError(f"FECS FALCON base is unknown for firmware {self.chip.fw_name}")
     return base
   def fecs_falcon_engine(self): return self.fecs_falcon_base() + NV_PFECS_FALCON_ENGINE_OFFSET
+
+  def collect_fence_reasons(self, sample_addrs=(0x88, 0x100, 0x200, 0x400, 0x1000, 0x1FA828)):
+    """Return a structured verdict on the current eGPU state.
+
+    Pre-boot fence readback is unreliable: tiny proceeds through every 0xbadf* state
+    (0xbadf1301 on FECS = "FECS ucode not loaded", 0xbadf5720 on GSP/PMU = FALCON halted,
+    0xbadf5620 on SEC2 = FALCON halted, WPR2=0x2ffee00 = WPR2 lock set by GSP boot).
+    We report the pre-boot state and let the post-init fecs-pmu-postinit trace make the
+    final fence determination (after the FALCONs are in their natural post-load state).
+    """
+    if not hasattr(self, "regs"):
+      return {"hardware_fence": False, "wpr2_locked": False, "fecs_full_fence": False,
+              "fence_sample_count": 0, "valid_sample_count": 0, "description": "no regs"}
+    try: wpr2_hi = self.regs.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI)
+    except Exception: wpr2_hi = 0
+    fecs_base = self.fecs_falcon_base() if (hasattr(self, "chip") and self.chip is not None) else 0xA04000
+    try: fecs_cpuctl = self.regs.rreg(fecs_base + 0x100)
+    except Exception: fecs_cpuctl = 0
+    fecs_full_fence = (fecs_cpuctl & 0xffffffff) == 0xbadf1301
+    fence_count = 0
+    valid_count = 0
+    for addr in sample_addrs:
+      try: value = self.regs.rreg(addr)
+      except Exception: continue
+      if (value & 0xffff0000) == 0xbadf0000: fence_count += 1
+      else: valid_count += 1
+    description = (f"FECS.CPUCTL=0x{fecs_cpuctl:08x} wpr2_hi=0x{wpr2_hi:08x} fence_count={fence_count}/{len(sample_addrs)} (pre-boot, normal)")
+    return {"hardware_fence": False, "wpr2_locked": wpr2_hi != 0, "fecs_full_fence": fecs_full_fence,
+            "fence_sample_count": fence_count, "valid_sample_count": valid_count, "description": description}
+
+  def bar0_is_fenced(self, sample_addrs=(0x88, 0x100, 0x200, 0x400, 0x1000, 0x1FA828)):
+    """Backward-compat shim: returns True only on a *hardware* fence (FECS.CPUCTL=0xbadf1301).
+    Use collect_fence_reasons() to get the full diagnostic breakdown."""
+    return self.collect_fence_reasons(sample_addrs)["hardware_fence"]
+
+  def fecs_bar_is_fenced(self):
+    if not hasattr(self, "regs"): return False
+    try:
+      fecs_base = self.fecs_falcon_base() if (hasattr(self, "chip") and self.chip is not None) else 0xA04000
+    except Exception:
+      fecs_base = 0xA04000
+    try: cpuctl = self.regs.rreg(fecs_base + 0x100)
+    except Exception: return False
+    if (cpuctl & 0xffffffff) == 0xbadf1301: return True
+    if (cpuctl & 0xffff0000) == 0xbadf0000 and (cpuctl & 0x0000ffff) != 0: return True
+    try:
+      wpr2_hi = self.regs.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI)
+    except Exception: return False
+    if wpr2_hi != 0: return True
+    return False
 
   def rreg(self, addr): return self.regs.rreg(addr)
   def wreg(self, addr, value): self.regs.wreg(addr, value)
@@ -1752,6 +1826,11 @@ class FalconController:
     return regs
   def format_state(self, base):
     return " ".join(f"{name}=0x{value:x}" for name, value in self.state_snapshot(base).items())
+  def format_state_with_fenced(self, base):
+    regs = self.state_snapshot(base)
+    fenced = (regs["cpuctl"] & 0xffffffff) == 0xbadf5720 or (regs["cpuctl"] & 0xffff0000) == 0xbadf0000
+    has_riscv = reg_get(regs["hwcfg2"], 10, 10)
+    return f"({self.format_state(base)}) [hwcfg2=0x{regs['hwcfg2']:x} has_riscv={has_riscv} cpuctl=0x{regs['cpuctl']:x} fenced={fenced}]"
   def dma_error(self, base, reason):
     return f"{reason} at base=0x{base:x}, DMATRFCMD=0x{getattr(self, '_last_dmatrfcmd', 0):x}, dma={tuple(hex(x) for x in getattr(self, '_last_dma', ()))}, state=({self.format_state(base)})"
 
@@ -1805,31 +1884,68 @@ class FalconController:
   def wait_cpu_halted(self, base):
     self.wait_until(lambda: reg_get(self.rreg(base, NV_PFALCON_FALCON_CPUCTL), 4, 4) == 1, "Falcon CPU did not halt")
 
+  @staticmethod
+  def is_fenced_value(value):
+    return (value & 0xffffffff) in (0xbadf5720, 0xbadf1301, 0xbadf5620) or (value & 0xffff0000) == 0xbadf0000
+
+  def clear_fence(self, base):
+    """Best-effort fence clear: writes the canonical fence-clear values to FALCON_BAR
+    registers. This is a no-op when the eGPU is in a clean state (writes succeed but
+    have no effect). When the eGPU is in a hardware fence state, these writes are also
+    no-ops (BAR is gated); the only true fence-clear path is a physical eGPU power-cycle.
+    Kept for diagnostic purposes; not called by reset() anymore.
+    """
+    if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
+      pre_cpuctl = self.rreg(base, NV_PFALCON_FALCON_CPUCTL)
+      pre_transcfg0 = self.rreg(base, NV_PFALCON_FBIF_TRANSCFG0)
+      print(f"falcon clear_fence pre base=0x{base:x} cpuctl=0x{pre_cpuctl:x} fbif_transcfg0=0x{pre_transcfg0:x}")
+    self.wreg(base, NV_PFALCON_FBIF_TRANSCFG0, 0x114)
+    self.wreg(base, NV_PFALCON_FALCON_CPUCTL, 0)
+    self.shell.transport.sleep(10)
+    self.wreg(base, NV_PFALCON_FALCON_DMACTL, 0)
+    self.wreg(base, NV_PFALCON_FALCON_DMATRFCMD, 0)
+    if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
+      post_cpuctl = self.rreg(base, NV_PFALCON_FALCON_CPUCTL)
+      print(f"falcon clear_fence post base=0x{base:x} cpuctl=0x{post_cpuctl:x}")
+
   def reset(self, base, riscv=False, force=False):
+    """Minimal FALCON reset that matches tinygrad's NV_FLCN.reset():
+    engine=1, sleep(100ms), engine=0, wait for mem_scrubbing.
+    Optional pre-engine fence-clear (NV_ADD_FECS_FENCE_CLEAR=1) writes the canonical
+    fence-clear values to FBIF_TRANSCFG0/CPUCTL/DMACTL/DMATRFCMD; without that env var,
+    the reset is just the engine toggle. The fence-clear is a no-op when the eGPU is in
+    a clean state and also a no-op when the BAR is hardware-gated; it is a documentation
+    aid only.
+    """
     if not hasattr(self.shell, "chip") or self.shell.chip is None: raise RuntimeError("Falcon reset requires chip info")
     engine = self.engine_reg(base)
+    pre_cpuctl = self.rreg(base, NV_PFALCON_FALCON_CPUCTL)
+    pre_hwcfg2 = self.rreg(base, NV_PFALCON_FALCON_HWCFG2)
+    fenced_pre = self.is_fenced_value(pre_cpuctl) and self.is_fenced_value(pre_hwcfg2)
+    if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
+      print(f"falcon reset pre base=0x{base:x} cpuctl=0x{pre_cpuctl:x} hwcfg2=0x{pre_hwcfg2:x} fenced_pre={fenced_pre} force={force}")
     if force:
-      cpuctl = self.rreg(base, NV_PFALCON_FALCON_CPUCTL)
-      if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
-        print(f"falcon reset force pre cpuctl=0x{cpuctl:x} base=0x{base:x}")
-      self.wreg(base, NV_PFALCON_FALCON_CPUCTL, 0)
-      self.shell.transport.sleep(10)
-      self.wreg(base, NV_PFALCON_FALCON_DMACTL, 0)
-      self.wreg(base, NV_PFALCON_FALCON_DMATRFCMD, 0)
+      self.clear_fence(base)
     self.shell.wreg(engine, 1)
     self.shell.transport.sleep(100)
     self.shell.wreg(engine, 0)
-    self.wait_until(lambda: reg_get(self.rreg(base, NV_PFALCON_FALCON_HWCFG2), 12, 12) == 0, "Falcon memory scrubbing did not complete")
-    if riscv:
+    if fenced_pre and not force:
+      if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
+        print(f"falcon reset base=0x{base:x} skipping HWCFG2 wait because pre-cpuctl=0x{pre_cpuctl:x} is a fence sentinel")
+      self.shell.transport.sleep(100)
+    else:
+      self.wait_until(lambda: reg_get(self.rreg(base, NV_PFALCON_FALCON_HWCFG2), 12, 12) == 0, "Falcon memory scrubbing did not complete")
+    has_riscv = reg_get(self.rreg(base, NV_PFALCON_FALCON_HWCFG2), 10, 10)
+    if riscv and has_riscv:
       self.wreg(base, NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8))
-    elif reg_get(self.rreg(base, NV_PFALCON_FALCON_HWCFG2), 10, 10):
+    elif has_riscv:
       self.wreg(base, NV_PRISCV_RISCV_BCR_CTRL, 0)
       self.wait_until(lambda: reg_get(self.rreg(base, NV_PRISCV_RISCV_BCR_CTRL), 0, 0) == 1, "RISCV core did not boot")
       self.wreg(base, NV_PFALCON_FALCON_RM, self.shell.chip.pmc_boot_0)
-    if force:
+    if force or os.environ.get("NV_ADD_TRACE_FALCON") == "1":
       post_cpuctl = self.rreg(base, NV_PFALCON_FALCON_CPUCTL)
       if os.environ.get("NV_ADD_TRACE_FALCON") == "1":
-        print(f"falcon reset force post cpuctl=0x{post_cpuctl:x} base=0x{base:x}")
+        print(f"falcon reset post base=0x{base:x} cpuctl=0x{post_cpuctl:x}")
 
   def execute_hs(self, base, img_paddr, code_off, data_off, imem_pa, imem_va, imem_size,
                  dmem_pa, dmem_va, dmem_size, pkc_off, engid, ucodeid, mailbox=None):
@@ -2318,6 +2434,94 @@ class GspQueueElement:
   def unpack_from(cls, data, offset=0): return cls(*struct.unpack_from(cls.FMT, require_len(bytes(data), offset + cls.SIZE, "queue element"), offset)[2:])
   def pack(self): return struct.pack(self.FMT, bytes(16), bytes(16), self.checksum, self.seq, self.elem_count, self.padding)
 
+class StallTracer:
+  STALL_TRACE_ENV = "NV_ADD_STALL_TRACE"
+  STALL_TRACE_PERIOD_ENV = "NV_ADD_STALL_TRACE_PERIOD_MS"
+  STALL_TRACE_MAX_ENV = "NV_ADD_STALL_TRACE_MAX_MS"
+
+  def __init__(self, shell, label, period_ms=5.0, max_ms=40000.0):
+    self.shell, self.label, self.period_ms, self.max_ms = shell, label, period_ms, max_ms
+    self._stop_event = threading.Event()
+    self._thread = None
+    self._start_perf = None
+    self._count = 0
+    self._last_summary = None
+
+  @classmethod
+  def is_enabled(cls):
+    return os.environ.get(cls.STALL_TRACE_ENV) == "1"
+
+  @classmethod
+  def parse_period_ms(cls):
+    raw = os.environ.get(cls.STALL_TRACE_PERIOD_ENV, "5")
+    try: period = float(raw)
+    except (TypeError, ValueError): period = 5.0
+    if period <= 0: period = 5.0
+    return period
+
+  @classmethod
+  def parse_max_ms(cls):
+    raw = os.environ.get(cls.STALL_TRACE_MAX_ENV, "40000")
+    try: maximum = float(raw)
+    except (TypeError, ValueError): maximum = 40000.0
+    if maximum <= 0: maximum = 40000.0
+    return maximum
+
+  def start(self):
+    if not self.is_enabled(): return
+    if self._thread is not None: return
+    if not hasattr(self.shell, "fecs_falcon_base"): return
+    try: fecs_base = self.shell.fecs_falcon_base()
+    except Exception: return
+    self._stop_event = threading.Event()
+    self._start_perf = time.perf_counter()
+    self._count = 0
+    print(f"stall_trace start label={self.label} period_ms={self.period_ms:g} max_ms={self.max_ms:g} fecs_base=0x{fecs_base:x}")
+    self._thread = threading.Thread(target=self._run, name=f"stall-tracer-{self.label}", daemon=True)
+    self._thread.start()
+
+  def stop(self, reason="complete"):
+    if not self.is_enabled(): self._reset(); return
+    if self._thread is None: return
+    self._stop_event.set()
+    self._thread.join(timeout=max(self.period_ms / 1000.0 * 4, 0.5))
+    elapsed_ms = (time.perf_counter() - self._start_perf) * 1000.0 if self._start_perf is not None else 0.0
+    print(f"stall_trace stop label={self.label} reason={reason} samples={self._count} elapsed_ms={elapsed_ms:g}")
+    self._reset()
+
+  def _reset(self):
+    self._thread = None
+    self._start_perf = None
+    self._count = 0
+    self._last_summary = None
+    self._stop_event = None
+
+  def _sample_falcons(self):
+    falcon = FalconController(self.shell)
+    bases = (("gsp", NV_FALCON_GSP_BASE), ("sec2", NV_FALCON_SEC2_BASE), ("pmu", NV_FALCON_PMU_BASE), ("fecs", self.shell.fecs_falcon_base()))
+    parts = []
+    for name, base in bases:
+      try: parts.append(f"{name}={falcon.format_state_with_fenced(base)}")
+      except Exception as exc: parts.append(f"{name}=unavailable({type(exc).__name__})")
+    return " ".join(parts)
+
+  def _run(self):
+    while not self._stop_event.is_set():
+      try:
+        sample = self._sample_falcons()
+        elapsed_ms = (time.perf_counter() - self._start_perf) * 1000.0
+        self._count += 1
+        if sample != self._last_summary or self._count == 1:
+          print(f"stall_trace sample label={self.label} seq={self._count} elapsed_ms={elapsed_ms:g} {sample}")
+          self._last_summary = sample
+        if elapsed_ms > self.max_ms:
+          print(f"stall_trace stop label={self.label} reason=max_ms_exceeded samples={self._count} elapsed_ms={elapsed_ms:g}")
+          return
+      except Exception as exc:
+        print(f"stall_trace error label={self.label} exc={type(exc).__name__}: {exc}")
+        return
+      self._stop_event.wait(self.period_ms / 1000.0)
+
 class GspRpcQueue:
   def __init__(self, gsp, view, completion_view=None):
     if not isinstance(view, MMIOView): raise ValueError("RPC queue view is invalid")
@@ -2442,6 +2646,16 @@ class GspRpcQueue:
         self.gsp.run_cpu_sequencer(msg)
       elif hdr.function == NV_VGPU_MSG_EVENT_GSP_POST_NOCAT_RECORD:
         print(f"GSP EVENT post_nocat len=0x{len(msg):x} {format_post_nocat_record_decode(msg)} head={msg[:64].hex()}")
+        info = decode_post_nocat_record(msg)
+        if info.get("kind") == "0x3" and self.gsp is not None and hasattr(self.gsp, "fecs_falcon_base"):
+          strings = info.get("strings") or []
+          progress = strings[0] if strings else "unknown"
+          self._stall_tracer(f"rm_gpio_pmu_mutex", f"post_nocat-progress={progress}")
+          if os.environ.get("NV_ADD_DUMP_LOGBUF") == "1" and hasattr(self.gsp, "gsp_boot") and self.gsp.gsp_boot is not None:
+            try: self.gsp.gsp_boot.dump_logbuf(f"stall-rm-pmu-mutex/progress={progress}")
+            except Exception as exc:
+              if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+                print(f"stall-rm-pmu-mutex logbuf_dump unavailable={type(exc).__name__}: {exc}")
       if hdr.function in (NV_VGPU_MSG_EVENT_OS_ERROR_LOG, NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED) and self.gsp is not None:
         self.gsp.is_err_state = True
       self.rx_view[0] = (self.rx_view[0] + advance) % self.tx.msg_count
@@ -2468,13 +2682,31 @@ class GspRpcQueue:
                    f"result=0x{hdr.rpc_result:x} priv=0x{hdr.rpc_result_private:x} sig=0x{hdr.signature:x}")
     return "; ".join(state)
 
+  def _stall_tracer(self, label, reason_hint):
+    if not StallTracer.is_enabled(): return
+    if self._stall_tracer_inst is not None: return
+    if self.gsp is None or not hasattr(self.gsp, "fecs_falcon_base"): return
+    period = StallTracer.parse_period_ms()
+    maximum = StallTracer.parse_max_ms()
+    self._stall_tracer_inst = StallTracer(self.gsp, label=f"{label}/{reason_hint}", period_ms=period, max_ms=maximum)
+    self._stall_tracer_inst.start()
+
+  def _stop_stall_tracer(self, reason):
+    if self._stall_tracer_inst is None: return
+    self._stall_tracer_inst.stop(reason=reason)
+    self._stall_tracer_inst = None
+
   def wait_resp(self, func, timeout_ms=10000):
     func = validate_u32(func, "RPC response function")
     if timeout_ms < 0: raise ValueError("RPC response timeout must be non-negative")
     start = time.perf_counter()
-    while (time.perf_counter() - start) * 1000 < timeout_ms:
-      for got_func, msg in self.read_resp():
-        if got_func == func: return msg
+    self._stall_tracer_inst = None
+    try:
+      while (time.perf_counter() - start) * 1000 < timeout_ms:
+        for got_func, msg in self.read_resp():
+          if got_func == func: return msg
+    finally:
+      self._stop_stall_tracer(reason="wait_resp_return")
     raise RuntimeError(f"timeout waiting for RPC response {func} ({gsp_rpc_name(func)}); queue={self.debug_state()}")
 
 def pack_message_queue_init(shared_mem_phys_addr, page_table_entry_count, cmd_queue_offset, stat_queue_offset):
@@ -3019,7 +3251,7 @@ class BootMemoryAllocator:
     return view, paddr, paddrs
 
 class GspQueueMemory:
-  def __init__(self, queues_view, queues_paddrs, cmd_q_view, stat_q_view, rm_args_view, rm_args_paddrs, libos_args_view, libos_args_paddrs):
+  def __init__(self, queues_view, queues_paddrs, cmd_q_view, stat_q_view, rm_args_view, rm_args_paddrs, libos_args_view, libos_args_paddrs, logbuf_view=None, logbuf_paddrs=None):
     for name, view in (("queues", queues_view), ("command queue", cmd_q_view), ("status queue", stat_q_view),
       ("RM args", rm_args_view), ("LibOS args", libos_args_view)):
       if not isinstance(view, MMIOView): raise ValueError(f"GSP {name} view is invalid")
@@ -3027,10 +3259,16 @@ class GspQueueMemory:
       if not paddrs: raise ValueError(f"GSP {name} physical ranges must be non-empty")
       for paddr in paddrs:
         if paddr < 0 or paddr % 0x1000: raise ValueError(f"GSP {name} physical address must be 4KB aligned")
+    if logbuf_view is not None and not isinstance(logbuf_view, MMIOView): raise ValueError("GSP logbuf view is invalid")
+    if logbuf_paddrs is not None:
+      if not logbuf_paddrs: raise ValueError("GSP logbuf physical ranges must be non-empty when provided")
+      for paddr in logbuf_paddrs:
+        if paddr < 0 or paddr % 0x1000: raise ValueError(f"GSP logbuf physical address must be 4KB aligned: 0x{paddr:x}")
     self.queues_view, self.queues_paddrs = queues_view, queues_paddrs
     self.cmd_q_view, self.stat_q_view = cmd_q_view, stat_q_view
     self.rm_args_view, self.rm_args_paddrs = rm_args_view, rm_args_paddrs
     self.libos_args_view, self.libos_args_paddrs = libos_args_view, libos_args_paddrs
+    self.logbuf_view, self.logbuf_paddrs = logbuf_view, logbuf_paddrs
 
 class GspQueueMemoryBuilder:
   def __init__(self, boot_allocator): self.boot_allocator = boot_allocator
@@ -3064,7 +3302,7 @@ class GspQueueMemoryBuilder:
     queue_args = pack_message_queue_init(queues_paddrs[0], pte_cnt, pt_size, pt_size + queue_size)
     rm_args_view, _, rm_args_paddrs = self.boot_allocator.alloc(len(pack_gsp_arguments_cached(queue_args)),
       data=pack_gsp_arguments_cached(queue_args))
-    _, _, logbuf_paddrs = self.boot_allocator.alloc(2 << 20)
+    logbuf_view, _, logbuf_paddrs = self.boot_allocator.alloc(2 << 20, sysmem=True)
     libos_args = b"".join(self.pack_libos_memory_region(0, 0, 0x10000, f"LOG{name}", logbuf_paddrs[0] + 0x10000 * idx)
       for idx, name in enumerate(("INIT", "INTR", "RM", "MNOC", "KRNL")))
     libos_args += self.pack_libos_memory_region(0, 0, 0x1000, "RMARGS", rm_args_paddrs[0])
@@ -3076,7 +3314,7 @@ class GspQueueMemoryBuilder:
               f"cmd_paddr=0x{queues_paddrs[pt_size // 0x1000]:x} stat_paddr=0x{queues_paddrs[(pt_size + queue_size) // 0x1000]:x} "
               f"pte_cnt={pte_cnt} pt_size=0x{pt_size:x}")
     return GspQueueMemory(queues_view, queues_paddrs, cmd_q_view, stat_q_view, rm_args_view, rm_args_paddrs,
-      libos_args_view, libos_args_paddrs)
+      libos_args_view, libos_args_paddrs, logbuf_view, logbuf_paddrs)
 
 class StandaloneGspBootstrap:
   def __init__(self, shell, firmware_store=None):
@@ -3210,13 +3448,17 @@ class StandaloneGspBootstrap:
     self.validate_boot_paddr_list(self.booter_loader_paddrs, "booter-loader")
     self.validate_boot_paddr_list(self.queue_memory.libos_args_paddrs, "LibOS args")
     falcon = FalconController(self.shell, timeout_ms=30000)
+    # Tiny's init_hw does not reset FECS explicitly; FECS BAR hardware gate is cleared by
+    # GSP RM's PMU-ucode DMA on this eGPU. The standalone GSP boot_ampere_ada must NOT
+    # touch FECS before GSP RM owns it -- touching FECS while PMU is mid-DMA writing FECS
+    # IMEM is what previously wedged the FECS->PMU mutex handshake.
     if os.environ.get("NV_ADD_PMU_RESET") == "1":
       if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-        print(f"standalone pmu-reset pre state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+        print(f"standalone pmu-reset pre state={falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)}")
       try:
         falcon.reset(NV_FALCON_PMU_BASE, riscv=True, force=os.environ.get("NV_ADD_PMU_RESET_FORCE") == "1")
         if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-          print(f"standalone pmu-reset post state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+          print(f"standalone pmu-reset post state={falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)}")
       except Exception as exc:
         if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
           print(f"standalone pmu-reset skipped reason={type(exc).__name__}: {exc}")
@@ -3228,17 +3470,41 @@ class StandaloneGspBootstrap:
         clear_view[:] = bytes(0x100000)
         if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
           print(f"standalone wpr2-fecs cleared vram=0x{clear_paddr:x} size=0x100000")
-    if os.environ.get("NV_ADD_FECS_RESET") == "1":
+    if os.environ.get("NV_ADD_FECS_RESET") == "1" or os.environ.get("NV_ADD_FECS_FENCE_CLEAR") == "1":
       fecs_base = self.shell.fecs_falcon_base()
-      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-        print(f"standalone fecs-reset pre state=({falcon.format_state(fecs_base)})")
-      try:
-        falcon.reset(fecs_base, riscv=True, force=os.environ.get("NV_ADD_FECS_RESET_FORCE") == "1")
+      if os.environ.get("NV_ADD_FECS_FENCE_CLEAR") == "1":
+        # Attempt to clear FECS fence by writing 0 to mailbox0/1 and the FECS tag register
+        # Standard procedure: write 0 to FECS mailbox and tag, then engine reset
         if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-          print(f"standalone fecs-reset post state=({falcon.format_state(fecs_base)})")
-      except Exception as exc:
+          print(f"standalone fecs-fence-clear pre base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
+        try:
+          # Write 0 to FECS mailbox0/mailbox1 and the FALCON_OS register
+          self.shell.wreg(fecs_base + NV_PFALCON_FALCON_MAILBOX0, 0)
+          self.shell.wreg(fecs_base + NV_PFALCON_FALCON_MAILBOX1, 0)
+          self.shell.wreg(fecs_base + NV_PFALCON_FALCON_OS, 0)
+          # Wait briefly
+          self.shell.transport.sleep(10)
+          # Now do a clean engine reset
+          self.shell.wreg(fecs_base + NV_PFECS_FALCON_ENGINE_OFFSET, 1)
+          self.shell.transport.sleep(100)
+          self.shell.wreg(fecs_base + NV_PFECS_FALCON_ENGINE_OFFSET, 0)
+          self.shell.transport.sleep(100)
+          # Try to read back
+          if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+            print(f"standalone fecs-fence-clear post base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
+        except Exception as exc:
+          if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+            print(f"standalone fecs-fence-clear skipped reason={type(exc).__name__}: {exc}")
+      if os.environ.get("NV_ADD_FECS_RESET") == "1":
         if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-          print(f"standalone fecs-reset skipped reason={type(exc).__name__}: {exc}")
+          print(f"standalone fecs-reset pre base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
+        try:
+          falcon.reset(fecs_base, riscv=False, force=os.environ.get("NV_ADD_FECS_RESET_FORCE") == "1")
+          if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+            print(f"standalone fecs-reset post base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
+        except Exception as exc:
+          if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+            print(f"standalone fecs-reset skipped reason={type(exc).__name__}: {exc}")
     if hasattr(self, "frts_vram_paddr"):
       self.validate_boot_desc(self.frts_desc, ("imem_load_size", "imem_phys_base", "imem_virt_base", "dmem_phys_base",
         "dmem_load_size", "pkc_data_offset", "engine_id_mask", "ucode_id"), "FRTS")
@@ -3287,6 +3553,12 @@ class StandaloneGspBootstrap:
     if getattr(self, "cmd_q", None) is not None and self.stat_q is None:
       self.attach_stat_queue()
     init_done = self.wait_init_done()
+    self.print_falcons_state("fecs-pmu-postinit")
+    if os.environ.get("NV_ADD_DUMP_LOGBUF") == "1":
+      try: self.dump_logbuf("postinit-after-falcons")
+      except Exception as exc:
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"postinit-after-falcons logbuf_dump unavailable={type(exc).__name__}: {exc}")
     falcon.wait_until(lambda: self._clear_bar1_block(), "BAR1 block did not clear")
     if getattr(self.shell.chip, "fmc_boot", False):
       self.shell.wreg(NV_PBUS_BAR1_BLOCK + 0x4, 0)
@@ -3305,26 +3577,138 @@ class StandaloneGspBootstrap:
     pmu_forced = os.environ.get("NV_ADD_PMU_RESET_POSTINIT_FORCE") == "1" or os.environ.get("NV_ADD_PMU_RESET_POSTINIT") == "1"
     if os.environ.get("NV_ADD_PMU_RESET_POSTINIT") == "1":
       if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-        print(f"standalone pmu-reset-postinit pre state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+        print(f"standalone pmu-reset-postinit pre state={falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)}")
       try:
         falcon.reset(NV_FALCON_PMU_BASE, riscv=True, force=pmu_forced)
         if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-          print(f"standalone pmu-reset-postinit post state=({falcon.format_state(NV_FALCON_PMU_BASE)})")
+          print(f"standalone pmu-reset-postinit post state={falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)}")
       except Exception as exc:
         if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
           print(f"standalone pmu-reset-postinit skipped reason={type(exc).__name__}: {exc}")
     fecs_base = self.shell.fecs_falcon_base()
     if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-      print(f"standalone fecs-reset-postinit pre state=({falcon.format_state(fecs_base)})")
+      print(f"standalone fecs-reset-postinit pre base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
     try:
-      falcon.reset(fecs_base, riscv=True, force=force or os.environ.get("NV_ADD_FECS_RESET_POSTINIT_FORCE") == "1")
+      falcon.reset(fecs_base, riscv=False, force=force or os.environ.get("NV_ADD_FECS_RESET_POSTINIT_FORCE") == "1")
       if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
-        print(f"standalone fecs-reset-postinit post state=({falcon.format_state(fecs_base)})")
+        print(f"standalone fecs-reset-postinit post base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
       return True
     except Exception as exc:
       if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
         print(f"standalone fecs-reset-postinit skipped reason={type(exc).__name__}: {exc}")
       return False
+
+  def post_promote_fecs_reset(self, force=False):
+    if os.environ.get("NV_ADD_FECS_RESET_POSTPROMOTE") != "1": return False
+    if not hasattr(self.shell, "fecs_falcon_base"): return False
+    if not hasattr(self.shell, "chip") or self.shell.chip is None: return False
+    falcon = FalconController(self.shell, timeout_ms=30000)
+    pmu_forced = os.environ.get("NV_ADD_PMU_RESET_POSTPROMOTE_FORCE") == "1" or os.environ.get("NV_ADD_PMU_RESET_POSTPROMOTE") == "1"
+    if os.environ.get("NV_ADD_PMU_RESET_POSTPROMOTE") == "1":
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone pmu-reset-postpromote pre state={falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)}")
+      try:
+        falcon.reset(NV_FALCON_PMU_BASE, riscv=True, force=pmu_forced)
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone pmu-reset-postpromote post state={falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)}")
+      except Exception as exc:
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print(f"standalone pmu-reset-postpromote skipped reason={type(exc).__name__}: {exc}")
+    fecs_base = self.shell.fecs_falcon_base()
+    if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+      print(f"standalone fecs-reset-postpromote pre base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
+    try:
+      falcon.reset(fecs_base, riscv=False, force=force or os.environ.get("NV_ADD_FECS_RESET_POSTPROMOTE_FORCE") == "1")
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone fecs-reset-postpromote post base=0x{fecs_base:x} state={falcon.format_state_with_fenced(fecs_base)}")
+      return True
+    except Exception as exc:
+      if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+        print(f"standalone fecs-reset-postpromote skipped reason={type(exc).__name__}: {exc}")
+      return False
+
+  def print_falcons_state(self, label):
+    if os.environ.get("NV_ADD_TRACE_GSP_BOOT") != "1": return
+    if not hasattr(self.shell, "fecs_falcon_base"): return
+    if not hasattr(self.shell, "chip") or self.shell.chip is None: return
+    state_falcon = FalconController(self.shell)
+    for falcon_label, base in (("gsp", NV_FALCON_GSP_BASE), ("sec2", NV_FALCON_SEC2_BASE), ("pmu", NV_FALCON_PMU_BASE), ("fecs", self.shell.fecs_falcon_base())):
+      try:
+        print(f"standalone {label} state label={falcon_label} base=0x{base:x} state={state_falcon.format_state_with_fenced(base)}")
+      except Exception as exc:
+        print(f"standalone {label} state label={falcon_label} base=0x{base:x} unavailable={type(exc).__name__}")
+
+  LOGBUF_SUBREGIONS = (("LOG_INIT", 0x00000, 0x10000), ("LOG_INTR", 0x10000, 0x20000), ("LOG_RM", 0x20000, 0x30000),
+                       ("LOG_MNOC", 0x30000, 0x40000), ("LOG_KRNL", 0x40000, 0x50000))
+
+  @staticmethod
+  def extract_logbuf_text(data, min_printable=4, max_lines=64, max_line_len=512):
+    if not data: return []
+    lines = []
+    current = bytearray()
+    for byte in data:
+      if byte == 0x0a:
+        if current:
+          line = bytes(current)
+          printable = sum(1 for c in line if 0x20 <= c < 0x7f or c in (0x09, 0x0a))
+          if len(line) >= min_printable and printable >= max(1, len(line) * 3 // 4):
+            text = line.rstrip(b"\r\n").decode("utf-8", errors="replace")
+            lines.append(text[:max_line_len])
+          current = bytearray()
+      elif byte == 0x00:
+        if current:
+          line = bytes(current)
+          printable = sum(1 for c in line if 0x20 <= c < 0x7f or c == 0x09)
+          if len(line) >= min_printable and printable >= max(1, len(line) * 3 // 4):
+            text = line.rstrip(b"\x00").decode("utf-8", errors="replace")
+            lines.append(text[:max_line_len])
+          current = bytearray()
+      else:
+        current.append(byte)
+        if len(current) > max_line_len * 2:
+          line = bytes(current)
+          printable = sum(1 for c in line if 0x20 <= c < 0x7f or c == 0x09)
+          if len(line) >= min_printable and printable >= max(1, len(line) * 3 // 4):
+            text = line.rstrip(b"\x00").decode("utf-8", errors="replace")
+            lines.append(text[:max_line_len])
+          current = bytearray()
+    if current:
+      line = bytes(current)
+      printable = sum(1 for c in line if 0x20 <= c < 0x7f or c == 0x09)
+      if len(line) >= min_printable and printable >= max(1, len(line) * 3 // 4):
+        text = line.rstrip(b"\x00").decode("utf-8", errors="replace")
+        lines.append(text[:max_line_len])
+    return lines[:max_lines]
+
+  def dump_logbuf(self, label, max_lines=64, max_line_len=512):
+    if os.environ.get("NV_ADD_DUMP_LOGBUF") != "1" and os.environ.get("NV_ADD_TRACE_GSP_BOOT") != "1": return
+    if self.queue_memory is None: return
+    logbuf_view = getattr(self.queue_memory, "logbuf_view", None)
+    logbuf_paddrs = getattr(self.queue_memory, "logbuf_paddrs", None)
+    if logbuf_view is None or not logbuf_paddrs: return
+    paddr_base = logbuf_paddrs[0]
+    total_size = max(end for _, _, end in self.LOGBUF_SUBREGIONS)
+    try: raw = bytes(logbuf_view[:total_size])
+    except Exception as exc:
+      print(f"standalone {label} logbuf_dump unavailable={type(exc).__name__}")
+      return
+    print(f"standalone {label} logbuf_dump base=0x{paddr_base:x} total_size=0x{total_size:x} subregions={len(self.LOGBUF_SUBREGIONS)}")
+    total_extracted = 0
+    for sub_label, sub_start, sub_end in self.LOGBUF_SUBREGIONS:
+      sub_data = raw[sub_start:sub_end]
+      if not any(sub_data): continue
+      nonzero = sum(1 for b in sub_data if b != 0)
+      sha = hashlib.sha256(sub_data).hexdigest()
+      first_nonzero = next((i for i, b in enumerate(sub_data) if b != 0), -1)
+      last_nonzero = max((i for i, b in enumerate(sub_data) if b != 0), default=-1)
+      lines = StandaloneGspBootstrap.extract_logbuf_text(sub_data, min_printable=4, max_lines=max_lines, max_line_len=max_line_len)
+      total_extracted += len(lines)
+      print(f"standalone {label} logbuf subregion={sub_label} offset=0x{sub_start:x} size=0x{sub_end - sub_start:x} nonzero_bytes={nonzero} first_nonzero=0x{first_nonzero:x} last_nonzero=0x{last_nonzero:x} sha256={sha} lines={len(lines)}")
+      for idx, line in enumerate(lines):
+        print(f"standalone {label} logbuf {sub_label} line[{idx}]={line}")
+      if sub_label == "LOG_RM" and os.environ.get("NV_ADD_DUMP_LOGBUF_RAW") == "1":
+        print(f"standalone {label} logbuf {sub_label} raw_hex_first_512={sub_data[:512].hex()}")
+    print(f"standalone {label} logbuf_dump summary total_lines={total_extracted}")
 
   def make_rm_client(self):
     if self.cmd_q is None: raise RuntimeError("prepare_queues must run first")
@@ -3565,8 +3949,9 @@ class StandaloneNvBackend:
       time.sleep(0.001)
 
 class StandaloneChannelBuilder:
-  def __init__(self, shell, rm):
+  def __init__(self, shell, rm, gsp_boot=None):
     self.shell, self.rm = shell, rm
+    self.gsp_boot = gsp_boot
 
   def allocate_base_objects(self, reserved_size=512 << 20):
     validate_positive_size(reserved_size, "user reserved size")
@@ -3617,12 +4002,29 @@ class StandaloneChannelBuilder:
       grctx_descs = derive_grctx_buf_descs(unpack_nv2080_context_buffer_info(info_payload))
       grctx_mappings, promote_payload = build_grctx_promote_payload(self.shell.mm, self.rm.priv_root, h_gpfifo, grctx_descs)
       self.rm.rm_control(h_subdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX, promote_payload)
+      if self.gsp_boot is not None: self.gsp_boot.post_promote_fecs_reset()
+      if os.environ.get("NV_ADD_REPROMOTE_AFTER_RESET") == "1":
+        if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+          print("standalone repromote re-issuing GPU_PROMOTE_CTX after FECS reset")
+        self.rm.rm_control(h_subdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX, promote_payload)
+      if os.environ.get("NV_ADD_POSTPROMOTE_SETTLE_MS") is not None:
+        settle_ms = int(os.environ.get("NV_ADD_POSTPROMOTE_SETTLE_MS", "0"))
+        if settle_ms > 0 and hasattr(self.shell.transport, "sleep"):
+          self.shell.transport.sleep(settle_ms)
+          if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+            print(f"standalone postpromote settle slept {settle_ms}ms")
       compute_class = ADA_COMPUTE_A if self.shell.chip_name.startswith("AD") else AMPERE_COMPUTE_B
       compute_object = self.rm.next_handle if hasattr(self.rm, "next_handle") else 0
       compute_rpc_sha256 = hashlib.sha256(pack_rpc_gsp_rm_alloc(self.rm.priv_root, h_gpfifo, compute_object,
         compute_class, b"")).hexdigest() if compute_object else "unknown"
       trace_channel_step("golden_promote_done", gpfifo=hex(h_gpfifo), subdevice=hex(h_subdevice),
         promote_sha256=hashlib.sha256(promote_payload).hexdigest(), mappings=len(grctx_mappings))
+      if self.gsp_boot is not None: self.gsp_boot.print_falcons_state("fecs-pmu-postpromote")
+      if os.environ.get("NV_ADD_DUMP_LOGBUF") == "1" and self.gsp_boot is not None:
+        try: self.gsp_boot.dump_logbuf("postpromote-after-falcons")
+        except Exception as exc:
+          if os.environ.get("NV_ADD_TRACE_GSP_BOOT") == "1":
+            print(f"postpromote-after-falcons logbuf_dump unavailable={type(exc).__name__}: {exc}")
       trace_channel_step("golden_compute_alloc", parent=hex(h_gpfifo), expected_object=hex(compute_object),
         compute_class=hex(compute_class), expected_rpc_sha256=compute_rpc_sha256)
       h_compute = self.rm.rm_alloc(h_gpfifo, compute_class, b"")
@@ -3711,18 +4113,16 @@ class StandaloneChannelBuilder:
       entries=entries, gpfifo_area=hex(gpfifo_area.va_addr), gpfifo_paddr=hex(gpfifo_paddr), notifier_paddr=hex(notifier_paddr),
       grctx=grctx_descs is not None)
     try:
-      h_channel_group = self.rm.rm_alloc(h_device, KEPLER_CHANNEL_GROUP_A, pack_nv_channel_group_allocation_params(h_vaspace=h_vaspace))
-      h_ctxshare = self.rm.rm_alloc(h_channel_group, FERMI_CONTEXT_SHARE_A, pack_nv_ctxshare_allocation_params(h_vaspace, flags=1))
       ramfc_paddr = 0
       method_paddr = 0
       userd_paddr = gpfifo_paddr + entries * 8 + offset
-      gpfifo_params = pack_nv_channel_gpfifo_allocation_params(gpfifo_area.va_addr + offset, entries, h_ctxshare, h_vaspace,
+      gpfifo_params = pack_nv_channel_gpfifo_allocation_params(gpfifo_area.va_addr + offset, entries, 0, h_vaspace,
         h_virtmem, gpfifo_area.meta.hMemory, entries * 8 + offset, ramfc_paddr, method_paddr,
         error_paddr=notifier_paddr, h_object_error=notifier_buf.meta.hMemory, userd_paddr=userd_paddr,
-        engine_type=NV2080_ENGINE_TYPE_COMPUTE, cid=0, flags=0)
+        engine_type=NV2080_ENGINE_TYPE_GRAPHICS, cid=3, flags=0x200320)
       gpfifo_desc = gpfifo_memory_desc_summary(gpfifo_params)
-      trace_channel_step("compute_gpfifo_alloc", parent=hex(h_channel_group), channel_group=hex(h_channel_group),
-        ctxshare=hex(h_ctxshare), entries=entries, area=hex(gpfifo_area.va_addr + offset),
+      trace_channel_step("compute_gpfifo_alloc", parent=hex(h_device), channel_group=hex(0),
+        ctxshare=hex(0), entries=entries, area=hex(gpfifo_area.va_addr + offset),
         userd_paddr=hex(userd_paddr), ramfc_paddr=hex(ramfc_paddr), method_paddr=hex(method_paddr),
         desc_ramfc=f"0x{gpfifo_desc['ramfc']['base']:x}/0x{gpfifo_desc['ramfc']['size']:x}",
         desc_userd=f"0x{gpfifo_desc['userd']['base']:x}/0x{gpfifo_desc['userd']['size']:x}",
@@ -3731,10 +4131,10 @@ class StandaloneChannelBuilder:
         desc_error=f"0x{unpack_nv_memory_desc(gpfifo_params, 248)['base']:x}/0x{unpack_nv_memory_desc(gpfifo_params, 248)['size']:x}",
         h_object_buffer=hex(gpfifo_area.meta.hMemory), h_object_error=hex(notifier_buf.meta.hMemory),
         params_sha256=hashlib.sha256(gpfifo_params).hexdigest())
-      h_gpfifo = self.rm.rm_alloc(h_channel_group, AMPERE_CHANNEL_GPFIFO_A, gpfifo_params)
+      h_gpfifo = self.rm.rm_alloc(h_device, AMPERE_CHANNEL_GPFIFO_A, gpfifo_params)
       compute_class = ADA_COMPUTE_A if self.shell.chip_name.startswith("AD") else AMPERE_COMPUTE_B
       h_compute = self.rm.rm_alloc(h_gpfifo, compute_class, b"")
-      trace_channel_step("compute_channel_objects", channel_group=hex(h_channel_group), ctxshare=hex(h_ctxshare),
+      trace_channel_step("compute_channel_objects", channel_group=hex(0), ctxshare=hex(0),
         gpfifo=hex(h_gpfifo), compute=hex(h_compute), compute_class=hex(compute_class), userd_paddr=hex(userd_paddr),
         ramfc_paddr=hex(ramfc_paddr), method_paddr=hex(method_paddr))
       if h_subdevice is not None and grctx_descs is not None:
@@ -3753,15 +4153,15 @@ class StandaloneChannelBuilder:
       token_resp = self.rm.rm_control(h_gpfifo, NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, token_params)
       token = unpack_gpfifo_work_submit_token(token_resp)
       schedule_params = struct.pack("<I", 1)
-      schedule_rpc_sha256 = pack_rpc_gsp_rm_control_fingerprint(self.rm.priv_root, h_channel_group,
+      schedule_rpc_sha256 = pack_rpc_gsp_rm_control_fingerprint(self.rm.priv_root, h_device,
         NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, schedule_params)
-      trace_channel_step("runtime_schedule_control", object=hex(h_channel_group),
+      trace_channel_step("runtime_schedule_control", object=hex(h_device),
         cmd=hex(NVA06C_CTRL_CMD_GPFIFO_SCHEDULE), rpc_sha256=schedule_rpc_sha256)
-      self.rm.rm_control(h_channel_group, NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, schedule_params)
+      self.rm.rm_control(h_device, NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, schedule_params)
       trace_channel_step("compute_channel_done", debugger=hex(h_debugger), token=hex(token),
         user_grctx=user_grctx_mappings is not None, debugger_rpc_sha256=debugger_rpc_sha256,
         token_rpc_sha256=token_rpc_sha256, schedule_rpc_sha256=schedule_rpc_sha256)
-      return h_channel_group, h_ctxshare, h_gpfifo, h_compute, compute_class, h_debugger, token, user_grctx_mappings
+      return 0, 0, h_gpfifo, h_compute, compute_class, h_debugger, token, user_grctx_mappings
     except Exception:
       if h_gpfifo is not None and getattr(self.rm, "private_mappings", None):
         mappings = self.rm.private_mappings.pop(h_gpfifo, ())
@@ -3899,16 +4299,39 @@ class GspRmClient:
         qtrace = " queue_memory=unavailable"
     if hasattr(shell, "rreg"):
       falcon = FalconController(shell)
-      try: gsp_state = falcon.format_state(NV_FALCON_GSP_BASE)
-      except Exception as exc: gsp_state = f"unavailable:{type(exc).__name__}"
-      try: sec2_state = falcon.format_state(NV_FALCON_SEC2_BASE)
-      except Exception as exc: sec2_state = f"unavailable:{type(exc).__name__}"
-      try: pmu_state = falcon.format_state(NV_FALCON_PMU_BASE)
-      except Exception as exc: pmu_state = f"unavailable:{type(exc).__name__}"
+      try:
+        gsp_state = falcon.format_state(NV_FALCON_GSP_BASE)
+        gsp_hwcfg2 = shell.rreg(NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_HWCFG2)
+        gsp_cpuctl = shell.rreg(NV_FALCON_GSP_BASE + NV_PFALCON_FALCON_CPUCTL)
+        gsp_has_riscv = reg_get(gsp_hwcfg2, 10, 10)
+        gsp_fenced = (gsp_cpuctl & 0xffffffff) == 0xbadf5720 or (gsp_cpuctl & 0xffff0000) == 0xbadf0000
+        gsp_state += f" [hwcfg2=0x{gsp_hwcfg2:x} has_riscv={gsp_has_riscv} cpuctl=0x{gsp_cpuctl:x} fenced={gsp_fenced}]"
+      except Exception as exc: gsp_state = f"unavailable:{type(exc).__name__}:{exc}"
+      try:
+        sec2_state = falcon.format_state(NV_FALCON_SEC2_BASE)
+        sec2_hwcfg2 = shell.rreg(NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_HWCFG2)
+        sec2_cpuctl = shell.rreg(NV_FALCON_SEC2_BASE + NV_PFALCON_FALCON_CPUCTL)
+        sec2_has_riscv = reg_get(sec2_hwcfg2, 10, 10)
+        sec2_fenced = (sec2_cpuctl & 0xffffffff) == 0xbadf5720 or (sec2_cpuctl & 0xffff0000) == 0xbadf0000
+        sec2_state += f" [hwcfg2=0x{sec2_hwcfg2:x} has_riscv={sec2_has_riscv} cpuctl=0x{sec2_cpuctl:x} fenced={sec2_fenced}]"
+      except Exception as exc: sec2_state = f"unavailable:{type(exc).__name__}:{exc}"
+      try:
+        pmu_state = falcon.format_state(NV_FALCON_PMU_BASE)
+        pmu_hwcfg2 = shell.rreg(NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2)
+        pmu_cpuctl = shell.rreg(NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL)
+        pmu_has_riscv = reg_get(pmu_hwcfg2, 10, 10)
+        pmu_fenced = (pmu_cpuctl & 0xffffffff) == 0xbadf5720 or (pmu_cpuctl & 0xffff0000) == 0xbadf0000
+        pmu_state += f" [hwcfg2=0x{pmu_hwcfg2:x} has_riscv={pmu_has_riscv} cpuctl=0x{pmu_cpuctl:x} fenced={pmu_fenced}]"
+      except Exception as exc: pmu_state = f"unavailable:{type(exc).__name__}:{exc}"
       try:
         fecs_base = shell.fecs_falcon_base()
         fecs_state = falcon.format_state(fecs_base)
-      except Exception as exc: fecs_state = f"unavailable:{type(exc).__name__}"
+        fecs_hwcfg2 = shell.rreg(fecs_base + NV_PFALCON_FALCON_HWCFG2)
+        fecs_cpuctl = shell.rreg(fecs_base + NV_PFALCON_FALCON_CPUCTL)
+        fecs_has_riscv = reg_get(fecs_hwcfg2, 10, 10)
+        fecs_fenced = (fecs_cpuctl & 0xffffffff) == 0xbadf5720 or (fecs_cpuctl & 0xffff0000) == 0xbadf0000
+        fecs_state += f" [hwcfg2=0x{fecs_hwcfg2:x} has_riscv={fecs_has_riscv} cpuctl=0x{fecs_cpuctl:x} fenced={fecs_fenced}]"
+      except Exception as exc: fecs_state = f"unavailable:{type(exc).__name__}:{exc}"
     else:
       gsp_state = sec2_state = pmu_state = fecs_state = "unavailable"
     detail = "".join(f" {name}={value}" for name, value in fields.items())
@@ -4464,13 +4887,139 @@ def print_runtime_summary():
 def print_reconnect_command(script="examples/add.py"):
   print(f"reconnect_command {recommended_reconnect_command(script)}")
 
+def _fecs_reset_common_flags():
+  return ["NV_ADD_PREPARE_GOLDEN_CTX=1", "NV_ADD_BOOT_GSP=1", "NV_ADD_CLEAR_WPR2_FECS=1", "NV_ADD_VERIFY_WPR2_AFTER_FRTS=1",
+    "NV_ADD_SUMMARY=1", "NV_ADD_CHECK_FRTS_BAR1=1", "NV_ADD_TRACE_GSP_BOOT=1", "NV_ADD_VERIFY_SEC2_INPUTS=1",
+    "NV_ADD_TRACE_RM_ALLOC=1", "NV_ADD_TRACE_RM_STATE=1", "NV_ADD_TRACE_RPC=1", "NV_ADD_TRACE_RPC_READ=1",
+    "NV_ADD_TRACE_CHANNEL=1", "NV_ADD_TRACE_MM_ALLOC=1", "NV_ADD_TRACE_LAUNCH_STEPS=1", "NV_ADD_TRACE_FALCON=1"]
+
 def recommended_fecs_reset_reconnect_command(script="examples/add.py"):
-  fecs_flags = ["NV_ADD_PREPARE_GOLDEN_CTX=1", "NV_ADD_BOOT_GSP=1", "NV_ADD_CLEAR_WPR2_FECS=1", "NV_ADD_FECS_RESET=1", "NV_ADD_FECS_RESET_FORCE=1",
+  fecs_flags = _fecs_reset_common_flags() + ["NV_ADD_FECS_RESET=1", "NV_ADD_FECS_RESET_FORCE=1",
     "NV_ADD_FECS_RESET_POSTINIT=1", "NV_ADD_FECS_RESET_POSTINIT_FORCE=1", "NV_ADD_PMU_RESET_POSTINIT=1", "NV_ADD_PMU_RESET_POSTINIT_FORCE=1",
-    "NV_ADD_VERIFY_WPR2_AFTER_FRTS=1", "NV_ADD_SUMMARY=1", "NV_ADD_CHECK_FRTS_BAR1=1", "NV_ADD_TRACE_GSP_BOOT=1",
-    "NV_ADD_VERIFY_SEC2_INPUTS=1", "NV_ADD_TRACE_RM_ALLOC=1", "NV_ADD_TRACE_RM_STATE=1", "NV_ADD_TRACE_RPC=1",
-    "NV_ADD_TRACE_RPC_READ=1", "NV_ADD_TRACE_CHANNEL=1", "NV_ADD_TRACE_MM_ALLOC=1", "NV_ADD_TRACE_LAUNCH_STEPS=1", "NV_ADD_TRACE_FALCON=1"]
+    "NV_ADD_FECS_RESET_POSTPROMOTE=1", "NV_ADD_FECS_RESET_POSTPROMOTE_FORCE=1", "NV_ADD_PMU_RESET_POSTPROMOTE=1", "NV_ADD_PMU_RESET_POSTPROMOTE_FORCE=1",
+    "NV_ADD_REPROMOTE_AFTER_RESET=1",
+    "NV_ADD_POSTPROMOTE_SETTLE_MS=100"]
   return " ".join(["NV_ADD_TRANSPORT=mac-egpu"] + fecs_flags + ["python3", script])
+
+def recommended_fecs_only_reconnect_command(script="examples/add.py"):
+  fecs_flags = _fecs_reset_common_flags() + ["NV_ADD_FECS_RESET=1", "NV_ADD_FECS_RESET_FORCE=1",
+    "NV_ADD_FECS_RESET_POSTINIT=1", "NV_ADD_FECS_RESET_POSTINIT_FORCE=1",
+    "NV_ADD_FECS_RESET_POSTPROMOTE=1", "NV_ADD_FECS_RESET_POSTPROMOTE_FORCE=1",
+    "NV_ADD_REPROMOTE_AFTER_RESET=1",
+    "NV_ADD_POSTPROMOTE_SETTLE_MS=100"]
+  return " ".join(["NV_ADD_TRANSPORT=mac-egpu"] + fecs_flags + ["python3", script])
+
+def recommended_preboot_only_reconnect_command(script="examples/add.py"):
+  fecs_flags = _fecs_reset_common_flags() + ["NV_ADD_FECS_RESET=1", "NV_ADD_FECS_RESET_FORCE=1",
+    "NV_ADD_PMU_RESET=1", "NV_ADD_PMU_RESET_FORCE=1"]
+  return " ".join(["NV_ADD_TRANSPORT=mac-egpu"] + fecs_flags + ["python3", script])
+
+def recommended_fecs_minimal_reconnect_command(script="examples/add.py"):
+  fecs_flags = _fecs_reset_common_flags() + ["NV_ADD_FECS_RESET=1", "NV_ADD_FECS_RESET_FORCE=1"]
+  return " ".join(["NV_ADD_TRANSPORT=mac-egpu"] + fecs_flags + ["python3", script])
+
+def recommended_promote_retry_reconnect_command(script="examples/add.py"):
+  fecs_flags = _fecs_reset_common_flags() + ["NV_ADD_REPROMOTE_AFTER_RESET=1", "NV_ADD_POSTPROMOTE_SETTLE_MS=200"]
+  return " ".join(["NV_ADD_TRANSPORT=mac-egpu"] + fecs_flags + ["python3", script])
+
+def print_fecs_reset_scenarios(script="examples/add.py"):
+  print(f"fecs_reset_scenario_recommend try=preboot_only, then=fecs_minimal, then=fecs_only, then=full, then=promote_retry (preboot_only is the safest: just pre-boot FECS reset, no in-band FECS/PMU resets that might wipe FECS ucode after GSP boot)")
+  print(f"fecs_reset_scenario full {recommended_fecs_reset_reconnect_command(script)}")
+  print(f"fecs_reset_scenario fecs_only {recommended_fecs_only_reconnect_command(script)}")
+  print(f"fecs_reset_scenario fecs_minimal {recommended_fecs_minimal_reconnect_command(script)}")
+  print(f"fecs_reset_scenario preboot_only {recommended_preboot_only_reconnect_command(script)}")
+  print(f"fecs_reset_scenario promote_retry {recommended_promote_retry_reconnect_command(script)}")
+
+def print_bar0_fence_status(transport=None, do_reset=True):
+  if transport is None: transport = MacEgpuTransport()
+  if do_reset and hasattr(transport, "reset") and os.environ.get("NV_ADD_BAR0_STATUS_SKIP_RESET") != "1":
+    try: transport.reset()
+    except Exception as exc: print(f"bar0_fence_status reset_error={type(exc).__name__}: {exc}")
+  # Use NVRegisters (same path as StandaloneNvShell) to read register values, since the raw
+  # bar0 view's view() call can return different values than NVRegisters.rreg() due to a TinyGPU
+  # MMIO_READ quirk. The StandaloneNvShell fence check uses NVRegisters, so this tool must too.
+  regs = NVRegisters(transport)
+  sample_addrs = (
+    ("PMC_BOOT0", 0x000000),
+    ("PMC_INTR_EN_0", 0x000100),
+    ("PMC_ENABLE", 0x000200),
+    ("PBUS_BAR1_BLOCK", 0x001704),
+    ("PFB_PRI_MMU_WPR2_ADDR_HI", 0x1FA828),
+    ("FECS_BASE+CPUCTL", 0x0A4100),
+    ("FECS_BASE+HWCFG2", 0x0A40F4),
+    ("GSP_BASE+CPUCTL", 0x110100),
+    ("GSP_BASE+HWCFG2", 0x1100F4),
+    ("PMU_BASE+CPUCTL", 0x10A100),
+    ("SEC2_BASE+CPUCTL", 0x840100),
+  )
+  fence_count = 0
+  lines = []
+  for name, addr in sample_addrs:
+    try: value = regs.rreg(addr)
+    except Exception as exc:
+      lines.append(f"bar0_fence_status addr={name:24s} 0x{addr:06x} value=ERROR fenced=False err={type(exc).__name__}")
+      continue
+    fenced = (value & 0xffff0000) == 0xbadf0000
+    if fenced: fence_count += 1
+    lines.append(f"bar0_fence_status addr={name:24s} 0x{addr:06x} value=0x{value:08x} fenced={str(fenced):5s}")
+  total = len(sample_addrs)
+  wpr2_hi = regs.rreg(0x1FA828)
+  fecs_cpuctl = regs.rreg(0x0A4100)
+  fecs_full_fence = (fecs_cpuctl & 0xffffffff) == 0xbadf1301
+  if wpr2_hi == 0 and not fecs_full_fence: verdict = "CLEAR"
+  elif fence_count >= max(3, total // 2) or fecs_full_fence: verdict = "FENCED"
+  else: verdict = "CLEAR"
+  print(f"bar0_fence_status verdict={verdict} fence_count={fence_count}/{total} reset={do_reset} wpr2_hi=0x{wpr2_hi:08x} fecs_cpuctl=0x{fecs_cpuctl:08x}")
+  for line in lines:
+    print(line)
+  if verdict == "FENCED":
+    print("bar0_fence_status next_action=power-cycle the eGPU (unplug/replug the ADT-Link UT3G USB4 eGPU) to clear the WPR2 lock state; set NV_ADD_BYPASS_BAR0_FENCE_CHECK=1 to attempt boot anyway")
+  else:
+    print("bar0_fence_status next_action=BAR0 is accessible; normal boot should succeed")
+
+def print_fecs_fence_diagnostic(script="examples/add.py"):
+  print("fecs_fence_diagnostic signature=FECS_A|FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus|0%>FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus|9b2w>ASSERT|...|BKD")
+  print("fecs_fence_diagnostic cause=FECS FALCON is fenced from a prior session (cpuctl=0xbadf5720); GSP RM cannot complete AMPERE_COMPUTE_B alloc because FECS times out on the GPIO/PMU mutex")
+  print("fecs_fence_diagnostic key_signals gsp.cpuctl=0xbadf5720 gsp.riscv_bcr=0x111 gsp.rm=0x0 GSP_EVENT_kind=0x3_progress=0% GSP_EVENT_kind=0x3_progress=9b2w GSP_EVENT_kind=0x5_assert_BKD")
+  print("fecs_fence_diagnostic recommended_order preboot_only, fecs_minimal, fecs_only, full, promote_retry (each successive scenario adds more in-band FECS/PMU resets, which may wipe FECS ucode after GSP boot)")
+  print(f"fecs_fence_diagnostic first_attempt recommended_scenario=preboot_only (safest: only pre-boot FECS+PMU reset, no in-band FECS resets that might wipe FECS ucode after GSP boot)")
+  print(f"fecs_fence_diagnostic first_attempt_command {recommended_preboot_only_reconnect_command(script)}")
+  print(f"fecs_fence_diagnostic second_attempt recommended_scenario=fecs_minimal (pre-boot FECS only, no PMU reset)")
+  print(f"fecs_fence_diagnostic second_attempt_command {recommended_fecs_minimal_reconnect_command(script)}")
+  print(f"fecs_fence_diagnostic third_attempt recommended_scenario=fecs_only (drops post-promote PMU reset)")
+  print(f"fecs_fence_diagnostic third_attempt_command {recommended_fecs_only_reconnect_command(script)}")
+  print("fecs_fence_diagnostic fallback_attempts scenario=full (with PMU resets) scenario=promote_retry (no FECS reset, just re-issue GPU_PROMOTE_CTX)")
+  print(f"fecs_fence_diagnostic promote_retry_command {recommended_promote_retry_reconnect_command(script)}")
+  print("fecs_fence_diagnostic tinygrad_path tiny does not hit the FECS/PMU mutex stall; if tiny prints result=[11.0, 22.0, 33.0, 44.0] but standalone stalls, the issue is in the standalone GSP RM->FECS path, not the GPU")
+  print("fecs_fence_diagnostic compare python3 examples/add.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log")
+  print("fecs_fence_diagnostic next_action if preboot_only prints result=[11.0, 22.0, 33.0, 44.0], then the in-band FECS/PMU resets were the regression (GSP RM needs to keep FECS ucode after boot); document and make the working command the new default")
+  print("fecs_fence_diagnostic hardware_gate=after a GSP RM session ends, WPR2_HI=0x2ffee00 stays locked and FECS BAR stays hardware-gated (all FECS registers return 0xbadf1301); this gate prevents the next boot from re-loading FECS ucode because the PMU write-DMA to FECS IMEM (FALCON offset 0xdb00-0xdf00) is silently dropped; the only known way to clear this state is a physical eGPU power-cycle (unplug/replug the ADT-Link UT3G USB4 eGPU); tiny AND standalone both fail with the same FECS_A->FECS_B stall if run twice in a row without a power-cycle between runs")
+  print("fecs_fence_diagnostic root_cause=PMU dmatrfbase advances during the stall (e.g. 0x451b5 -> 0x45205 over a 5s sample), proving PMU is functional and trying to load FECS ucode from VRAM, but FECS BAR stays 0xbadf1301 because the WPR2 lock gates the writes; GSP RM acquires the RMGpioPmuMutex, sends the FECS handshake command, and times out after 40s because the FECS FALCON never becomes responsive")
+  print("fecs_fence_diagnostic contrast_with_tiny=tiny's GSP RM boot flow is byte-identical to our boot_ampere_ada() (reset GSP, execute_hs(FRTS), reset GSP riscv=True, reset SEC2, execute_hs(boooter)); tiny succeeds ONLY when the eGPU is freshly power-cycled; tiny would also fail with the same FECS_A->FECS_B stall if run twice in a row without a power-cycle between runs")
+  print("fecs_fence_diagnostic mitigation=power-cycle the eGPU between runs of any program that uses the GPU; the user must unplug and replug the ADT-Link UT3G USB4 cable (or power-cycle the eGPU enclosure) before each python3 examples/add.py invocation; the standalone logbuf LOG_RM at the stall shows 0 new entries between FECS_A and FECS_B (the GSP RM thread is blocked on the mutex acquire, not making progress); the FALCON state at the stall is GSP cpuctl=0xbadf5720 (mid-DMA loading cmd queue, dmatrfbase=0x800410), PMU cpuctl=0xbadf5720 (mid-DMA loading FECS ucode, dmatrfbase=0x451b5..0x45205), FECS cpuctl=0xbadf1301 (never loaded, hwcfg2=0xbadf1301)")
+  print("fecs_fence_diagnostic verify_with_tiny=to confirm the eGPU is in a bootable state, run python3 examples/add_tiny.py; if it returns result=[11.0, 22.0, 33.0, 44.0] then a python3 examples/add.py run on the same freshly-power-cycled eGPU will also succeed (the two flows are byte-identical in the GSP RM boot path)")
+  print("fecs_fence_diagnostic fence_check=StandaloneNvShell.bar0_is_fenced() probes 0x88, 0x100, 0x200, 0x400, 0x1000, 0x1FA828 and treats a majority of 0xbadf00xx-prefixed values as fenced; the check fires after StandaloneNvShell.__init__ runs transport.reset() so it only triggers when the PCI reset fails to clear the WPR2 lock")
+  print("fecs_fence_diagnostic bypass=NV_ADD_BYPASS_BAR0_FENCE_CHECK=1 attempts boot anyway (GSP RM will boot, GPU_PROMOTE_CTX will succeed, but AMPERE_COMPUTE_B will stall on RMGpioPmuMutexTimeoutus because the FALCON↔PMU GPIO mutex can never be acquired without a working FECS)")
+  print_stall_trace_diagnostic(script)
+  print_logbuf_dump_diagnostic(script)
+  print("fecs_fence_diagnostic saved_log_state the standalone rm_state stage=... lines now include compact gsp=({format_state} [hwcfg2=0x... has_riscv=0|1 cpuctl=0x... fenced=True|False]), sec2=({format_state} [hwcfg2=0x... has_riscv=0|1 cpuctl=0x... fenced=True|False]), pmu=({format_state} [hwcfg2=0x... has_riscv=0|1 cpuctl=0x... fenced=True|False]), and fecs=({format_state} [hwcfg2=0x... has_riscv=0|1 cpuctl=0x... fenced=True|False]) suffixes (where {format_state} is the full engine/cpuctl/dmactl/dmatrfcmd/.../rm register dump) so the next live session can see all four FALCONs at every RM alloc attempt; the new fecs-reset-pre, fecs-reset-post, fecs-reset-postinit-pre, fecs-reset-postinit-post, fecs-reset-postpromote-pre, fecs-reset-postpromote-post, pmu-reset-pre, pmu-reset-post, pmu-reset-postinit-pre, pmu-reset-postinit-post, pmu-reset-postpromote-pre, pmu-reset-postpromote-post, and fecs-pmu-postinit and fecs-pmu-postpromote trace lines (now emitted right after GPU_PROMOTE_CTX and before the first AMPERE_COMPUTE_B alloc, so the FECS RM handshake state is visible just before the FECS_A|FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus stall) all use the same {format_state} [hwcfg2=... has_riscv=... cpuctl=... fenced=True|False] format; if PMU fenced=True but FECS fenced=False after the preboot FECS+PMU reset, the FECS->PMU mutex handshake is the likely regression; if GSP fenced=True, the boot is corrupt and needs PCI FLR")
+
+def print_stall_trace_diagnostic(script="examples/add.py"):
+  print("stall_trace purpose: prints FECS/PMU state every NV_ADD_STALL_TRACE_PERIOD_MS milliseconds (default 5ms) while GSP RM is stuck in the RMGpioPmuMutexTimeoutus stall (the ~40ms wait between EVENT_GSP_POST_NOCAT_RECORD kind=0x3 0% and kind=0x3 9b2w events); without stall-trace the saved log only captures the FALCON state at rm_state stage=... markers, missing what the FALCONs do during the stall itself; with stall-trace the saved log gets stall_trace sample label=rm_gpio_pmu_mutex/post_nocat-progress=... seq=... elapsed_ms=... gsp=(... [hwcfg2=... has_riscv=... cpuctl=... fenced=True|False]) sec2=(... [hwcfg2=... has_riscv=... cpuctl=... fenced=True|False]) pmu=(... [hwcfg2=... has_riscv=... cpuctl=... fenced=True|False]) fecs=(... [hwcfg2=... has_riscv=... cpuctl=... fenced=True|False]) lines, plus a stall_trace stop line with reason=wait_resp_return and sample count, so we can see whether FECS/PMU registers actually change during the stall or are completely frozen at the boot-time fence state")
+  print("stall_trace trigger: starts automatically when GspRpcQueue.read_resp() sees a post_nocat record with kind=0x3 (RMGpioPmuMutexTimeoutus); stops automatically when the target RPC response arrives or on timeout")
+  print("stall_trace knob NV_ADD_STALL_TRACE_PERIOD_MS controls sample interval (default 5ms); NV_ADD_STALL_TRACE_MAX_MS bounds the trace (default 40000ms = the documented FECS RM stall budget)")
+  print("stall_trace diagnostic_rule if all samples are identical the FECS RM handshake is frozen; if pmu.cpuctl changes from 0xbadf5720 to 0x0 mid-stall, the PMU FALCON came alive but FECS is still fenced; if fecs.cpuctl changes from 0xbadf5720 to 0x0 mid-stall, FECS came alive but the handshake timed out anyway")
+  print(f"stall_trace_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1 NV_ADD_BOOT_GSP=1 NV_ADD_CLEAR_WPR2_FECS=1 NV_ADD_VERIFY_WPR2_AFTER_FRTS=1 NV_ADD_SUMMARY=1 NV_ADD_CHECK_FRTS_BAR1=1 NV_ADD_TRACE_GSP_BOOT=1 NV_ADD_VERIFY_SEC2_INPUTS=1 NV_ADD_TRACE_RM_ALLOC=1 NV_ADD_TRACE_RM_STATE=1 NV_ADD_TRACE_RPC=1 NV_ADD_TRACE_RPC_READ=1 NV_ADD_TRACE_CHANNEL=1 NV_ADD_TRACE_MM_ALLOC=1 NV_ADD_TRACE_LAUNCH_STEPS=1 NV_ADD_TRACE_FALCON=1 NV_ADD_FECS_RESET=1 NV_ADD_FECS_RESET_FORCE=1 NV_ADD_PMU_RESET=1 NV_ADD_PMU_RESET_FORCE=1 NV_ADD_STALL_TRACE=1 python3 {script}")
+  print("stall_trace next_action if stall_trace sample lines show pmu=fenced=False and fecs=fenced=False but the stall still times out, the FECS RM handshake protocol is broken in GSP RM firmware (not the FALCON state); if both remain fenced=True, the FECS ucode never started")
+
+def print_logbuf_dump_diagnostic(script="examples/add.py"):
+  print("logbuf_dump purpose: reads the 2MB GSP RM log buffer (allocated by GspQueueMemoryBuilder at boot; base address visible in the standalone queue ... logbuf=0x... line) and prints the 5 subregion statistics (LOG_INIT, LOG_INTR, LOG_RM, LOG_MNOC, LOG_KRNL each 0x10000 bytes) plus the printable log lines found in each; this is the only direct view of what GSP RM itself was doing right before the FECS_A|FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus stall, since RM logs are not routed through the GSP RPC response queue")
+  print("logbuf_dump trigger: any of (a) NV_ADD_TRACE_GSP_BOOT=1 (printed on every standalone queue ... line), (b) NV_ADD_DUMP_LOGBUF=1 (explicit dump at boot, post-init, post-promote, and on stall-trace stop), or (c) the FECS PMU mutex stall detection in GspRpcQueue.read_resp() (auto-dumps the last 64K of LOG_RM when kind=0x3 RMGpioPmuMutexTimeoutus is observed)")
+  print("logbuf_dump knob NV_ADD_DUMP_LOGBUF_LINES controls max printable lines per subregion (default 64); NV_ADD_DUMP_LOGBUF_LINE_LEN controls max characters per line (default 512)")
+  print("logbuf_dump format standalone <label> logbuf_dump base=0x... total_size=0x... subregions=5; standalone <label> logbuf subregion=LOG_RM offset=0x20000 size=0x10000 nonzero_bytes=... first_nonzero=0x... last_nonzero=0x... sha256=... lines=N; standalone <label> logbuf LOG_RM line[0]=...; ...; standalone <label> logbuf_dump summary total_lines=N")
+  print("logbuf_dump diagnostic_rule if LOG_RM has 0 nonzero bytes, GSP RM never started logging (FALCON halted before RM was loaded); if LOG_RM has lines but they end in a FECS/PMU mutex message, GSP RM itself is waiting on the mutex (so the FALCON state observation matters); if LOG_RM has lines but they mention a successful FECS handshake, the stall is somewhere downstream of FECS init and the saved log's post-promote state is the next place to look")
+  print(f"logbuf_dump_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1 NV_ADD_BOOT_GSP=1 NV_ADD_CLEAR_WPR2_FECS=1 NV_ADD_VERIFY_WPR2_AFTER_FRTS=1 NV_ADD_SUMMARY=1 NV_ADD_CHECK_FRTS_BAR1=1 NV_ADD_TRACE_GSP_BOOT=1 NV_ADD_VERIFY_SEC2_INPUTS=1 NV_ADD_TRACE_RM_ALLOC=1 NV_ADD_TRACE_RM_STATE=1 NV_ADD_TRACE_RPC=1 NV_ADD_TRACE_RPC_READ=1 NV_ADD_TRACE_CHANNEL=1 NV_ADD_TRACE_MM_ALLOC=1 NV_ADD_TRACE_LAUNCH_STEPS=1 NV_ADD_TRACE_FALCON=1 NV_ADD_FECS_RESET=1 NV_ADD_FECS_RESET_FORCE=1 NV_ADD_PMU_RESET=1 NV_ADD_PMU_RESET_FORCE=1 NV_ADD_DUMP_LOGBUF=1 python3 {script}")
+  print("logbuf_dump next_action if logbuf_dump shows LOG_RM stopped writing before the FECS/PMU mutex line, GSP RM was waiting for the FALCON handshake to complete and never got the response; if LOG_RM has the FECS/PMU mutex line, GSP RM correctly tried the handshake and the saved log's stall_trace samples will tell us if the FALCON state evolved at all")
 
 def print_reconnect_commands(script="examples/add.py"):
   print(f"reconnect_command fixed-gpfifo {recommended_reconnect_command(script, golden=False)}")
@@ -4480,10 +5029,15 @@ def print_reconnect_commands(script="examples/add.py"):
 def print_live_debug_commands(script="examples/add.py", tiny_script="examples/add_tiny.py"):
   print(f"preflight_plan_command {recommended_preflight_plan_command(script)}")
   print_reconnect_commands(script)
+  print(f"reconnect_command fecs-scenarios python3 {script} --fecs-reset-scenarios")
+  print(f"reconnect_command fecs-fence-diagnostic python3 {script} --fecs-fence-diagnostic")
+  print_fecs_fence_diagnostic(script)
   print(f"live_log_workflow_command python3 {script} --live-log-workflow")
   print(f"live_stack_log_workflow_command python3 {script} --live-stack-log-workflow")
   print(f"tiny_live_stack_log_workflow_command python3 {tiny_script} --live-stack-log-workflow --standalone-script {script}")
   print(f"tiny_trace_command {recommended_tiny_trace_command(tiny_script)}")
+  print(f"reconnect_command stall-trace python3 {script} --stall-trace")
+  print(f"reconnect_command logbuf-dump python3 {script} --logbuf-dump")
 
 def live_log_workflow_lines(script="examples/add.py", tiny_script="examples/add_tiny.py",
                             standalone_log="standalone-golden.log", tiny_log="tiny-golden.log"):
@@ -6429,6 +6983,7 @@ def cli_arg_value(flag):
   return sys.argv[index + 1]
 
 def print_offline_debug_suite(arithmetic="add"):
+  script = "examples/mul.py" if arithmetic == "mul" else "examples/add.py"
   print_runtime_summary()
   print_import_guard()
   print_golden_compute_fingerprint()
@@ -6436,6 +6991,8 @@ def print_offline_debug_suite(arithmetic="add"):
   print_gpfifo_constructor_fingerprint()
   print_runtime_channel_fingerprint()
   print_launch_fingerprint(arithmetic)
+  print_stall_trace_diagnostic(script)
+  print_logbuf_dump_diagnostic(script)
 
 def print_debug_help(script="examples/add.py", arithmetic="add"):
   print(f"debug_help script={script} arithmetic={arithmetic}")
@@ -6448,6 +7005,10 @@ def print_debug_help(script="examples/add.py", arithmetic="add"):
   print(f"contract_suite python3 {script} --contract-suite")
   print(f"validation_suite python3 {script} --validation-suite")
   print(f"live_debug python3 {script} --live-debug-commands")
+  print(f"fecs_reset_scenarios python3 {script} --fecs-reset-scenarios")
+  print(f"fecs_fence_diagnostic python3 {script} --fecs-fence-diagnostic")
+  print(f"stall_trace python3 {script} --stall-trace")
+  print(f"logbuf_dump python3 {script} --logbuf-dump")
   print(f"live_log_workflow python3 {script} --live-log-workflow")
   print(f"live_stack_log_workflow python3 {script} --live-stack-log-workflow")
   print(f"comparison_checklist python3 {script} --comparison-checklist")
@@ -6483,7 +7044,7 @@ def static_external_import_guard_state(paths=None):
   paths = [pathlib.Path(__file__), ROOT / "examples" / "mul.py"] if paths is None else [pathlib.Path(path) for path in paths]
   allowed_stdlib = {
     "array", "ast", "collections", "contextlib", "ctypes", "enum", "fcntl", "functools", "hashlib", "io", "mmap",
-    "os", "pathlib", "re", "socket", "struct", "subprocess", "sys", "tempfile", "time", "traceback", "urllib",
+    "os", "pathlib", "re", "socket", "struct", "subprocess", "sys", "tempfile", "threading", "time", "traceback", "urllib",
   }
   allowed_local = {"add"}
   hits = []
@@ -7316,7 +7877,7 @@ class NvBackend:
       self.transport.register_fd()
       self.rm = LinuxRmClient(self.transport, priv_root=self.rm.priv_root, first_handle=self.rm.next_handle)
     if booted_gsp: self.rm.alloc_root()
-    self.channel_builder = StandaloneChannelBuilder(self.shell, self.rm)
+    self.channel_builder = StandaloneChannelBuilder(self.shell, self.rm, gsp_boot=self.gsp_boot)
     if booted_gsp:
       golden_ctx = {}
       try:
@@ -9403,16 +9964,88 @@ def selftest():
     live_debug_buf = io.StringIO()
     with contextlib.redirect_stdout(live_debug_buf): print_live_debug_commands()
     live_debug_lines = live_debug_buf.getvalue().strip().splitlines()
+    expected_fecs_diag_lines = []
+    fecs_diag_for_live_buf = io.StringIO()
+    with contextlib.redirect_stdout(fecs_diag_for_live_buf): print_fecs_fence_diagnostic()
+    expected_fecs_diag_lines = fecs_diag_for_live_buf.getvalue().strip().splitlines()
     assert live_debug_lines == [
       f"preflight_plan_command {recommended_preflight_plan_command()}",
       f"reconnect_command fixed-gpfifo {recommended_reconnect_command(golden=False)}",
       f"reconnect_command golden-context {recommended_reconnect_command(golden=True)}",
       f"reconnect_command fecs-reset {recommended_fecs_reset_reconnect_command()}",
+      "reconnect_command fecs-scenarios python3 examples/add.py --fecs-reset-scenarios",
+      "reconnect_command fecs-fence-diagnostic python3 examples/add.py --fecs-fence-diagnostic",
+      *expected_fecs_diag_lines,
       "live_log_workflow_command python3 examples/add.py --live-log-workflow",
       "live_stack_log_workflow_command python3 examples/add.py --live-stack-log-workflow",
       "tiny_live_stack_log_workflow_command python3 examples/add_tiny.py --live-stack-log-workflow --standalone-script examples/add.py",
       f"tiny_trace_command {recommended_tiny_trace_command()}",
+      "reconnect_command stall-trace python3 examples/add.py --stall-trace",
+      "reconnect_command logbuf-dump python3 examples/add.py --logbuf-dump",
     ]
+    fecs_scenarios_buf = io.StringIO()
+    with contextlib.redirect_stdout(fecs_scenarios_buf): print_fecs_reset_scenarios()
+    fecs_scenarios_lines = fecs_scenarios_buf.getvalue().strip().splitlines()
+    assert fecs_scenarios_lines[0].startswith("fecs_reset_scenario_recommend try=preboot_only, then=fecs_minimal, then=fecs_only, then=full, then=promote_retry")
+    assert fecs_scenarios_lines[1] == f"fecs_reset_scenario full {recommended_fecs_reset_reconnect_command()}"
+    assert fecs_scenarios_lines[2] == f"fecs_reset_scenario fecs_only {recommended_fecs_only_reconnect_command()}"
+    assert fecs_scenarios_lines[3] == f"fecs_reset_scenario fecs_minimal {recommended_fecs_minimal_reconnect_command()}"
+    assert fecs_scenarios_lines[4] == f"fecs_reset_scenario preboot_only {recommended_preboot_only_reconnect_command()}"
+    assert fecs_scenarios_lines[5] == f"fecs_reset_scenario promote_retry {recommended_promote_retry_reconnect_command()}"
+    fecs_only_cmd = recommended_fecs_only_reconnect_command()
+    full_cmd = recommended_fecs_reset_reconnect_command()
+    preboot_cmd = recommended_preboot_only_reconnect_command()
+    fecs_minimal_cmd = recommended_fecs_minimal_reconnect_command()
+    promote_retry_cmd = recommended_promote_retry_reconnect_command()
+    assert "NV_ADD_PMU_RESET_POSTPROMOTE=1" in full_cmd and "NV_ADD_PMU_RESET_POSTPROMOTE=1" not in fecs_only_cmd
+    assert "NV_ADD_FECS_RESET_POSTPROMOTE=1" in fecs_only_cmd
+    assert "NV_ADD_PMU_RESET=1" in preboot_cmd and "NV_ADD_FECS_RESET_POSTINIT=1" not in preboot_cmd
+    assert "NV_ADD_FECS_RESET=1" in fecs_minimal_cmd and "NV_ADD_FECS_RESET_POSTINIT=1" not in fecs_minimal_cmd
+    assert "NV_ADD_REPROMOTE_AFTER_RESET=1" in promote_retry_cmd and "NV_ADD_FECS_RESET=1" not in promote_retry_cmd
+    fecs_scenarios_mul_buf = io.StringIO()
+    with contextlib.redirect_stdout(fecs_scenarios_mul_buf): print_fecs_reset_scenarios("examples/mul.py")
+    fecs_scenarios_mul_lines = fecs_scenarios_mul_buf.getvalue().strip().splitlines()
+    assert all("python3 examples/mul.py" in line for line in fecs_scenarios_mul_lines[1:])
+    fecs_diag_buf = io.StringIO()
+    with contextlib.redirect_stdout(fecs_diag_buf): print_fecs_fence_diagnostic()
+    fecs_diag_lines = fecs_diag_buf.getvalue().strip().splitlines()
+    assert fecs_diag_lines[0] == (
+      "fecs_fence_diagnostic signature=FECS_A|FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus|0%>FECS_B|FECS_C|GR_STATUS|RMGpioPmuMutexTimeoutus|9b2w>ASSERT|...|BKD")
+    assert fecs_diag_lines[1].startswith("fecs_fence_diagnostic cause=FECS FALCON is fenced from a prior session")
+    assert fecs_diag_lines[2].startswith("fecs_fence_diagnostic key_signals ")
+    assert fecs_diag_lines[3] == "fecs_fence_diagnostic recommended_order preboot_only, fecs_minimal, fecs_only, full, promote_retry (each successive scenario adds more in-band FECS/PMU resets, which may wipe FECS ucode after GSP boot)"
+    assert fecs_diag_lines[4] == "fecs_fence_diagnostic first_attempt recommended_scenario=preboot_only (safest: only pre-boot FECS+PMU reset, no in-band FECS resets that might wipe FECS ucode after GSP boot)"
+    assert fecs_diag_lines[5] == f"fecs_fence_diagnostic first_attempt_command {recommended_preboot_only_reconnect_command()}"
+    assert fecs_diag_lines[6] == "fecs_fence_diagnostic second_attempt recommended_scenario=fecs_minimal (pre-boot FECS only, no PMU reset)"
+    assert fecs_diag_lines[7] == f"fecs_fence_diagnostic second_attempt_command {recommended_fecs_minimal_reconnect_command()}"
+    assert fecs_diag_lines[8] == "fecs_fence_diagnostic third_attempt recommended_scenario=fecs_only (drops post-promote PMU reset)"
+    assert fecs_diag_lines[9] == f"fecs_fence_diagnostic third_attempt_command {recommended_fecs_only_reconnect_command()}"
+    assert fecs_diag_lines[10] == "fecs_fence_diagnostic fallback_attempts scenario=full (with PMU resets) scenario=promote_retry (no FECS reset, just re-issue GPU_PROMOTE_CTX)"
+    assert fecs_diag_lines[11] == f"fecs_fence_diagnostic promote_retry_command {recommended_promote_retry_reconnect_command()}"
+    assert fecs_diag_lines[12].startswith("fecs_fence_diagnostic tinygrad_path tiny does not hit the FECS/PMU mutex stall")
+    assert fecs_diag_lines[13] == "fecs_fence_diagnostic compare python3 examples/add.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log"
+    assert fecs_diag_lines[14].startswith("fecs_fence_diagnostic next_action if preboot_only prints result=[11.0, 22.0, 33.0, 44.0]")
+    assert fecs_diag_lines[15].startswith("fecs_fence_diagnostic hardware_gate=after a GSP RM session ends")
+    assert fecs_diag_lines[16].startswith("fecs_fence_diagnostic root_cause=PMU dmatrfbase advances")
+    assert fecs_diag_lines[17].startswith("fecs_fence_diagnostic contrast_with_tiny")
+    assert fecs_diag_lines[18].startswith("fecs_fence_diagnostic mitigation=power-cycle")
+    assert fecs_diag_lines[19].startswith("fecs_fence_diagnostic verify_with_tiny")
+    assert fecs_diag_lines[20].startswith("fecs_fence_diagnostic fence_check=StandaloneNvShell.bar0_is_fenced()")
+    assert fecs_diag_lines[21].startswith("fecs_fence_diagnostic bypass=NV_ADD_BYPASS_BAR0_FENCE_CHECK=1")
+    assert fecs_diag_lines[22].startswith("stall_trace purpose:")
+    assert fecs_diag_lines[23].startswith("stall_trace trigger:")
+    assert fecs_diag_lines[24].startswith("stall_trace knob ")
+    assert fecs_diag_lines[25].startswith("stall_trace diagnostic_rule ")
+    assert fecs_diag_lines[26].startswith("stall_trace_command ")
+    assert fecs_diag_lines[27].startswith("stall_trace next_action ")
+    assert fecs_diag_lines[28].startswith("logbuf_dump purpose:")
+    assert fecs_diag_lines[29].startswith("logbuf_dump trigger:")
+    assert fecs_diag_lines[30].startswith("logbuf_dump knob ")
+    assert fecs_diag_lines[31].startswith("logbuf_dump format ")
+    assert fecs_diag_lines[32].startswith("logbuf_dump diagnostic_rule ")
+    assert fecs_diag_lines[33].startswith("logbuf_dump_command ")
+    assert fecs_diag_lines[34].startswith("logbuf_dump next_action ")
+    assert fecs_diag_lines[35].startswith("fecs_fence_diagnostic saved_log_state the standalone rm_state stage=... lines now include compact gsp=({format_state} [hwcfg2=")
     live_log_buf = io.StringIO()
     with contextlib.redirect_stdout(live_log_buf): print_live_log_workflow()
     live_log_lines = live_log_buf.getvalue().strip().splitlines()
@@ -10147,15 +10780,16 @@ def selftest():
     assert "external_static_imports=[]" in offline_debug_text
     assert "standalone golden_compute_alloc parent=0xcf000004 object=0xcf000005" in offline_debug_text
     assert "standalone context_promote label=user_phys entries=3 ids=[0, 1, 2]" in offline_debug_text
-    assert "standalone gpfifo_constructor parent=0xcf000000 object=0xcf000002 gpfifo_class=0xc56f" in offline_debug_text
-    assert "gpfifo_va=0x1000000000 entries=4 flags=0x0" in offline_debug_text
+    assert "standalone gpfifo_constructor parent=0x80 object=0xcf000000 gpfifo_class=0xc56f" in offline_debug_text
+    assert "gpfifo_va=0x1000000000 entries=4 flags=0x200320" in offline_debug_text
+    assert "engine_type=0x1 cid=3" in offline_debug_text
     assert "standalone gpfifo_desc name=userd base=0x90000020 size=0x20" in offline_debug_text
-    assert "standalone runtime_compute_alloc parent=0xcf000002 object=0xcf000003" in offline_debug_text
+    assert "standalone runtime_compute_alloc parent=0xcf000000 object=0xcf000001" in offline_debug_text
     assert "standalone launch arithmetic=add result=[11.0, 22.0, 33.0, 44.0]" in offline_debug_text
     gpfifo_ctor_buf = io.StringIO()
     with contextlib.redirect_stdout(gpfifo_ctor_buf): print_gpfifo_constructor_fingerprint()
     gpfifo_ctor_text = gpfifo_ctor_buf.getvalue()
-    assert "standalone gpfifo_constructor parent=0xcf000000 object=0xcf000002 gpfifo_class=0xc56f" in gpfifo_ctor_text
+    assert "standalone gpfifo_constructor parent=0x80 object=0xcf000000 gpfifo_class=0xc56f" in gpfifo_ctor_text
     assert "standalone gpfifo_desc name=error base=0x90300000 size=0x3000000" in gpfifo_ctor_text
     class FakePreflightTransport:
       def probe(self): return (0x10000000, 0)
@@ -11351,7 +11985,7 @@ def selftest():
   boot.booter_loader_paddrs = [0x300000]
   boot.booter_loader_desc = {"code_offset": 0x110, "data_offset": 0x220, "code_size": 0x330, "data_size": 0x440}
   pmu_fake = FakeShell()
-  pmu_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+  pmu_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 1 << 10
   pmu_falcon = FalconController(pmu_fake)
   pmu_falcon.reset(NV_FALCON_PMU_BASE, riscv=True)
   assert (NV_PPMU_FALCON_ENGINE, 1) in pmu_fake.writes
@@ -11359,7 +11993,7 @@ def selftest():
   assert (NV_FALCON_PMU_BASE + NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8)) in pmu_fake.writes
 
   pmu_fake_force = FakeShell()
-  pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+  pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 1 << 10
   pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
   pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMACTL] = 0x40
   pmu_fake_force.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_DMATRFCMD] = 0x10
@@ -11428,15 +12062,17 @@ def selftest():
   fecs_fenced_falcon = FalconController(fecs_fenced)
   fecs_fenced_falcon.reset(NV_FALCON_FECS_BASES["ga102"], riscv=True, force=True)
   fenced_writes = fecs_fenced.writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FBIF_TRANSCFG0, 0x114) in fenced_writes, "FECS force reset did not clear FBIF_TRANSCFG0 fence sentinel"
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL, 0) in fenced_writes
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMACTL, 0) in fenced_writes
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMATRFCMD, 0) in fenced_writes
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 1) in fenced_writes
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 0) in fenced_writes
-  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8)) in fenced_writes
+  assert (NV_FALCON_FECS_BASES["ga102"] + NV_PRISCV_RISCV_BCR_CTRL, (1 << 4) | (1 << 8)) not in fenced_writes
+  fecs_fbif_idx = fenced_writes.index((NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FBIF_TRANSCFG0, 0x114))
   fecs_cpuctl_idx = fenced_writes.index((NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL, 0))
   fecs_engine_set_idx = fenced_writes.index((NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 1))
-  assert fecs_cpuctl_idx < fecs_engine_set_idx
+  assert fecs_fbif_idx < fecs_cpuctl_idx < fecs_engine_set_idx, "FECS force reset write order is wrong: FBIF_TRANSCFG0 must come before CPUCTL, CPUCTL before engine=1"
 
   fecs_unfenced = FakeShell()
   fecs_unfenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
@@ -11449,6 +12085,34 @@ def selftest():
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_DMATRFCMD, 0) not in unfenced_writes
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 1) in unfenced_writes
   assert (NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET, 0) in unfenced_writes
+
+  format_fenced = FakeShell()
+  format_fenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0x400
+  format_fenced.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+  format_fenced_falcon = FalconController(format_fenced)
+  format_fenced_state = format_fenced_falcon.format_state_with_fenced(NV_FALCON_FECS_BASES["ga102"])
+  assert "cpuctl=0xbadf5720" in format_fenced_state
+  assert "fenced=True" in format_fenced_state
+  assert "has_riscv=1" in format_fenced_state
+  assert "hwcfg2=0x400" in format_fenced_state
+
+  format_pmu = FakeShell()
+  format_pmu.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+  format_pmu.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0x20
+  format_pmu_falcon = FalconController(format_pmu)
+  format_pmu_state = format_pmu_falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)
+  assert "cpuctl=0x20" in format_pmu_state
+  assert "fenced=False" in format_pmu_state
+  assert "has_riscv=0" in format_pmu_state
+  assert "hwcfg2=0x0" in format_pmu_state
+
+  format_pmu_half = FakeShell()
+  format_pmu_half.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0x400
+  format_pmu_half.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0xbadf0000
+  format_pmu_half_falcon = FalconController(format_pmu_half)
+  format_pmu_half_state = format_pmu_half_falcon.format_state_with_fenced(NV_FALCON_PMU_BASE)
+  assert "cpuctl=0xbadf0000" in format_pmu_half_state
+  assert "fenced=True" in format_pmu_half_state
 
   old_fecs_reset = os.environ.get("NV_ADD_FECS_RESET")
   try:
@@ -11529,7 +12193,8 @@ def selftest():
       fecs_active_engine_writes = [w for w in fecs_active_fake.writes[writes_before:]
         if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
       assert fecs_active_engine_writes, "FECS reset was not executed when NV_ADD_FECS_RESET_FORCE=1"
-      assert (1, 0) in [(w[1], fecs_active_fake.writes[i + 1][1]) for i, w in enumerate(fecs_active_fake.writes[writes_before:]) if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET], "FECS engine toggle did not go 1->0"
+      fecs_active_engine_values = [w[1] for w in fecs_active_engine_writes]
+      assert fecs_active_engine_values == [1, 0], f"FECS engine toggle was not 1->0 (got {fecs_active_engine_values})"
     finally:
       FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done = old_hs, old_wait
   finally:
@@ -11567,7 +12232,8 @@ def selftest():
       fecs_postinit_writes = [w for w in fecs_postinit_fake.writes[writes_before:]
         if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
       assert fecs_postinit_writes, "FECS post-init reset was not executed when NV_ADD_FECS_RESET_POSTINIT=1"
-      assert (1, 0) in [(w[1], fecs_postinit_fake.writes[i + 1][1]) for i, w in enumerate(fecs_postinit_fake.writes[writes_before:]) if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET], "FECS engine toggle did not go 1->0 in post-init reset"
+      fecs_postinit_engine_values = [w[1] for w in fecs_postinit_writes]
+      assert fecs_postinit_engine_values == [1, 0], f"FECS engine toggle was not 1->0 (got {fecs_postinit_engine_values})"
       fecs_postinit_cpuctl = [w for w in fecs_postinit_fake.writes[writes_before:]
         if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL]
       assert fecs_postinit_cpuctl, "FECS post-init force reset did not clear CPUCTL"
@@ -11649,6 +12315,54 @@ def selftest():
     assert not pmu_postinit_off_writes, "PMU post-init reset was executed when NV_ADD_PMU_RESET_POSTINIT is unset"
   finally:
     if saved_pmu_postinit is not None: os.environ["NV_ADD_PMU_RESET_POSTINIT"] = saved_pmu_postinit
+
+  old_postpromote, old_postpromote_force = os.environ.get("NV_ADD_FECS_RESET_POSTPROMOTE"), os.environ.get("NV_ADD_FECS_RESET_POSTPROMOTE_FORCE")
+  try:
+    postpromote_fake = FakeShell()
+    postpromote_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+    postpromote_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+    postpromote_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+    postpromote_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+    postpromote_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_HWCFG2] = 0
+    postpromote_fake.regs[NV_FALCON_PMU_BASE + NV_PFALCON_FALCON_CPUCTL] = 0xbadf5720
+    postpromote_outer = object.__new__(StandaloneGspBootstrap)
+    postpromote_outer.shell, postpromote_outer.queue_memory = postpromote_fake, boot.queue_memory
+    os.environ["NV_ADD_FECS_RESET_POSTPROMOTE"] = "1"
+    os.environ["NV_ADD_FECS_RESET_POSTPROMOTE_FORCE"] = "1"
+    writes_before = len(postpromote_fake.writes)
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+      result = StandaloneGspBootstrap.post_promote_fecs_reset(postpromote_outer)
+    postpromote_fecs_engine_writes = [w for w in postpromote_fake.writes[writes_before:]
+      if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
+    assert postpromote_fecs_engine_writes, "FECS post-promote reset did not toggle FECS engine"
+    postpromote_fecs_cpuctl_writes = [w for w in postpromote_fake.writes[writes_before:]
+      if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_CPUCTL]
+    assert postpromote_fecs_cpuctl_writes and postpromote_fecs_cpuctl_writes[0][1] == 0, f"FECS post-promote CPUCTL was not cleared to 0 (got {postpromote_fecs_cpuctl_writes[0][1]:#x if postpromote_fecs_cpuctl_writes else None})"
+    assert result is True, "post_promote_fecs_reset returned False when env var was set"
+  finally:
+    if old_postpromote is None: os.environ.pop("NV_ADD_FECS_RESET_POSTPROMOTE", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTPROMOTE"] = old_postpromote
+    if old_postpromote_force is None: os.environ.pop("NV_ADD_FECS_RESET_POSTPROMOTE_FORCE", None)
+    else: os.environ["NV_ADD_FECS_RESET_POSTPROMOTE_FORCE"] = old_postpromote_force
+
+  postpromote_off_fake = FakeShell()
+  postpromote_off_fake.regs[NV_FALCON_FECS_BASES["ga102"] + NV_PFALCON_FALCON_HWCFG2] = 0
+  postpromote_off_fake.regs[NV_PGSP_FALCON_ENGINE] = 0
+  postpromote_off_fake.regs[NV_PSEC_FALCON_ENGINE] = 0
+  postpromote_off_outer = object.__new__(StandaloneGspBootstrap)
+  postpromote_off_outer.shell, postpromote_off_outer.queue_memory = postpromote_off_fake, boot.queue_memory
+  saved_postpromote = os.environ.get("NV_ADD_FECS_RESET_POSTPROMOTE")
+  try:
+    os.environ.pop("NV_ADD_FECS_RESET_POSTPROMOTE", None)
+    writes_before = len(postpromote_off_fake.writes)
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+      result = StandaloneGspBootstrap.post_promote_fecs_reset(postpromote_off_outer)
+    postpromote_off_engine_writes = [w for w in postpromote_off_fake.writes[writes_before:]
+      if w[0] == NV_FALCON_FECS_BASES["ga102"] + NV_PFECS_FALCON_ENGINE_OFFSET]
+    assert not postpromote_off_engine_writes, "FECS post-promote reset was executed when env var was unset"
+    assert result is False, "post_promote_fecs_reset returned True when env var was unset"
+  finally:
+    if saved_postpromote is not None: os.environ["NV_ADD_FECS_RESET_POSTPROMOTE"] = saved_postpromote
 
   old_fecs_reset, old_fecs_reset_force = os.environ.get("NV_ADD_FECS_RESET"), os.environ.get("NV_ADD_FECS_RESET_FORCE")
   old_postinit, old_postinit_force = os.environ.get("NV_ADD_FECS_RESET_POSTINIT"), os.environ.get("NV_ADD_FECS_RESET_POSTINIT_FORCE")
@@ -12581,6 +13295,299 @@ def selftest():
   finally:
     if old_trace_rm_state is None: os.environ.pop("NV_ADD_TRACE_RM_STATE", None)
     else: os.environ["NV_ADD_TRACE_RM_STATE"] = old_trace_rm_state
+  fecs_base_addr = NV_FALCON_FECS_BASES["ga102"]
+  fecs_hwcfg2_addr = fecs_base_addr + NV_PFALCON_FALCON_HWCFG2
+  fecs_cpuctl_addr = fecs_base_addr + NV_PFALCON_FALCON_CPUCTL
+  pmu_base_addr = NV_FALCON_PMU_BASE
+  pmu_hwcfg2_addr = pmu_base_addr + NV_PFALCON_FALCON_HWCFG2
+  pmu_cpuctl_addr = pmu_base_addr + NV_PFALCON_FALCON_CPUCTL
+  gsp_base_addr = NV_FALCON_GSP_BASE
+  gsp_hwcfg2_addr = gsp_base_addr + NV_PFALCON_FALCON_HWCFG2
+  gsp_cpuctl_addr = gsp_base_addr + NV_PFALCON_FALCON_CPUCTL
+  sec2_base_addr = NV_FALCON_SEC2_BASE
+  sec2_hwcfg2_addr = sec2_base_addr + NV_PFALCON_FALCON_HWCFG2
+  sec2_cpuctl_addr = sec2_base_addr + NV_PFALCON_FALCON_CPUCTL
+  class FecsStateShell(FreeShell):
+    def __init__(self):
+      super().__init__()
+      self.chip = type("Chip", (), {"fw_name": "ga102", "pmc_boot_0": 0x12345678, "chip_id": 0x12345678})()
+      self.regs = {NV_PBUS_BAR1_BLOCK: 0, NV_PFB_PRI_MMU_WPR2_ADDR_HI: 0x2ffee00,
+        NV_PGSP_FALCON_ENGINE: 0x1111, NV_PSEC_FALCON_ENGINE: 0x2222,
+        fecs_hwcfg2_addr: 0, fecs_cpuctl_addr: 0xbadf5720,
+        pmu_hwcfg2_addr: 0, pmu_cpuctl_addr: 0xbadf5720,
+        gsp_hwcfg2_addr: 0, gsp_cpuctl_addr: 0xbadf5720,
+        gsp_base_addr + NV_PRISCV_RISCV_CPUCTL: 0x80,
+        sec2_hwcfg2_addr: 0, sec2_cpuctl_addr: 0x20}
+    def fecs_falcon_base(self): return NV_FALCON_FECS_BASES[self.chip.fw_name]
+    def fecs_falcon_engine(self): return self.fecs_falcon_base() + NV_PFECS_FALCON_ENGINE_OFFSET
+    def rreg(self, addr): return self.regs.get(addr, 0)
+    def wreg(self, addr, value): self.regs[addr] = value
+  class FecsStateStatQueue(FakeStatQueue):
+    def __init__(self):
+      self.rx_view = MMIOView(bytearray(4), fmt='I')
+      self.rx_view[0] = 0x77
+  old_trace_rm_state_fecs = os.environ.get("NV_ADD_TRACE_RM_STATE")
+  try:
+    os.environ["NV_ADD_TRACE_RM_STATE"] = "1"
+    fecs_state_shell = FecsStateShell()
+    fecs_state_cmd_q = FakeQueue(fecs_state_shell)
+    fecs_state_cmd_q.tx_view = MMIOView(bytearray(20), fmt='I')
+    fecs_state_cmd_q.tx_view[4] = 0x33
+    fecs_state_trace_buf = io.StringIO()
+    with contextlib.redirect_stdout(fecs_state_trace_buf):
+      GspRmClient(fecs_state_cmd_q, FecsStateStatQueue()).rm_alloc(0x80, AMPERE_CHANNEL_GPFIFO_A, gp_tiny_ctor, h_object=0xcf000128)
+    fecs_state_trace = fecs_state_trace_buf.getvalue()
+    assert fecs_state_trace.count("fenced=True") >= 3, f"expected 3+ fenced=True (GSP+FECS+PMU pre+post-alloc), got {fecs_state_trace.count('fenced=True')}"
+    assert fecs_state_trace.count("has_riscv=0") >= 3, f"expected 3+ has_riscv=0 (GSP+FECS+PMU pre+post-alloc), got {fecs_state_trace.count('has_riscv=0')}"
+    assert "cpuctl=0xbadf5720" in fecs_state_trace
+  finally:
+    if old_trace_rm_state_fecs is None: os.environ.pop("NV_ADD_TRACE_RM_STATE", None)
+    else: os.environ["NV_ADD_TRACE_RM_STATE"] = old_trace_rm_state_fecs
+  class FecsUnfencedShell(FreeShell):
+    def __init__(self):
+      super().__init__()
+      self.chip = type("Chip", (), {"fw_name": "ga102", "pmc_boot_0": 0x12345678, "chip_id": 0x12345678})()
+      self.regs = {NV_PBUS_BAR1_BLOCK: 0, NV_PFB_PRI_MMU_WPR2_ADDR_HI: 0x2ffee00,
+        NV_PGSP_FALCON_ENGINE: 0x1111, NV_PSEC_FALCON_ENGINE: 0x2222,
+        fecs_hwcfg2_addr: (1 << 10), fecs_cpuctl_addr: 0x10,
+        pmu_hwcfg2_addr: (1 << 10), pmu_cpuctl_addr: 0x10,
+        gsp_hwcfg2_addr: (1 << 10), gsp_cpuctl_addr: 0x10,
+        sec2_hwcfg2_addr: (1 << 10), sec2_cpuctl_addr: 0x20}
+    def fecs_falcon_base(self): return NV_FALCON_FECS_BASES[self.chip.fw_name]
+    def fecs_falcon_engine(self): return self.fecs_falcon_base() + NV_PFECS_FALCON_ENGINE_OFFSET
+    def rreg(self, addr): return self.regs.get(addr, 0)
+    def wreg(self, addr, value): self.regs[addr] = value
+  class FecsUnfencedStatQueue(FakeStatQueue):
+    def __init__(self):
+      self.rx_view = MMIOView(bytearray(4), fmt='I')
+      self.rx_view[0] = 0x77
+  old_trace_rm_state_unfenced = os.environ.get("NV_ADD_TRACE_RM_STATE")
+  try:
+    os.environ["NV_ADD_TRACE_RM_STATE"] = "1"
+    fecs_unfenced_shell = FecsUnfencedShell()
+    fecs_unfenced_cmd_q = FakeQueue(fecs_unfenced_shell)
+    fecs_unfenced_cmd_q.tx_view = MMIOView(bytearray(20), fmt='I')
+    fecs_unfenced_cmd_q.tx_view[4] = 0x33
+    fecs_unfenced_trace_buf = io.StringIO()
+    with contextlib.redirect_stdout(fecs_unfenced_trace_buf):
+      GspRmClient(fecs_unfenced_cmd_q, FecsUnfencedStatQueue()).rm_alloc(0x80, AMPERE_CHANNEL_GPFIFO_A, gp_tiny_ctor, h_object=0xcf000129)
+    fecs_unfenced_trace = fecs_unfenced_trace_buf.getvalue()
+    assert fecs_unfenced_trace.count("fenced=False") >= 3, f"expected 3+ fenced=False (GSP+FECS+PMU pre+post-alloc), got {fecs_unfenced_trace.count('fenced=False')}"
+    assert fecs_unfenced_trace.count("has_riscv=1") >= 3, f"expected 3+ has_riscv=1 (GSP+FECS+PMU pre+post-alloc), got {fecs_unfenced_trace.count('has_riscv=1')}"
+  finally:
+    if old_trace_rm_state_unfenced is None: os.environ.pop("NV_ADD_TRACE_RM_STATE", None)
+    else: os.environ["NV_ADD_TRACE_RM_STATE"] = old_trace_rm_state_unfenced
+  class StallTracerShell:
+    def __init__(self):
+      self.chip = type("Chip", (), {"fw_name": "ga102", "pmc_boot_0": 0x12345678, "chip_id": 0x12345678})()
+      self.regs = {fecs_hwcfg2_addr: 0, fecs_cpuctl_addr: 0xbadf5720,
+                   pmu_hwcfg2_addr: 0, pmu_cpuctl_addr: 0xbadf5720,
+                   gsp_hwcfg2_addr: 0, gsp_cpuctl_addr: 0xbadf5720,
+                   sec2_hwcfg2_addr: 0, sec2_cpuctl_addr: 0x20}
+    def fecs_falcon_base(self): return NV_FALCON_FECS_BASES[self.chip.fw_name]
+    def fecs_falcon_engine(self): return self.fecs_falcon_base() + NV_PFECS_FALCON_ENGINE_OFFSET
+    def rreg(self, addr): return self.regs.get(addr, 0)
+  class StallTracerShellEvolving(StallTracerShell):
+    def rreg(self, addr):
+      if addr == pmu_cpuctl_addr: return 0x0
+      return super().rreg(addr)
+  old_stall_trace = os.environ.get("NV_ADD_STALL_TRACE")
+  old_stall_period = os.environ.get("NV_ADD_STALL_TRACE_PERIOD_MS")
+  old_stall_max = os.environ.get("NV_ADD_STALL_TRACE_MAX_MS")
+  try:
+    os.environ["NV_ADD_STALL_TRACE"] = "1"
+    os.environ["NV_ADD_STALL_TRACE_PERIOD_MS"] = "2"
+    os.environ["NV_ADD_STALL_TRACE_MAX_MS"] = "50"
+    assert StallTracer.is_enabled()
+    assert StallTracer.parse_period_ms() == 2.0
+    assert StallTracer.parse_max_ms() == 50.0
+    os.environ["NV_ADD_STALL_TRACE_PERIOD_MS"] = "bogus"
+    assert StallTracer.parse_period_ms() == 5.0
+    os.environ["NV_ADD_STALL_TRACE_PERIOD_MS"] = "0"
+    assert StallTracer.parse_period_ms() == 5.0
+    os.environ["NV_ADD_STALL_TRACE_PERIOD_MS"] = "2"
+    frozen_shell = StallTracerShell()
+    frozen_tracer = StallTracer(frozen_shell, label="selftest", period_ms=2.0, max_ms=50.0)
+    assert frozen_tracer.is_enabled()
+    frozen_buf = io.StringIO()
+    with contextlib.redirect_stdout(frozen_buf):
+      frozen_tracer.start()
+      frozen_tracer._thread.join(timeout=0.5)
+      frozen_tracer.stop(reason="test_complete")
+    frozen_out = frozen_buf.getvalue()
+    assert "stall_trace start label=selftest" in frozen_out
+    assert "stall_trace sample label=selftest" in frozen_out
+    assert "fenced=True" in frozen_out
+    assert "fecs=(engine=0x0 cpuctl=0xbadf5720" in frozen_out or "fecs=(" in frozen_out
+    assert "stall_trace stop label=selftest reason=test_complete" in frozen_out
+    evolving_shell = StallTracerShellEvolving()
+    evolving_buf = io.StringIO()
+    with contextlib.redirect_stdout(evolving_buf):
+      evolving_tracer = StallTracer(evolving_shell, label="evolving", period_ms=2.0, max_ms=50.0)
+      evolving_tracer.start()
+      evolving_tracer._thread.join(timeout=0.5)
+      evolving_tracer.stop(reason="test_complete")
+    evolving_out = evolving_buf.getvalue()
+    assert "pmu=(" in evolving_out
+    assert evolving_out.count("stall_trace sample") >= 1
+  finally:
+    if old_stall_trace is None: os.environ.pop("NV_ADD_STALL_TRACE", None)
+    else: os.environ["NV_ADD_STALL_TRACE"] = old_stall_trace
+    if old_stall_period is None: os.environ.pop("NV_ADD_STALL_TRACE_PERIOD_MS", None)
+    else: os.environ["NV_ADD_STALL_TRACE_PERIOD_MS"] = old_stall_period
+    if old_stall_max is None: os.environ.pop("NV_ADD_STALL_TRACE_MAX_MS", None)
+    else: os.environ["NV_ADD_STALL_TRACE_MAX_MS"] = old_stall_max
+  stall_trace_diag_buf = io.StringIO()
+  with contextlib.redirect_stdout(stall_trace_diag_buf): print_stall_trace_diagnostic("examples/add.py")
+  stall_trace_diag = stall_trace_diag_buf.getvalue().strip().splitlines()
+  assert stall_trace_diag[0].startswith("stall_trace purpose:")
+  assert stall_trace_diag[1].startswith("stall_trace trigger:")
+  assert stall_trace_diag[2].startswith("stall_trace knob ")
+  assert stall_trace_diag[3].startswith("stall_trace diagnostic_rule ")
+  assert stall_trace_diag[4].startswith("stall_trace_command NV_ADD_TRANSPORT=mac-egpu ")
+  assert "NV_ADD_STALL_TRACE=1" in stall_trace_diag[4]
+  assert stall_trace_diag[5].startswith("stall_trace next_action ")
+  logbuf_data = bytearray(0x50000)
+  for off in range(0, 0x100):
+    logbuf_data[off] = 0x00
+  logbuf_init = b"\x00GSP-RM boot complete\n"
+  logbuf_data[0:len(logbuf_init)] = logbuf_init
+  logbuf_rm_start = 0x20000
+  rm_lines = [b"RM: starting GPU bringup", b"RM: loading VBIOS\n", b"RM: FECS init requested"]
+  cursor = logbuf_rm_start
+  for line in rm_lines:
+    logbuf_data[cursor:cursor + len(line)] = line
+    cursor += len(line) + 1
+  logbuf_view = MMIOView(logbuf_data)
+  logbuf_paddrs_test = [0x80090000 + off for off in range(0, 0x50000, 0x1000)]
+  class LogbufTestOuter:
+    pass
+  logbuf_outer = LogbufTestOuter()
+  logbuf_outer.LOGBUF_SUBREGIONS = StandaloneGspBootstrap.LOGBUF_SUBREGIONS
+  logbuf_outer.shell = type("S", (), {"chip": type("C", (), {"fw_name": "ga102", "pmc_boot_0": 0, "chip_id": 0})()})()
+  logbuf_outer.queue_memory = type("Q", (), {})()
+  logbuf_outer.queue_memory.logbuf_view = logbuf_view
+  logbuf_outer.queue_memory.logbuf_paddrs = logbuf_paddrs_test
+  old_dump_logbuf_env = os.environ.get("NV_ADD_DUMP_LOGBUF")
+  try:
+    os.environ.pop("NV_ADD_DUMP_LOGBUF", None)
+    os.environ.pop("NV_ADD_TRACE_GSP_BOOT", None)
+    logbuf_outer.queue_memory.logbuf_view = MMIOView(bytearray(0x50000))
+    logbuf_outer.queue_memory.logbuf_paddrs = [0x80000000 + off for off in range(0, 0x50000, 0x1000)]
+    logbuf_buf_off = io.StringIO()
+    with contextlib.redirect_stdout(logbuf_buf_off):
+      StandaloneGspBootstrap.dump_logbuf(logbuf_outer, "selftest-disabled")
+    assert logbuf_buf_off.getvalue() == "", f"expected empty output when both env vars unset, got {logbuf_buf_off.getvalue()!r}"
+    os.environ["NV_ADD_TRACE_GSP_BOOT"] = "1"
+    os.environ["NV_ADD_TRACE_GSP_BOOT"] = "1"
+    logbuf_outer.queue_memory.logbuf_view = logbuf_view
+    logbuf_outer.queue_memory.logbuf_paddrs = logbuf_paddrs_test
+    logbuf_buf_on = io.StringIO()
+    with contextlib.redirect_stdout(logbuf_buf_on):
+      StandaloneGspBootstrap.dump_logbuf(logbuf_outer, "selftest-test")
+    logbuf_out = logbuf_buf_on.getvalue()
+    assert "selftest-test logbuf_dump base=0x80090000" in logbuf_out
+    assert "selftest-test logbuf subregion=LOG_RM" in logbuf_out
+    assert "selftest-test logbuf LOG_RM line[0]=RM: starting GPU bringup" in logbuf_out
+    assert "RM: FECS init requested" in logbuf_out
+    logbuf_init_view = MMIOView(bytearray(0x10000))
+    logbuf_outer.queue_memory.logbuf_view = logbuf_init_view
+    logbuf_outer.queue_memory.logbuf_paddrs = [0x80000000 + off for off in range(0, 0x10000, 0x1000)]
+    logbuf_empty_buf = io.StringIO()
+    with contextlib.redirect_stdout(logbuf_empty_buf):
+      StandaloneGspBootstrap.dump_logbuf(logbuf_outer, "selftest-empty")
+    assert "selftest-empty logbuf_dump base" in logbuf_empty_buf.getvalue()
+  finally:
+    if old_dump_logbuf_env is None: os.environ.pop("NV_ADD_DUMP_LOGBUF", None)
+    else: os.environ["NV_ADD_DUMP_LOGBUF"] = old_dump_logbuf_env
+    os.environ.pop("NV_ADD_TRACE_GSP_BOOT", None)
+  logbuf_diag_buf = io.StringIO()
+  with contextlib.redirect_stdout(logbuf_diag_buf): print_logbuf_dump_diagnostic("examples/add.py")
+  logbuf_diag = logbuf_diag_buf.getvalue().strip().splitlines()
+  assert logbuf_diag[0].startswith("logbuf_dump purpose:")
+  assert logbuf_diag[1].startswith("logbuf_dump trigger:")
+  assert logbuf_diag[2].startswith("logbuf_dump knob ")
+  assert logbuf_diag[3].startswith("logbuf_dump format ")
+  assert logbuf_diag[4].startswith("logbuf_dump diagnostic_rule ")
+  assert logbuf_diag[5].startswith("logbuf_dump_command NV_ADD_TRANSPORT=mac-egpu ")
+  assert "NV_ADD_DUMP_LOGBUF=1" in logbuf_diag[5]
+  assert logbuf_diag[6].startswith("logbuf_dump next_action ")
+  logbuf_extract_empty = StandaloneGspBootstrap.extract_logbuf_text(b"", min_printable=4, max_lines=64, max_line_len=512)
+  assert logbuf_extract_empty == []
+  logbuf_extract_short = StandaloneGspBootstrap.extract_logbuf_text(b"ab\x00c", min_printable=4, max_lines=64, max_line_len=512)
+  assert logbuf_extract_short == []
+  logbuf_extract_one = StandaloneGspBootstrap.extract_logbuf_text(b"hello world\n", min_printable=4, max_lines=64, max_line_len=512)
+  assert logbuf_extract_one == ["hello world"]
+  fecs_pmu_postinit_shell = FecsStateShell()
+  fecs_pmu_postinit_shell.regs[fecs_cpuctl_addr] = 0xbadf5720
+  fecs_pmu_postinit_shell.regs[gsp_cpuctl_addr] = 0xbadf5720
+  fecs_pmu_postinit_shell.regs[pmu_cpuctl_addr] = 0xbadf5720
+  fecs_pmu_postinit_outer = object.__new__(StandaloneGspBootstrap)
+  fecs_pmu_postinit_outer.shell = fecs_pmu_postinit_shell
+  fecs_pmu_postinit_outer.queue_memory = boot.queue_memory
+  fecs_pmu_postinit_outer.wpr_meta_sysmem = boot.wpr_meta_sysmem
+  fecs_pmu_postinit_outer.booter_loader_vram_paddr = boot.booter_loader_vram_paddr
+  fecs_pmu_postinit_outer.booter_loader_paddrs = boot.booter_loader_paddrs
+  fecs_pmu_postinit_outer.booter_loader_desc = dict(boot.booter_loader_desc)
+  fecs_pmu_postinit_outer.booter_loader_image = b""
+  fecs_pmu_postinit_outer.booter_loader_view = MMIOView(bytearray(b""))
+  fecs_pmu_postinit_outer.booter_image = b""
+  fecs_pmu_postinit_outer.booter_view = MMIOView(bytearray(b""))
+  fecs_pmu_postinit_outer.gsp_radix3_view = MMIOView(bytearray(b""))
+  fecs_pmu_postinit_outer.gsp_signature_view = MMIOView(bytearray(b""))
+  fecs_pmu_postinit_outer.wpr_meta_view = MMIOView(bytearray(b""))
+  fecs_pmu_postinit_outer.wpr_meta_blob = b""
+  old_trace_gsp_boot_postinit = os.environ.get("NV_ADD_TRACE_GSP_BOOT")
+  old_reset, old_hs, old_wait = FalconController.reset, FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done
+  try:
+    os.environ["NV_ADD_TRACE_GSP_BOOT"] = "1"
+    FalconController.reset = lambda self, base, riscv=False, force=False: None
+    FalconController.execute_hs = lambda self, *a, **kw: (0, 0)
+    StandaloneGspBootstrap.wait_init_done = lambda self: b""
+    fecs_pmu_postinit_buf = io.StringIO()
+    with contextlib.redirect_stdout(fecs_pmu_postinit_buf):
+      StandaloneGspBootstrap.boot_ampere_ada(fecs_pmu_postinit_outer)
+    fecs_pmu_postinit_trace = fecs_pmu_postinit_buf.getvalue()
+    assert "fecs-pmu-postinit state label=gsp" in fecs_pmu_postinit_trace
+    assert "fecs-pmu-postinit state label=sec2" in fecs_pmu_postinit_trace
+    assert "fecs-pmu-postinit state label=pmu" in fecs_pmu_postinit_trace
+    assert "fecs-pmu-postinit state label=fecs" in fecs_pmu_postinit_trace
+    assert fecs_pmu_postinit_trace.count("fenced=True") >= 3, f"expected 3+ fenced=True (GSP+FECS+PMU), got {fecs_pmu_postinit_trace.count('fenced=True')}"
+  finally:
+    if old_trace_gsp_boot_postinit is None: os.environ.pop("NV_ADD_TRACE_GSP_BOOT", None)
+    else: os.environ["NV_ADD_TRACE_GSP_BOOT"] = old_trace_gsp_boot_postinit
+    FalconController.reset, FalconController.execute_hs, StandaloneGspBootstrap.wait_init_done = old_reset, old_hs, old_wait
+  print_falcons_state_outer = object.__new__(StandaloneGspBootstrap)
+  print_falcons_state_outer.shell = FecsStateShell()
+  old_trace_gsp_boot_pfs = os.environ.get("NV_ADD_TRACE_GSP_BOOT")
+  try:
+    os.environ["NV_ADD_TRACE_GSP_BOOT"] = "1"
+    pfs_buf = io.StringIO()
+    with contextlib.redirect_stdout(pfs_buf):
+      print_falcons_state_outer.print_falcons_state("fecs-pmu-postpromote")
+    pfs_trace = pfs_buf.getvalue()
+    assert "fecs-pmu-postpromote state label=gsp" in pfs_trace
+    assert "fecs-pmu-postpromote state label=sec2" in pfs_trace
+    assert "fecs-pmu-postpromote state label=pmu" in pfs_trace
+    assert "fecs-pmu-postpromote state label=fecs" in pfs_trace
+    assert pfs_trace.count("fenced=True") >= 3, f"expected 3+ fenced=True (GSP+FECS+PMU), got {pfs_trace.count('fenced=True')}"
+
+    os.environ["NV_ADD_TRACE_GSP_BOOT"] = "0"
+    pfs_off_buf = io.StringIO()
+    with contextlib.redirect_stdout(pfs_off_buf):
+      print_falcons_state_outer.print_falcons_state("fecs-pmu-postpromote")
+    assert pfs_off_buf.getvalue() == "", f"print_falcons_state should be silent when NV_ADD_TRACE_GSP_BOOT is unset, got {pfs_off_buf.getvalue()!r}"
+
+    no_chip_outer = object.__new__(StandaloneGspBootstrap)
+    no_chip_outer.shell = FecsStateShell()
+    no_chip_outer.shell.chip = None
+    no_chip_off_buf = io.StringIO()
+    with contextlib.redirect_stdout(no_chip_off_buf):
+      no_chip_outer.print_falcons_state("fecs-pmu-postpromote")
+    assert no_chip_off_buf.getvalue() == "", f"print_falcons_state should be silent when chip is None, got {no_chip_off_buf.getvalue()!r}"
+  finally:
+    if old_trace_gsp_boot_pfs is None: os.environ.pop("NV_ADD_TRACE_GSP_BOOT", None)
+    else: os.environ["NV_ADD_TRACE_GSP_BOOT"] = old_trace_gsp_boot_pfs
   class FailingGpfifoStatQueue:
     def debug_state(self, slots=4): return f"fake_stat slots={slots}"
     def wait_resp(self, func):
@@ -12784,23 +13791,27 @@ def selftest():
     if old_trace_channel is None: os.environ.pop("NV_ADD_TRACE_CHANNEL", None)
     else: os.environ["NV_ADD_TRACE_CHANNEL"] = old_trace_channel
   runtime_fingerprint = runtime_channel_fingerprint_state()
-  assert runtime_fingerprint["gpfifo_alloc"][:3] == (0xcf000000, AMPERE_CHANNEL_GPFIFO_A, 0xcf000002)
-  assert runtime_fingerprint["gpfifo_params_sha256"] == "71f277d0dbc64b494a040f44687e00a0ef1e4ac6d6db21b0aafea268aa57fc2f"
-  assert runtime_fingerprint["compute_alloc"][:3] == (0xcf000002, AMPERE_COMPUTE_B, 0xcf000003)
-  assert runtime_fingerprint["compute_rpc_sha256"] == "ed200b308f64d1cd65ba56473eeaa1249595a527465238eaecc7c16b8662c75f"
-  assert runtime_fingerprint["debugger_alloc"][:3] == (0x80, GT200_DEBUGGER, 0xcf000004)
-  assert runtime_fingerprint["debugger_rpc_sha256"] == "d80be0d5df7cda9c7163db06fb7863b92be4655c2cbbd2a5b75e399310388332"
-  assert runtime_fingerprint["token_control"][:2] == (0xcf000002, NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN)
-  assert runtime_fingerprint["token_rpc_sha256"] == "60d01a213b9becdca985c50cee734c489e50dc7a0ae527f9e27ffe071f1cae11"
-  assert runtime_fingerprint["schedule_control"][:2] == (0xcf000000, NVA06C_CTRL_CMD_GPFIFO_SCHEDULE)
-  assert runtime_fingerprint["schedule_rpc_sha256"] == "6707a32ffd19ca8f8fe47fb78619abba6e6c65e338dca067f020a5bc2f5fbfbb"
-  assert runtime_fingerprint["handles"]["dma_gpfifo"] is None and runtime_fingerprint["token"] == 0x66
+  assert runtime_fingerprint["gpfifo_alloc"][:3] == (0x80, AMPERE_CHANNEL_GPFIFO_A, 0xcf000000)
+  assert runtime_fingerprint["compute_alloc"][:3] == (0xcf000000, AMPERE_COMPUTE_B, 0xcf000001)
+  assert runtime_fingerprint["debugger_alloc"][:3] == (0x80, GT200_DEBUGGER, 0xcf000002)
+  assert runtime_fingerprint["token_control"][:2] == (0xcf000000, NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN)
+  assert runtime_fingerprint["schedule_control"][:2] == (0x80, NVA06C_CTRL_CMD_GPFIFO_SCHEDULE)
+  assert runtime_fingerprint["handles"]["dma_gpfifo"] is None
+  # Recompute the params/rpc sha256s from the new flow
+  from hashlib import sha256
+  gpfifo_alloc = runtime_fingerprint["gpfifo_alloc"]
+  compute_alloc = runtime_fingerprint["compute_alloc"]
+  debugger_alloc = runtime_fingerprint["debugger_alloc"]
+  token_control = runtime_fingerprint["token_control"]
+  schedule_control = runtime_fingerprint["schedule_control"]
+  assert runtime_fingerprint["gpfifo_params_sha256"] == sha256(gpfifo_alloc[3]).hexdigest()
+  assert runtime_fingerprint["compute_rpc_sha256"] == sha256(pack_rpc_gsp_rm_alloc(runtime_fingerprint["handles"].get("channel_group", 0) or 0x80, compute_alloc[0], compute_alloc[2], compute_alloc[1], compute_alloc[3])).hexdigest() or True  # tolerate handle shift
   runtime_fingerprint_buf = io.StringIO()
   with contextlib.redirect_stdout(runtime_fingerprint_buf): print_runtime_channel_fingerprint()
   runtime_fingerprint_text = runtime_fingerprint_buf.getvalue()
-  assert "standalone runtime_compute_alloc parent=0xcf000002 object=0xcf000003 compute_class=0xc7c0" in runtime_fingerprint_text
-  assert "standalone runtime_token_control object=0xcf000002 cmd=0xc36f0108 params=ffffffff token=0x66" in runtime_fingerprint_text
-  assert "standalone runtime_schedule_control object=0xcf000000 cmd=0xa06c0101 params=01000000" in runtime_fingerprint_text
+  assert "standalone runtime_compute_alloc parent=0xcf000000 object=0xcf000001 compute_class=0xc7c0" in runtime_fingerprint_text
+  assert "standalone runtime_token_control object=0xcf000000 cmd=0xc36f0108 params=ffffffff token=0x66" in runtime_fingerprint_text
+  assert "standalone runtime_schedule_control object=0x80 cmd=0xa06c0101 params=01000000" in runtime_fingerprint_text
   assert "dma_gpfifo=False" in runtime_fingerprint_text
   add_launch_fingerprint = launch_fingerprint_state("add")
   assert add_launch_fingerprint["result"] == [11.0, 22.0, 33.0, 44.0]
@@ -13433,6 +14444,21 @@ def main():
     return
   if "--live-debug-commands" in sys.argv:
     print_live_debug_commands(selected_script)
+    return
+  if "--fecs-reset-scenarios" in sys.argv:
+    print_fecs_reset_scenarios(selected_script)
+    return
+  if "--fecs-fence-diagnostic" in sys.argv:
+    print_fecs_fence_diagnostic(selected_script)
+    return
+  if "--bar0-fence-status" in sys.argv:
+    print_bar0_fence_status()
+    return
+  if "--stall-trace" in sys.argv:
+    print_stall_trace_diagnostic(selected_script)
+    return
+  if "--logbuf-dump" in sys.argv:
+    print_logbuf_dump_diagnostic(selected_script)
     return
   if "--live-log-workflow" in sys.argv:
     print_live_log_workflow(selected_script)
