@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone NV multiply example built on the shared add.py backend."""
 
-from add import NvBackend, SimpleProgram, apply_default_live_run_env, build_cubin, cli_arg_value, compare_trace_log_fields, compare_trace_log_gpfifo_descs, compare_trace_log_promote_contexts, compare_trace_log_rm_alloc_sequence, compare_trace_log_text, format_trace_log_comparison, format_trace_log_rm_alloc_sequence_comparison, import_guard_state, make_simulated_backend, manual_launch_mul, print_boot_firmware_contract, print_channel_contract, print_comparison_checklist, print_context_promote_fingerprint, print_contract_suite, print_debug_help, print_golden_compute_fingerprint, print_gpfifo_constructor_fingerprint, print_gsp_rpc_contract, print_import_guard, print_launch_fingerprint, print_live_debug_commands, print_live_log_workflow, print_live_stack_log_workflow, print_offline_debug_suite, print_reconnect_command, print_reconnect_commands, print_register_contract, print_runtime_channel_fingerprint, print_runtime_summary, print_trace_log_comparison, print_transport_contract, print_transport_preflight, print_transport_preflight_classification, print_transport_preflight_gate, print_transport_preflight_plan, print_validation_suite, print_vm_contract, static_external_import_guard_state, static_import_guard_state
+from add import NvBackend, SimpleProgram, apply_default_live_run_env, build_cubin, cli_arg_value, compare_trace_log_fields, compare_trace_log_gpfifo_descs, compare_trace_log_promote_contexts, compare_trace_log_rm_alloc_sequence, compare_trace_log_text, format_trace_log_comparison, format_trace_log_rm_alloc_sequence_comparison, import_guard_state, make_simulated_backend, manual_launch_mul, print_boot_firmware_contract, print_channel_contract, print_comparison_checklist, print_context_promote_fingerprint, print_contract_suite, print_debug_help, print_golden_compute_fingerprint, print_gpfifo_constructor_fingerprint, print_gsp_rpc_contract, print_import_guard, print_launch_fingerprint, print_live_debug_commands, print_live_log_workflow, print_live_stack_log_workflow, print_offline_debug_suite, print_reconnect_command, print_reconnect_commands, print_register_contract, print_runtime_channel_fingerprint, print_fecs_fence_diagnostic, print_fecs_reset_scenarios, print_logbuf_dump_diagnostic, print_stall_trace_diagnostic, print_bar0_fence_status, print_runtime_summary, print_trace_log_comparison, print_transport_contract, print_transport_preflight, print_transport_preflight_classification, print_transport_preflight_gate, print_transport_preflight_plan, print_validation_suite, print_vm_contract, static_external_import_guard_state, static_import_guard_state
 import contextlib
 import io
 import pathlib
@@ -58,6 +58,21 @@ def main():
     return
   if "--live-debug-commands" in sys.argv:
     print_live_debug_commands("examples/mul.py")
+    return
+  if "--fecs-reset-scenarios" in sys.argv:
+    print_fecs_reset_scenarios("examples/mul.py")
+    return
+  if "--fecs-fence-diagnostic" in sys.argv:
+    print_fecs_fence_diagnostic("examples/mul.py")
+    return
+  if "--bar0-fence-status" in sys.argv:
+    print_bar0_fence_status()
+    return
+  if "--stall-trace" in sys.argv:
+    print_stall_trace_diagnostic("examples/mul.py")
+    return
+  if "--logbuf-dump" in sys.argv:
+    print_logbuf_dump_diagnostic("examples/mul.py")
     return
   if "--live-log-workflow" in sys.argv:
     print_live_log_workflow("examples/mul.py")
@@ -240,9 +255,9 @@ def main():
     with contextlib.redirect_stdout(offline_debug_buf): print_offline_debug_suite("mul")
     offline_debug_text = offline_debug_buf.getvalue()
     assert "tinygrad_modules=[]" in offline_debug_text and "external_static_imports=[]" in offline_debug_text
-    assert "standalone runtime_compute_alloc parent=0xcf000002" in offline_debug_text
+    assert "standalone runtime_compute_alloc parent=0xcf000000 object=0xcf000001" in offline_debug_text
     assert "standalone context_promote label=user_phys entries=3 ids=[0, 1, 2]" in offline_debug_text
-    assert "standalone gpfifo_constructor parent=0xcf000000 object=0xcf000002 gpfifo_class=0xc56f" in offline_debug_text
+    assert "standalone gpfifo_constructor parent=0x80 object=0xcf000000 gpfifo_class=0xc56f" in offline_debug_text
     assert "standalone launch arithmetic=mul result=[10.0, 40.0, 90.0, 160.0]" in offline_debug_text
     debug_help_buf = io.StringIO()
     with contextlib.redirect_stdout(debug_help_buf): print_debug_help("examples/mul.py", "mul")
