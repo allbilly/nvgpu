@@ -68,3 +68,5 @@ stack is broken and the standalone path is also likely broken.
 - gpgpu-sim/gpgpu-sim_distribution
 - Tim453/ClusterSim
 - nvidia/open-gpu-kernel-modules
+
+https://blog.doubleword.ai/what-happens-when-you-run-a-cuda-kernel
