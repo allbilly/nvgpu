@@ -69,7 +69,7 @@ stack is broken and the standalone path is also likely broken.
 - Tim453/ClusterSim
 - nvidia/open-gpu-kernel-modules
 
-https://blog.doubleword.ai/what-happens-when-you-run-a-cuda-kernel
+- https://blog.doubleword.ai/what-happens-when-you-run-a-cuda-kernel
 
 Revealing NVIDIA Closed-Source Driver Command Streams for CPU–GPU Runtime Behavior Insight
-https://arxiv.org/html/2604.26889
+- https://arxiv.org/html/2604.26889
