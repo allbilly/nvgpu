@@ -52,8 +52,8 @@ NV_ADD_TRACE_STAGES=1 python3 examples/middle_nv.py
 `result=[11.0, 22.0, 33.0, 44.0]`. If it doesn't, the eGPU / GSP / tinygrad
 stack is broken and the standalone path is also likely broken.
 
-## Reference repos (deepwiki MCP)
 
+ask deepwiki on ref repo
 - allbilly/ane: examples/
 - allbilly/rk3588: examples/
 - florianmattana/sass-king
@@ -68,6 +68,7 @@ stack is broken and the standalone path is also likely broken.
 - gpgpu-sim/gpgpu-sim_distribution
 - Tim453/ClusterSim
 - nvidia/open-gpu-kernel-modules
+- TheTom/pascal-egpu
 
 - https://blog.doubleword.ai/what-happens-when-you-run-a-cuda-kernel
 
