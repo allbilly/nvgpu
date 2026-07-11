@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<title>VGA Bios Collection: NVIDIA GTX 770 4 GB | TechPowerUp</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<link rel="preconnect" href="https://tpucdn.com" />
+		<meta name="application-name" content="TechPowerUp">
+		
+		<link rel="preload stylesheet" href="https://tpucdn.com/css/style-v1783659488.css" as="style" crossorigin>
+		<link rel="preload" href="https://tpucdn.com/css/fonts/tpu-body-regular-v1783659488.woff2" as="font" type="font/woff2" crossorigin>
+		<link rel="preload" href="https://tpucdn.com/css/fonts/tpu-body-bold-v1783659488.woff2" as="font" type="font/woff2" crossorigin>
+		<link rel="preload" href="https://tpucdn.com/css/fonts/opensans-condbold-v1783659488.woff2" as="font" type="font/woff2" crossorigin>
+
+		<meta name="robots" content="max-image-preview:large">
+
+		<meta property="article:publisher" content="https://www.facebook.com/TechPowerUp" />
+		<meta property="og:site_name" content="TechPowerUp">
+		<meta property="og:title" content="NVIDIA GTX 770 VBIOS">
+		<meta property="og:type" content="article">
+		<meta property="og:description" content="4 GB GDDR5, 1058 MHz GPU, 1600 MHz Memory">
+		<meta property="og:url" content="https://www.techpowerup.com/vgabios/219286/219286">				<meta property="og:image" content="https://www.techpowerup.com/gpu-specs/images-new/c/1856-front-thumb.jpg">
+				
+		
+		
+				
+		
+		<link rel="shortcut icon" href="https://tpucdn.com/favicon-v1783659488.ico">
+		<link rel="apple-touch-icon" href="https://tpucdn.com/apple-touch-icon-v1783659488.png">
+
+		<link rel="stylesheet" href="https://tpucdn.com/css/style-v1783659488.css">
+														<link rel="stylesheet" href="https://tpucdn.com/css/databases-v1783659488.css">						
+		<script>
+			loadjs=function(){var n=function(){},e={},t={},r={};function c(n,e){if(n){var c=r[n];if(t[n]=e,c)for(;c.length;)c[0](n,e),c.splice(0,1)}}function i(e,t){e.call&&(e={success:e}),t.length?(e.error||n)(t):(e.success||n)(e)}function o(e,t,r,c){var i,s,u=document,f=r.async,a=(r.numRetries||0)+1,h=r.before||n;c=c||0,/(^css!|\.css$)/.test(e)?(i=!0,(s=u.createElement("link")).rel="stylesheet",s.href=e.replace(/^css!/,"")):((s=u.createElement("script")).src=e,s.async=void 0===f||f),s.onload=s.onerror=s.onbeforeload=function(n){var u=n.type[0];if(i&&"hideFocus"in s)try{s.sheet.cssText.length||(u="e")}catch(n){u="e"}if("e"==u&&(c+=1)<a)return o(e,t,r,c);t(e,u,n.defaultPrevented)},!1!==h(e,s)&&u.head.appendChild(s)}function s(n,t,r){var s,u;if(t&&t.trim&&(s=t),u=(s?r:t)||{},s){if(s in e)throw"LoadJS";e[s]=!0}!function(n,e,t){var r,c,i=(n=n.push?n:[n]).length,s=i,u=[];for(r=function(n,t,r){if("e"==t&&u.push(n),"b"==t){if(!r)return;u.push(n)}--i||e(u)},c=0;c<s;c++)o(n[c],r,t)}(n,function(n){i(u,n),c(s,n)},u)}return s.ready=function(n,e){return function(n,e){var c,i,o,s=[],u=(n=n.push?n:[n]).length,f=u;for(c=function(n,t){t.length&&s.push(n),--f||e(s)};u--;)i=n[u],(o=t[i])?c(i,o):(r[i]=r[i]||[]).push(c)}(n,function(n){i(e,n)}),s},s.done=function(n){c(n,[])},s.reset=function(){e={},t={},r={}},s.isDefined=function(n){return n in e},s}();
+		</script>
+
+		<!--[if lt IE 9]><script src="https://tpucdn.com/js/html5shiv.min-v1783659488.js"></script><![endif]-->
+		<!--[if lt IE 9]><script>window.onerror = function(){ return true; }</script><![endif]-->
+
+		<script>
+			loadjs(["https://tpucdn.com/js/jquery-3.6.0.min-v1783659488.js", "https://tpucdn.com/js/tpu-v1783659488.js"], { async: false, success: function() { $(function() { loadjs.done('jquery'); }); }});
+
+			loadjs.ready(['jquery'], function() {
+				
+				loadjs(["https://tpucdn.com/js/popup/popup.min-v1783659488.css", "https://tpucdn.com/js/popup/popup.min-v1783659488.js"], 'popup');
+
+																																																											});
+
+												
+											</script>
+
+		
+		
+		<link rel="alternate" type="application/rss+xml" title="TechPowerUp Frontpage News" href="/rss/news">
+		<link rel="alternate" type="application/rss+xml" title="TechPowerup Reviews" href="/rss/reviews">
+
+				<script>
+			window._paq = [
+    			['setSiteId', '1'],
+    			['setTrackerUrl', 'https://www.techpowerup.com/js/mt'],
+				['enableLinkTracking'],
+    			['setRequestMethod', 'POST'],
+    			['enableHeartBeatTimer'],
+								['setCustomVariable', 1, 'PageGen', '12.3', scope = 'page'],
+    			['trackPageView'],
+			];
+			(function() {
+				var d=document; g=d.createElement('script'); s=d.getElementsByTagName('script')[0];
+				g.async=true; g.src='https://tpucdn.com/js/mt-v1783659488.js'; s.parentNode.insertBefore(g,s);
+			})();
+		</script>
+		
+		<noscript><style>.jsonly { display: none !important; }</style></noscript>
+
+		
+	</head>
+
+	<body class="body vgabios-details">
+		
+		
+
+		
+		<div class="v-port">
+			
+						<div data-slot="takeover"></div>
+			<div class="page-header">
+				<div class="page-header__logo-wrapper">
+					<label for="navigation-check" class="navigation-toggle" onclick="" title="Navigation"></label>
+					<label for="s--check" class="s--toggle" onclick="" title="Sidebar"></label>
+					<script>
+						loadjs.ready(['jquery'], function() {
+							$('.s-').clone().insertBefore('.page').addClass('s---responsive');
+							$('#navigation-check').prop('checked', false).on('click', function() {
+								$('html').toggleClass('navigation-active', $(this).is(':checked'));
+							});
+							$('#s--check').prop('checked', false).on('click', function() {
+								$('html').toggleClass('sidebar-active', $(this).is(':checked'));
+							});
+						});
+					</script>
+					<a class="page-header__logo" href="/" title="TechPowerUp"></a>
+				</div>
+
+				<div btr-cls data-slot="top_right"><span data-req-id="PfmFMAyynfxKU"><div><a href="/reviyuu/b784/3999er/images/gmchjhj.png" target="_blank" rel="nofollow">
+<img src="/reviyuu/b784/_72fb9356.png" alt="">
+</a></div></span></div>
+			</div>
+			<input type="checkbox" id="s--check"/>
+
+			<input type="checkbox" id="navigation-check"/>
+			<nav id="menu">
+				<label for="navigation-check" id="menu-toggle" onclick="" title="Close"></label>
+				<ul>
+					<li><a href="/">Home</a></li>
+					<li><a href="/review/">Reviews</a></li>
+					<li><a href="/forums/">Forums</a></li>
+					<li><a href="/download/">Downloads</a></li>
+					<li><a href="/gallery/">Case Mod Gallery</a></li>
+					<li>
+						<label class="menu-toggle-sub" onclick="" for="menu-databases">Databases</label>
+						<input id="menu-databases" class="sub-menu-check" type="checkbox">
+						<ul id="menu-databases-sub" class="sub-menu">
+							<li class="menu-sub-heading">Databases…
+								<label class="menu-back" title="Back" onclick="" for="menu-databases">Back</label>
+							</li>
+							<li><a href="/vgabios/">VGA Bios Collection</a></li>
+							<li><a href="/gpu-specs/">GPU Database</a></li>
+							<li><a href="/cpu-specs/">CPU Database</a></li>
+							<li><a href="/ssd-specs/">SSD Database</a></li>
+							<li><a href="/reviewdb/">Review Database</a></li>
+							<li><a href="/review/future-hardware-releases/">Upcoming Hardware</a></li>
+						</ul>
+					</li>
+					<li>
+						<label class="menu-toggle-sub" onclick="" for="menu-software">Our Software</label>
+						<input id="menu-software" class="sub-menu-check" type="checkbox">
+						<ul id="menu-software-sub" class="sub-menu">
+							<li class="menu-sub-heading">Our Software…
+								<label class="menu-back" title="Back" onclick="" for="menu-software">Back</label>
+							</li>
+							<li><a href="/gpuz/">GPU-Z</a></li>
+							<li><a href="/realtemp/">RealTemp</a></li>
+							<li><a href="/nvcleanstall/">NVCleanstall</a></li>
+							<li><a href="/tpucapture/">TPUCapture</a></li>
+							<li><a href="/memtest64/">MemTest64</a></li>
+						</ul>
+					</li>
+					<li>
+						<label class="menu-toggle-sub" onclick="" for="menu-more">More</label>
+						<input id="menu-more" class="sub-menu-check" type="checkbox">
+						<ul id="menu-more-sub" class="sub-menu">
+							<li class="menu-sub-heading">More…
+								<label class="menu-back" title="Back" onclick="" for="menu-more">Back</label>
+							</li>
+							<li><a href="/articles/">Articles</a></li>
+							<li><a href="/oldstuff/">Old Stuff</a></li>
+							<li><a href="/trivia/">Computer Trivia</a></li>
+							<li><a href="/live/">TPU Live</a></li>
+							<li><a href="/dram-latency/">RAM Latency Calculator</a></li>
+																				</ul>
+					</li>
+					<li><a href="/contact/">Contact Us</a></li>
+										<li class="social">
+						<a class="facebook" title="Facebook" target="_blank" rel="nofollow noopener" href="https://www.facebook.com/TechPowerUp"></a>
+						<a class="x" title="X" target="_blank" rel="nofollow noopener" href="https://x.com/TechPowerUp"></a>
+						<a class="bluesky" title="Bluesky" target="_blank" rel="nofollow noopener" href="https://bsky.app/profile/techpowerup.com"></a>
+						<a class="patreon" title="Patreon" target="_blank" rel="nofollow noopener" href="https://www.patreon.com/TechPowerUp"></a>
+						<a class="youtube" title="YouTube" target="_blank" rel="nofollow noopener" href="https://www.youtube.com/c/TechPowerUp"></a>
+						<a class="rss" title="RSS" href="/rss/"></a>
+					</li>
+				</ul>
+			</nav>
+
+			<div class="page">
+				
+				<div class="contnt ">
+					
+<div class="wrap-center">
+
+	<ul class="breadcrumb" itemscope itemtype="https://schema.org/BreadcrumbList">
+		<li itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
+									<a href="/vgabios/" itemprop="item"><span itemprop="name">VGA BIOS Collection</span></a>
+							<meta itemprop="position" content="1" />
+	</li>
+		<li itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
+									<a href="/vgabios/?model=GTX+770" itemprop="item"><span itemprop="name">GTX 770</span></a>
+							<meta itemprop="position" content="2" />
+	</li>
+		<li itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
+									<a href="/vgabios/?manufacturer=NVIDIA&amp;model=GTX+770" itemprop="item"><span itemprop="name">NVIDIA GTX 770</span></a>
+							<meta itemprop="position" content="3" />
+	</li>
+		<li itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
+									<a href="/vgabios/219286/219286" itemprop="item"><b itemprop="name">NVIDIA GTX 770 4096 MB BIOS</b></a>
+							<meta itemprop="position" content="4" />
+	</li>
+	</ul>
+
+	
+	<h1 class="biostitle">NVIDIA GTX 770 4 GB BIOS</h1>
+
+	
+	
+		<div class="bios-unverified-warning p">
+		<div><b>Warning:</b> You are viewing an unverified BIOS file.</div>
+		This upload has not been verified by us in any way (like we do for the entries listed under the 'AMD', 'ATI' and 'NVIDIA' sections).<br />
+		Please exercise caution when flashing it to your graphics card, and always have a backup.
+	</div>
+	
+	<div class="clearfix tablecontainer">
+		<section class="biosinfo">
+			<h1>VBIOS Info</h1>
+			<table>
+				<tr>
+					<th>Filename:</th>
+					<td class="filename">219286.rom</td>
+				</tr>
+				<tr>
+					<th>VBIOS Version:</th>
+					<td>80.04.C4.00.03</td>
+				</tr>
+				<tr>
+					<th>UEFI Supported:</th>
+					<td>Yes</td>
+				</tr>
+				<tr>
+					<th>BIOS Build date:</th>
+					<td>2016-04-06 00:00:00</td>
+				</tr>
+				<tr>
+					<th>Date added:</th>
+					<td>2020-03-22 17:31:19</td>
+				</tr>
+				<tr>
+					<th>VBIOS Size:</th>
+					<td>164 KB</td>
+				</tr>
+				<tr>
+					<th>MD5 Hash:</th>
+					<td class="md5">252f95cd3a014777e49c42c915bd8bfe</td>
+				</tr>
+				<tr>
+					<th>SHA1 Hash:</th>
+					<td class="sha1">0e3e30802582f4ebf8ff3be11a10feec98820429</td>
+				</tr>
+								<tr>
+					<th>Same Bios:</th>
+					<td><a target="_blank" href="/vgabios/244812/244812">Chaintech GTX 770</a></td>
+				</tr>
+							</table>
+		</section>
+
+				<section class="cardimage">
+			<figure>
+												<div class="placeholder-text">Placeholder picture (may not match the card exactly)</div>
+								<a href="/gpu-specs/geforce-gtx-770.c1856">
+					<img src="/gpu-specs/images-new/c/1856-front-thumb.jpg" alt="GeForce GTX 770 Image" width="670" height="350" />
+				</a>
+								<figcaption>
+					<a href="/gpu-specs/geforce-gtx-770.c1856">View all GeForce GTX 770 specs in our GPU Database</a>
+				</figcaption>
+			</figure>
+		</section>
+		
+	</div>
+
+	<div class="clearfix tablecontainer">
+		<section class="biosinternals">
+			<h1>BIOS Internals</h1>
+			<table class="biosinternals">
+				<tr>
+					<td>GPU Device Id: 0x10DE 0x1184
+GK104 P2004 SKU 0010 VGA BIOS (HWDIAG)
+Copyright (C) 1996-2013 NVIDIA Corp.
+GK104 Board - 20040010
+Connectors
+  1x DisplayPort
+  1x DVI-D
+  1x DVI-I
+  1x HDMI
+GPU power limit
+  Target: 173.0 W
+  Limit: 200.0 W
+  Adj. Range: -42%, +16%
+Fan Speed
+  Min: 30%
+  Max: 77%
+Thermal Limits
+  Rated: 80.0°C
+  Max: 95.0°C
+Memory Support
+  GDDR5, Elpida
+  GDDR5, Hynix
+  GDDR5, Samsung
+Performance Level 0
+  Core Clk: 405.0 MHz
+  Mem Clk: 162.0 MHz
+Performance Level 1
+  Core Clk: 540.0 MHz
+  Mem Clk: 405.0 MHz
+Performance Level 2
+  Core Clk: 540.0 MHz
+  Mem Clk: 1502.0 MHz
+Performance Level 3
+  Core Clk: 540.0 MHz
+  Mem Clk: 1600.5 MHz
+Boost Clocks
+  P0 Boost: 1124 MHz
+  P0 Base: 1058.5 MHz</td>
+				</tr>
+			</table>
+		</section>
+
+		<section class="cardinfo">
+			<h1>Graphics Card Info</h1>
+			<table>
+				<tr>
+					<th>Manufacturer:</th>
+					<td>NVIDIA</td>
+				</tr>
+				<tr>
+					<th>Model:</th>
+					<td>GTX 770</td>
+				</tr>
+				<tr>
+					<th>Device Id:</th>
+					<td>10DE 1184</td>
+				</tr>
+				<tr>
+					<th>Subsystem Id:</th>
+					<td>10DE 1033</td>
+				</tr>
+				<tr>
+					<th>Interface:</th>
+					<td>PCI-E</td>
+				</tr>
+				<tr>
+					<th>Memory Size:</th>
+					<td>4096 MB</td>
+				</tr>
+				<tr>
+					<th>GPU Clock:</th>
+					<td>1058 MHz</td>
+				</tr>
+								<tr>
+					<th>Boost Clock:</th>
+					<td>1124 MHz</td>
+				</tr>
+								<tr>
+					<th>Memory Clock:</th>
+					<td>1600 MHz</td>
+				</tr>
+				<tr>
+					<th>Memory Type:</th>
+					<td>GDDR5</td>
+				</tr>
+			</table>
+		</section>
+	</div>
+
+	<div class="clearfix tablecontainer">
+				<section class="biosdesc">
+			<p>NVIDIA, GTX 770 4 GB, NVIDIA GeForce GTX 770,  (1059 / 1601)
+</p>
+		</section>
+		
+		<div class="clearfix buttons">
+			<a class="button downloadbutton" rel="nofollow" href="/vgabios/219286/219286.rom">Download Now</a><br />
+			or <a class="button findcompat" href="/vgabios/?did=10DE-1184-10DE-1033">Find compatible BIOS</a><br />
+		</div>
+
+	</div>
+
+</div>
+
+				</div>
+
+				<div class="s-">
+					<label for="s--check" class="s--toggle-button" title="Close" onclick=""></label>
+
+					<div class="s--item s--time">
+						<span class="s--time__cur">Jul 11th, 2026 04:48 CDT</span>
+ 						<a class="s--time__link" href="#">change timezone</a>
+					</div>
+					<script>
+						loadjs.ready(['jquery', 'popup'], function() {
+							$('.s--time__cur, .s--time__link').on('click', function(e) {
+								e.preventDefault();
+								popup.ShowAJAX('Please select your timezone', '/set-timezone', { width:455 });
+							});
+						});
+					</script>
+
+					<div class="s--item s--search">
+						<form class="s--search__form" action="/site-search" method="POST">
+							<input class="s--search__input" type="text" placeholder="Search TechPowerUp" name="q" autocomplete="off" />
+							<input class="s--search__submit" type="submit" value="" />
+													</form>
+					</div>
+
+										<article class="s--item s--login">
+						<a href="/forums/login">Sign in</a> / <a href="/forums/register">Register</a>
+					</article>
+					
+					<div class="s--item s--drivers">
+<div>
+	<h1 class="s--item__heading">Latest&nbsp;GPU Drivers</h1>
+
+	<div>
+	<ul class="s--drivers__list">
+		<li><a class="s--drivers__driver s--drivers__driver--nvidia" href="/download/nvidia-geforce-graphics-drivers/">NVIDIA GeForce 610.74 WHQL </a></li>
+		<li><a class="s--drivers__driver s--drivers__driver--amd" href="/download/amd-radeon-graphics-drivers/">AMD Radeon 26.6.4 WHQL </a></li>
+		<li><a class="s--drivers__driver s--drivers__driver--intel" href="/download/intel-integrated-graphics-drivers/">Intel Arc &amp; iGPU 101.8861 Beta </a>
+		</li>
+	</ul>
+	</div>
+</div>
+</div>
+
+					<div br-cls class="s--item" data-slot="right_1"><span data-req-id="PfmFMOWFZSKXv"><div><a href="/reviyuu/b784/2738er/images/gmchjhj.png" target="_blank" rel="nofollow">
+<img src="/reviyuu/b784/_d194b8d3.png" alt="">
+</a></div></span></div>
+
+					<article class="s--item s--newposts">
+	<h1 class="s--item__heading">New Forum Posts</h1>
+	<ul class="s--newposts__list">
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T09:22:57+0000">04:22</time>
+				by
+				<span class="s--newposts__username">de.das.dude</span>
+			</div>
+			<a href="/forums/threads/whats-your-latest-tech-purchase.225885/unread">What&#039;s your latest tech purchase?</a> (<span class="s--newposts__replycount">27630</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T09:06:22+0000">04:06</time>
+				by
+				<span class="s--newposts__username">steamrick</span>
+			</div>
+			<a href="/forums/threads/do-oems-scam-us-about-ssd-tbw.344623/unread">Do OEMs Scam us about SSD TBW?</a> (<span class="s--newposts__replycount">70</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T08:54:55+0000">03:54</time>
+				by
+				<span class="s--newposts__username">AusWolf</span>
+			</div>
+			<a href="/forums/threads/the-steamos-thread.350514/unread">The SteamOS Thread</a> (<span class="s--newposts__replycount">36</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T08:52:34+0000">03:52</time>
+				by
+				<span class="s--newposts__username">AleXXX666</span>
+			</div>
+			<a href="/forums/threads/do-you-have-faith-in-software-which-advices-drivers-updates.350631/unread">do you have faith in software which advices drivers updates ?</a> (<span class="s--newposts__replycount">24</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T08:32:28+0000">03:32</time>
+				by
+				<span class="s--newposts__username">Ferather</span>
+			</div>
+			<a href="/forums/threads/dts-dch-driver-for-realtek-hda-dts-x-apo4-dts-interactive.279972/unread">DTS DCH Driver for Realtek HDA [DTS:X APO4 + DTS Interactive]</a> (<span class="s--newposts__replycount">2645</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T08:02:07+0000">03:02</time>
+				by
+				<span class="s--newposts__username">Rulumi</span>
+			</div>
+			<a href="/forums/threads/high-hotspot-but-normal-core-temperature-sapphire-pulse-rx-6700-xt-help.350149/unread">High Hotspot but normal Core Temperature - Sapphire Pulse RX 6700 Xt - help</a> (<span class="s--newposts__replycount">69</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T08:01:52+0000">03:01</time>
+				by
+				<span class="s--newposts__username">Jtuck9</span>
+			</div>
+			<a href="/forums/threads/close-call-5090-burnt-cable.334508/unread">Close call... 5090 Burnt Cable</a> (<span class="s--newposts__replycount">437</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T08:00:57+0000">03:00</time>
+				by
+				<span class="s--newposts__username">Dr. Dro</span>
+			</div>
+			<a href="/forums/threads/gacha-games-discussions-pulls-updates-etc.339067/unread">Gacha Games - Discussions, Pulls, Updates, etc.</a> (<span class="s--newposts__replycount">869</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T05:02:18+0000">00:02</time>
+				by
+				<span class="s--newposts__username">LabRat 891</span>
+			</div>
+			<a href="/forums/threads/multi-gpu-amd-instability-gpus-randomly-disappear-driver-crashes-rocm-vulkan-%E2%80%93-only-happens-with-2-cards-windows-11-ubuntu-26-04.350674/unread">Multi-GPU AMD Instability: GPUs Randomly Disappear + Driver Crashes (ROCm/Vulkan) – Only Happens With 2+ Cards (Windows 11 + Ubuntu 26.04)</a> (<span class="s--newposts__replycount">12</span>)
+		</li>
+				<li>
+			<div class="s--newposts__byline">
+				<time class="s--newposts__time" datetime="2026-07-11T04:53:58+0000">23:53</time>
+				by
+				<span class="s--newposts__username">Toothless</span>
+			</div>
+			<a href="/forums/threads/how-good-is-a-xeon-e5-1680-v2-compared-to-modern-cpus.306548/unread">How good is a Xeon E5 1680 V2 compared to modern CPU&#039;s?</a> (<span class="s--newposts__replycount">40</span>)
+		</li>
+			</ul>
+</article>
+
+
+					<div br-cls class="s--item" data-slot="right_2"><span data-req-id="PfmFM2bUtkt7S"><div><a href="/reviyuu/b784/3954er/images/gmchjhj.png" target="_blank" rel="nofollow">
+<img src="/reviyuu/b784/_da2eb7f6.png" alt="">
+</a></div></span></div>
+
+					<article class="s--item s--top-rev-s">
+	<h1 class="s--item__heading">Popular Reviews</h1>
+	<ul class="s--top-rev-s__list">
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-07-08T19:03:05+0000">Jul 8th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/xpg-lancer-blade-rgb-ddr5-5600-16-gb-cl46/">XPG Lancer Blade RGB DDR5-5600 16 GB CL46 Review - Low Profile</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-07-09T18:59:37+0000">Jul 9th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/cooler-master-v8-ace-3dhp-black-cpu-air-cooler/">Cooler Master V8 ACE 3DHP Black Review</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-07-06T18:36:45+0000">Jul 6th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/geekom-a9-max-2026-update/">GEEKOM A9 Max (2026 Update) Review</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-07-10T20:20:23+0000">Jul 10th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/asus-rog-strix-z890-e-gaming-wi-fi/">ASUS ROG Strix Z890-E Gaming Wi-Fi Review</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-07-07T18:35:46+0000">Jul 7th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/lenovo-yoga-pro-7i-aura-edition-15iph11/">Lenovo Yoga Pro 7i Gen 11 Aura Edition (15IPH11) Review - Light Workhorse Loaded with Features</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-06-16T17:55:00+0000">Jun 16th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/future-hardware-releases/">Upcoming Hardware Launches 2026 (Updated Jun 2026)</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-06-19T18:02:00+0000">Jun 19th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/best-of-computex-2026/">Best of Computex 2026</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-06-16T09:00:43+0000">Jun 16th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/noctua-nl-lc1-36-aio-liquid-cpu-cooler/">Noctua NL-LC1-36 AIO Review - Very Impressive</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-06-25T13:03:10+0000">Jun 25th, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/lian-li-b4-matx/">Lian Li B4-mATX Review</a>
+		</li>
+				<li>
+			<time class="s--top-rev-s__date" datetime="2026-07-02T19:59:36+0000">Jul 2nd, 2026</time>
+			<a class="s--top-rev-s__link" href="/review/asus-rog-strix-x870e-e-gaming-wi-fi7-neo/">ASUS ROG Strix X870E-E Gaming Wi-Fi7 Neo Review</a>
+		</li>
+			</ul>
+</article>
+
+
+					<article class="s--item s--youtube">
+						<h1 class="s--item__heading">TPU on YouTube</h1>
+						<a class="tpu-on-youtube-link" href="https://www.youtube.com/watch?v=rhhK0kxaraI" target="_blank" rel="nofollow"></a>
+					</article>
+
+										<article class="s--item s--top-news">
+	<h1 class="s--item__heading">Controversial News Posts</h1>
+	<ul class="s--top-news__list">
+				<li>
+			<a class="s--top-news__link" href="/350188/valve-finally-reveals-steam-machine-pricing-and-starts-accepting-pre-orders">Valve Finally Reveals Steam Machine Pricing and Starts Accepting Pre-orders</a>
+			(<span class="s--top-news__replycount">517</span>)
+		</li>
+				<li>
+			<a class="s--top-news__link" href="/350334/intel-nova-lake-s-52-core-oc-sku-to-draw-474-w-in-pl2-mode">Intel &quot;Nova Lake-S&quot; 52-Core OC SKU to Draw 474 W in PL2 Mode</a>
+			(<span class="s--top-news__replycount">291</span>)
+		</li>
+				<li>
+			<a class="s--top-news__link" href="/350502/intel-readies-two-22-core-nova-lake-s-skus-with-108-mb-bllc-cache-for-gaming">Intel Readies Two 22-Core &quot;Nova Lake-S&quot; SKUs with 108 MB bLLC Cache for Gaming</a>
+			(<span class="s--top-news__replycount">278</span>)
+		</li>
+				<li>
+			<a class="s--top-news__link" href="/349961/intel-readies-core-raptor-lake-next-socket-lga1700-processors-for-2027">Intel Readies Core &quot;Raptor Lake Next&quot; Socket LGA1700 Processors for 2027</a>
+			(<span class="s--top-news__replycount">184</span>)
+		</li>
+				<li>
+			<a class="s--top-news__link" href="/350013/amd-ryzen-10000-series-olympic-ridge-could-trade-integrated-graphics-for-npu">AMD Ryzen 10000 Series &quot;Olympic Ridge&quot; Could Trade Integrated Graphics for NPU</a>
+			(<span class="s--top-news__replycount">133</span>)
+		</li>
+				<li>
+			<a class="s--top-news__link" href="/350160/microsoft-will-again-force-install-microsoft-365-copilot-app-on-windows-11">Microsoft Will Again Force-Install Microsoft 365 Copilot App on Windows 11</a>
+			(<span class="s--top-news__replycount">128</span>)
+		</li>
+				<li>
+			<a class="s--top-news__link" href="/350434/steam-machine-crippled-by-single-channel-ram">Steam Machine Crippled by Single-Channel RAM</a>
+			(<span class="s--top-news__replycount">108</span>)
+		</li>
+				<li>
+			<a class="s--top-news__link" href="/350185/amd-fsr-upscaling-4-1-officially-released-for-radeon-rx-7000-gpus">AMD FSR Upscaling 4.1 Officially Released for Radeon RX 7000 GPUs</a>
+			(<span class="s--top-news__replycount">106</span>)
+		</li>
+			</ul>
+</article>
+
+									</div>
+				
+			</div>
+
+			<div class="page-is-loading"></div>
+
+			<footer class="site-footer">
+				Copyright &copy; 2004-2026 www.techpowerup.com.<br class="site-footer__break">
+				All rights reserved.<br>
+				All trademarks used are properties of their respective owners.
+			</footer>
+
+					</div>
+
+		<script>
+    
+        loadjs.ready(['jquery'], function() {
+        if ($(window).width()>=900)
+            return;
+
+        var $b=$('[br-cls]');
+        var $b1=$b.eq(0);
+        var $b2=$b.eq(1);
+                                                                $b1.insertBefore($('.tablecontainer').eq(1));
+    $b2.insertAfter($('.tablecontainer').eq(1));
+                
+    });
+    </script>
+		
+		<script>
+			/* Fix for jumping scrollbar, to only target Windows systems */
+			loadjs.ready(['jquery'], function() {
+				if (navigator.platform=='Win32')
+					return;
+				$('html').addClass('disable-scrollbar-fix');
+			});
+		</script>
+
+		
+		
+    	<script>
+	(function() {
+		// State: 1=loaded, 2=viewed, 3=engaged
+		const data = { e: {} }
+		const sentState = {}
+		const durations = {}
+		let observer
+		let flushCount = 0
+		let bfcacheRestore = false
+		const loadTime = Date.now()
+		const lsKey = '_adst'
+		let hasLS = false
+
+		try { localStorage.setItem('_t', '1'); localStorage.removeItem('_t'); hasLS = true } catch(e) {}
+
+		function lsRead() {
+			if (!hasLS) return {}
+			try {
+				var raw = localStorage.getItem(lsKey)
+				if (!raw) return {}
+				var parsed = JSON.parse(raw)
+				var now = Date.now()
+				var result = {}
+				for (var id in parsed) {
+					if (now - parsed[id].t < 1800000) result[id] = parsed[id].s
+				}
+				return result
+			} catch(e) { return {} }
+		}
+
+		function lsWrite() {
+			if (!hasLS) return
+			try {
+				var existing = {}
+				try { var raw = localStorage.getItem(lsKey); if (raw) existing = JSON.parse(raw) } catch(e) {}
+				var now = Date.now()
+				for (var id in sentState) existing[id] = { s: sentState[id], t: now }
+				// cleanup old entries
+				for (var id in existing) {
+					if (now - existing[id].t >= 1800000) delete existing[id]
+				}
+				localStorage.setItem(lsKey, JSON.stringify(existing))
+			} catch(e) {}
+		}
+
+		window.addEventListener('pageshow', function(e) {
+			if (e.persisted) bfcacheRestore = true
+		})
+
+		function flush(reason) {
+			var toSend = {}
+			for (var id in data.e) {
+				if (!sentState[id] || data.e[id] > sentState[id]) {
+					toSend[id] = data.e[id]
+				}
+			}
+
+			if (!Object.keys(toSend).length) return
+
+			for (var id in toSend) sentState[id] = toSend[id]
+			lsWrite()
+
+			flushCount++
+			var tokens = Object.keys(toSend).join(',')
+			var age = Math.round((Date.now() - loadTime) / 1000)
+			var qs = '?t=' + tokens + '&r=' + reason + '&n=' + flushCount + '&bf=' + (bfcacheRestore ? 1 : 0) + '&age=' + age + '&vis=' + document.visibilityState
+			navigator.sendBeacon('/_confirm-loaded' + qs, JSON.stringify({ e: toSend }))
+		}
+
+		function onPageHide() { flush('pagehide') }
+
+		function onVisibilityChange() {
+			if (document.visibilityState === 'hidden' && Object.values(data.e).every(v => v === 3)) flush('vischange')
+		}
+
+		function init() {
+			const els = document.querySelectorAll('[data-req-id]')
+			if (!els.length) return
+
+			var stored = lsRead()
+			els.forEach(el => {
+				var id = el.dataset.reqId
+				data.e[id] = 1
+				if (stored[id]) sentState[id] = stored[id]
+			})
+
+			if (!('IntersectionObserver' in window)) {
+				data.io = false
+				flush('no-io')
+				return
+			}
+
+			observer = new IntersectionObserver(entries => {
+				entries.forEach(({ target, isIntersecting, intersectionRatio }) => {
+					const id = target.dataset.reqId
+
+					if (isIntersecting && data.e[id] < 2) data.e[id] = 2
+
+					if (intersectionRatio >= 0.5) {
+						if (!durations[id]) {
+							durations[id] = setTimeout(() => {
+								data.e[id] = 3
+								if (Object.values(data.e).every(v => v === 3)) flush('engaged')
+							}, 1000)
+						}
+					} else {
+						clearTimeout(durations[id])
+						durations[id] = null
+					}
+				})
+			}, { threshold: [0, 0.5] })
+
+			els.forEach(el => observer.observe(el))
+
+			document.addEventListener('visibilitychange', onVisibilityChange)
+			window.addEventListener('pagehide', onPageHide)
+
+			setInterval(function() { flush('periodic') }, 600000)
+		}
+
+		if (document.readyState === 'loading') {
+			document.addEventListener('DOMContentLoaded', init)
+		} else {
+			init()
+		}
+	})()
+	</script>
+    
+		
+	</body>
+</html>

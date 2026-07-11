@@ -54,6 +54,7 @@ stack is broken and the standalone path is also likely broken.
 
 
 ask deepwiki on ref repo
+- TheTom/pascal-egpu
 - allbilly/ane: examples/
 - allbilly/rk3588: examples/
 - florianmattana/sass-king
@@ -68,6 +69,12 @@ ask deepwiki on ref repo
 - gpgpu-sim/gpgpu-sim_distribution
 - Tim453/ClusterSim
 - nvidia/open-gpu-kernel-modules
+- TheTom/pascal-egpu
+
+- https://blog.doubleword.ai/what-happens-when-you-run-a-cuda-kernel
+
+Revealing NVIDIA Closed-Source Driver Command Streams for CPU–GPU Runtime Behavior Insight
+- https://arxiv.org/html/2604.26889
 - TheTom/pascal-egpu
 
 - https://blog.doubleword.ai/what-happens-when-you-run-a-cuda-kernel
