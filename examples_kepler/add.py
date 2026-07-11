@@ -36,6 +36,8 @@ from typing import cast, Any, ClassVar, Generic, TypeVar
 from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
 from tinygrad.runtime.autogen import nv_regs
 from tinygrad.runtime.autogen import libc
+import nvbios_init
+from pgraph_mmio_gk104 import GK104_PGRAPH_PACK_MMIO
 
 # ============================================================================
 # Helpers (slimmed from tinygrad/helpers.py — Kepler-agnostic, reused verbatim)
@@ -721,6 +723,40 @@ class NVDevice:
     self.dev_impl.mm = GK104MemoryManager(self.dev_impl, self.VRAM_SIZE, self.BOOT_SIZE)
     self.dev_impl.is_booting = False
 
+  def _dump_fecs_tlb(self):
+    """Dump the FECS code TLB and the physical instruction at virtual PC 0xd804."""
+    base = FECS_FALCON_BASE
+    rd = self.read32
+    wr = self.write32
+    def vtlb(va):
+      wr(base + 0x140, (3 << 24) | (va & 0x00ffffff))
+      return rd(base + 0x144)
+    def ptlb(phys_page):
+      wr(base + 0x140, (2 << 24) | phys_page)
+      return rd(base + 0x144)
+    caps = rd(base + 0x108)
+    caps2 = rd(base + 0x12c)
+    pages = caps & 0x1ff
+    print(f"[kepler] TLB dump: UC_CAPS=0x{caps:08x} UC_CAPS2=0x{caps2:08x} phys_pages=0x{pages:x} virt_page_bits={(caps2>>16)&0xf}")
+    for p in range(pages):
+      x = ptlb(p)
+      flags = (x >> 24) & 0x7
+      virtual_page = (x >> 8) & 0xffff
+      if flags or x:
+        print(f"[kepler] TLB: phys={p:02x} virt={virtual_page:04x} flags={flags:x} raw=0x{x:08x}")
+    for va in (0x000000, 0x000003, 0x000100, 0x000400, 0x000004, 0x00d800, 0x00d804, 0x00d807):
+      v = vtlb(va)
+      print(f"[kepler] VTLB(0x{va:06x})=0x{v:08x} phys_page=0x{v&0xff:02x} flags={(v>>24)&0x7:x} multihit={bool(v&0x40000000)} nohit={bool(v&0x80000000)}")
+    v = vtlb(0x00d804)
+    if not (v & 0xc0000000):
+      physical_page = v & 0xff
+      physical_addr = (physical_page << 8) | (0x00d804 & 0xff)
+      wr(base + FALCON_CODE_INDEX, physical_addr & ~3)
+      word = rd(base + FALCON_CODE)
+      print(f"[kepler] VA 0x00d804 -> PA 0x{physical_addr:04x}, word=0x{word:08x}, first_insn=0x{word&0xffff:04x}, second=0x{word>>16:04x}")
+    else:
+      print(f"[kepler] VA 0x00d804 is unmapped (no-hit or multi-hit)")
+
   def _init_hardware(self):
     """Live eGPU bring-up (plan §24 / milestones 5-12).  Everything here is
     host-driven RM — there is no GSP on Kepler.  Steps that require firmware
@@ -779,12 +815,29 @@ class NVDevice:
             f"GPCCS CTRL(0x41a100)={self.read32(0x41a100):#x}")
     fecs_code = _rd("gk104_fecs_code.bin"); fecs_data = _rd("gk104_fecs_data.bin")
     gpccs_code = _rd("gk104_gpccs_code.bin"); gpccs_data = _rd("gk104_gpccs_data.bin")
-    # nouveau gf100_gr_init_ctxctl_int: gate the FALCONs (0x260=0) during load,
-    # then release (0x260=1) so FECS can run and bring up the GPCs.
+    # nouveau gf100_gr_init: disable PGRAPH master, write main register init,
+    # then re-enable master.  Extra FECS power/reset and clock-gating are needed
+    # before the FALCON can start.
+    self.write32(0x400500, 0x00000000)
+    for addr, val in GK104_PGRAPH_PACK_MMIO:
+      self.write32(addr, val)
+    # GK104 FECS clock-gating and power/enable (from gf100_gr_fecs_reset).
+    self.write32(0x409890, 0x00000045)
+    self.write32(0x4098b0, 0x0000007f)
+    self.write32(0x409614, 0x00000070)
+    time.sleep(0.00001)
+    before = self.read32(0x409614)
+    self.write32(0x409614, (before & ~0x00000700) | 0x00000700)
+    time.sleep(0.00001)
+    _ = self.read32(0x409614)
+    self.write32(0x400500, 0x00010001)
+    print(f"[kepler] before ctxctl gate: FECS_CTRL={self.read32(0x409100):#x} GPCCS_CTRL={self.read32(0x41a100):#x} PGRAPH_CTRL={self.read32(0x400500):#x} RED_SWITCH={self.read32(0x409614):#x}")
     self.write32(0x260, 0)
+    print(f"[kepler] after ctxctl gate (0x260=0): FECS_CTRL={self.read32(0x409100):#x} GPCCS_CTRL={self.read32(0x41a100):#x}")
     falcon_load(self, FECS_FALCON_BASE, fecs_code, fecs_data, entry=0, start=False)
     falcon_load(self, GPCCS_FALCON_BASE, gpccs_code, gpccs_data, entry=0, start=False)
     self.write32(0x260, 1)
+    print(f"[kepler] after ctxctl ungate (0x260=1): FECS_CTRL={self.read32(0x409100):#x} GPCCS_CTRL={self.read32(0x41a100):#x}")
     # nouveau gf100_gr_init_ctxctl_int: upload the GR context-init (csdata)
     # register lists into the falcons via the 0x1c0/0x1c4 method interface
     # BEFORE starting FECS.  Without these the FECS firmware has no context
@@ -796,7 +849,56 @@ class NVDevice:
       if DEBUG:
         print(f"[kepler] csdata {pack_name}: {len(words)} method words -> "
               f"falcon={info['falcon']:#x} starstar={info['starstar']:#x}")
-    falcon_start(self, FECS_FALCON_BASE)
+    print(f"[kepler] before FECS start: FECS_CTRL=0x{self.read32(0x409100):08x} FECS_SIGNAL=0x{self.read32(0x409400):08x} GPCCS_CTRL=0x{self.read32(0x41a100):08x} FECS_MMIO_BASE=0x{self.read32(0x409724):08x} FECS_MMIO_CTRL=0x{self.read32(0x409728):08x} ACCESS_EN=0x{self.read32(0x409048):08x} INTR=0x{self.read32(0x409008):08x} HWCFG2=0x{self.read32(0x40916c):08x} UC_STATUS=0x{self.read32(0x409128):08x} XFER_STATUS=0x{self.read32(0x409120):08x}")
+    # tight transient trace around FECS start to see if it ever executes
+    FECS_TRACE_REGS = {
+      "INTR":          0x409008,
+      "STATUS":        0x40904c,
+      "UC_CTRL":       0x409100,
+      "UC_ENTRY":      0x409104,
+      "BLOCK_ON_FIFO": 0x40910c,
+      "UC_STATUS":     0x409128,
+      "BH_CTRL":       0x409148,
+      "BH_PC":         0x40914c,
+      "UC_PC":         0x409ff0,
+      "HOST_IO_INDEX": 0x409ffc,
+      "FECS_RESET":    0x409614,
+    }
+    def snapshot():
+      return {n: self.read32(a) for n, a in FECS_TRACE_REGS.items()}
+    before = snapshot()
+    self.write32(0x40910c, 0x00000000)
+    _ = self.read32(0x40910c)
+    self.write32(0x409100, 0x00000002)
+    _ = self.read32(0x409100)
+    trace = []
+    for _ in range(256):
+      trace.append((
+        self.read32(0x409100),
+        self.read32(0x409128),
+        self.read32(0x40904c),
+        self.read32(0x409008),
+        self.read32(0x409ff0),
+        self.read32(0x40914c),
+      ))
+    after = snapshot()
+    # print the trace compactly
+    print(f"[kepler] FECS trace before start: {before}")
+    print(f"[kepler] FECS trace after  start: {after}")
+    # find the first sample where any register changed from the before snapshot
+    base_vals = (before["UC_CTRL"], before["UC_STATUS"], before["STATUS"], before["INTR"], before["UC_PC"], before["BH_PC"])
+    for i, s in enumerate(trace):
+      if s != base_vals:
+        print(f"[kepler] FECS trace first delta at sample {i}: {s}")
+        break
+    else:
+      print(f"[kepler] FECS trace no change over 256 samples")
+    # find any sample where UC_PC or STATUS changed
+    for i, s in enumerate(trace):
+      if s[4] != base_vals[4] or s[2] != base_vals[2]:
+        print(f"[kepler] FECS trace first movement at sample {i}: UC_PC={s[4]:#x} STATUS={s[2]:#x} UC_CTRL={s[0]:#x} UC_STATUS={s[1]:#x} INTR={s[3]:#x} BH_PC={s[5]:#x}")
+        break
+    print(f"[kepler] after FECS start: FECS_CTRL=0x{self.read32(0x409100):08x} ACCESS_EN=0x{self.read32(0x409048):08x}")
     try:
       wait_cond(lambda: falcon_ready(self, FECS_FALCON_BASE),
                 timeout_ms=2000, msg="FECS ready (0x409800 bit31)")
@@ -805,7 +907,8 @@ class NVDevice:
       print(f"[kepler] FECS NOT ready. CPUCTL(0x409100)={rd(0x409100):#x} "
             f"VER(0x40912c)={rd(0x40912c):#x} MB0(0x409800)={rd(0x409800):#x} "
             f"MB1(0x409804)={rd(0x409804):#x} MB2(0x409808)={rd(0x409808):#x} "
-            f"MB3(0x40980c)={rd(0x40980c):#x} GPCCS_CPUCTL(0x41a100)={rd(0x41a100):#x}")
+            f"MB3(0x40980c)={rd(0x40980c):#x} GPCCS_CPUCTL(0x41a100)={rd(0x41a100):#x} "
+            f"MMIO_BASE(0x409724)={rd(0x409724):#x} MMIO_CTRL(0x409728)={rd(0x409728):#x} MMIO_WRVAL(0x409730)={rd(0x409730):#x}")
       # nouveau gf100_gr_ctxctl_debug + ISR: dump the FUC fault/exception state.
       print(f"[kepler] FECS done(0x409400)={rd(0x409400):#x} "
             f"stat 0x409800-0x40981c="
@@ -823,7 +926,19 @@ class NVDevice:
       imem0 = rd(FECS_FALCON_BASE + FALCON_CODE)
       self.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX, 0)
       dmem0 = rd(FECS_FALCON_BASE + FALCON_DATA)
-      print(f"[kepler] FECS imem[0]={imem0:#x} (expect 0xf50e9b03)  dmem[0]={dmem0:#x}")
+      print(f"[kepler] FECS imem[0]={imem0:#x} (expect 0x039b0ef5)  dmem[0]={dmem0:#x}")
+      # Inspect the IO address the PC is pointing to (0xd804 -> 0x360/IDX1)
+      orig_idx = self.read32(0x409ffc)
+      self.write32(0x409ffc, 0)
+      v0 = self.read32(0x409360)
+      self.write32(0x409ffc, 1)
+      v1 = self.read32(0x409360)
+      self.write32(0x409ffc, orig_idx)
+      print(f"[kepler] FECS IO 0x409360 HOST_IO_INDEX=0 -> {v0:#x} (0xd800 block)")
+      print(f"[kepler] FECS IO 0x409360 HOST_IO_INDEX=1 -> {v1:#x} (0xd804 block, PC target)")
+      # Falcon v3+ has per-page code TLB.  Dump it to see whether the PC is
+      # fetching an unmapped page or a real exit instruction.
+      self._dump_fecs_tlb()
       raise
     ctx_size = self.read32(0x409804)
     if DEBUG:
@@ -1379,64 +1494,18 @@ def _vbios_target_ops(image, start, limit=0x4000, _seen=None, _enabled=True):
   return ops
 
 def vbios_init_info(path):
-  image = _vbios_first_image(pathlib.Path(path).read_bytes())
-  table, scripts = _vbios_find_init_table(image)
-  print(f"vbios-init: image_bytes={len(image)} table={table:#x} scripts={len(scripts)}")
+  image = nvbios_init.find_vbios_image(pathlib.Path(path).read_bytes())
+  scripts = nvbios_init.find_vbios_scripts(image)
+  print(f"vbios-init: image_bytes={len(image)} scripts={len(scripts)}")
   for i, script in enumerate(scripts):
-    ops = _vbios_target_ops(image, script)
-    print(f"  script[{i}]={script:#x} target_ops={len(ops)}")
-    for op in ops:
-      if op[1] == "write": print(f"    {op[0]:#x}: WR {op[2]:#x}={op[3]:#x}")
-      elif op[1] == "condition": print(f"    {op[0]:#x}: IF (R[{op[2]:#x}] & {op[3]:#x}) == {op[4]:#x}")
-      elif op[1] == "resume": print(f"    {op[0]:#x}: RESUME")
-      elif op[1] in ("andn", "or"): print(f"    {op[0]:#x}: {op[1].upper()} {op[2]:#x} mask={op[3]:#x}")
-      else: print(f"    {op[0]:#x}: MSK {op[2]:#x} mask={op[3]:#x} val={op[4]:#x}")
-  return image, table, scripts
+    print(f"  script[{i}]={script:#x}")
+  return image, 0, scripts
 
 def execute_vbios_target_ops(dev, image, script, dry_run=False):
-  """Run the conservative direct-register subset of one NVINIT script."""
-  ops = _vbios_target_ops(image, script)
-  enabled = True
-  for op in ops:
-    if op[1] == "condition":
-      reg = op[2]
-      # Ordinary BAR0 registers are accessible; reject NVINIT indirect/port
-      # addresses such as 0x406xxxxx before issuing a TinyGPU RPC.
-      bar0_ok = ((reg < 0x200000) or
-                 (0x137000 <= reg < 0x137400))
-      try:
-        enabled = bar0_ok and ((dev.read32(reg) & op[3]) == op[4])
-      except (OSError, RuntimeError, ConnectionError, BrokenPipeError):
-        # Some NVINIT conditions address ports/indirect spaces which are not
-        # exposed through TinyGPU BAR0.  Do not abort the whole POST script.
-        enabled = False
-      print(f"vbios-init: condition {op[2]:#x} -> {'true' if enabled else 'false'}")
-      continue
-    if op[1] == "resume":
-      enabled = True
-      continue
-    if not enabled:
-      continue
-    addr = op[2]
-    if op[1] == "write":
-      value = op[3]
-    elif op[1] == "andn":
-      value = dev.read32(addr) & ~op[3]
-    elif op[1] == "or":
-      value = dev.read32(addr) | op[3]
-    elif op[1] == "copy":
-      value = dev.read32(op[3])
-    elif op[1] == "maskadd":
-      before = dev.read32(addr)
-      value = (before & op[3]) | ((before + op[4]) & ~op[3])
-    else:
-      before = dev.read32(addr)
-      # NV_REG is encoded as "R &= keep_mask; R |= or_value" in Nouveau,
-      # not as the nvkm_mask (mask/value) convention.
-      value = (before & op[3]) | op[4]
-    print(f"vbios-init: {'dry-' if dry_run else ''}write {addr:#x}={value:#010x}")
-    if not dry_run: dev.write32(addr, value)
-  return len(ops)
+  """Execute one NVINIT script using the full nvbios interpreter."""
+  if not dry_run:
+    nvbios_init.run_vbios_init(dev, image, [script], debug=DEBUG)
+  return 0
 
 def program_gk104_gpc_pll(dev, target_khz=300000, ref_khz=810000):
   """Program CLK0 using the GK104 PLL layout from nouveau gk104.c."""
@@ -1563,7 +1632,6 @@ def nvkm_fuse_read_31c(dev):
 GPC_CLK_REGS = (0x137100, 0x137160, 0x1371d0, 0x137250,
                 0x137000, 0x137004, 0x00e800, 0x00e804,
                 0x00e820, 0x00e824)
-
 
 def probe_pgob_power_on(dev):
   """Standalone PGOB bring-up trace (no PMU/FECS firmware involved).  Run AFTER

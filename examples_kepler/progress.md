@@ -141,3 +141,40 @@ Each tested on real HW with full MMIO traces:
   `0x137000` still reads `0xbadf3001`, `0x409604` remains zero, and the PLL
   cannot be programmed. The remaining blocker is a real NVINIT control-flow
   executor (conditions/subscripts/resume), not ROM availability.
+
+### Current test result (2026-07-12)
+
+- Implemented a complete `nvbios_init.py` NVINIT executor (SUB_DIRECT/SUB/JUMP,
+  control-flow, PLL, IO, MACRO, CONDITION/TIME/REPEAT, etc.) and wired it into
+  `add.py`.
+- Live `--probe-vbios-devinit` now executes all VBIOS init scripts and the GPC PLL
+  becomes programmable: `0x137000` locks, `gpc-pll: ... lock=YES`.
+- After VBIOS devinit and PGOB, `0x409604=0x40004`, `0x41a100=0x10`, `0x502100=0x10`
+  (GPC/GPCCS/per-GPC FALCONs are now out of power-gate, not `0xbadf1200`).
+- **Next blocker:** FECS does not post `0x409800 bit31` ready. After `falcon_start`,
+  `0x409100=0x10` (FECS STOPPED/halted), `0x409400=0x300`, `0x409724=0x0`, `0x409728=0x0`,
+  `0x409730=0x0`, and all `0x40980x` mailboxes are `0x0`, `0x409c18=0x0` (no ISR). The
+  FALCON CPUCTL `0x10` bit does not clear and the MMIO_CTRL never becomes pending, so
+  `hub.fuc` is not actually executing. The `0x2` START_TRIGGER to `0x409100` is not
+  taking effect from a `0x10` STOPPED state, even though the `falcon_load` sequence
+  (0x180/0x184/0x188, 0x1c0/0x1c4) appears correct and `imem[0]` matches.
+  - Tried `0x400080-0x400148` (GK104 `main_0` init list) + `0x400500` PGRAPH master enable
+    before `0x260=0`/`1`; no effect. `0x409100` still `0x10` and `0x409728` still `0x0`.
+  - Tried `0x409100 = 0x0` and `0x12`/`0x112` start values; no effect.
+  - Tried `0x409100` reset bits `0x1`/`0x4` and `0x40907c` SUBENGINE_RESET; `0x40907c=1`
+    gates `FECS` to `0xbadf5000` and is not the correct path.
+  - This is the hard blocker: the FALCON CPUCTL START_TRIGGER is not accepted.
+
+### Current test result (2026-07-12) – fixed
+
+- Root cause: `firmware/gk104/*.bin` were big-endian word dumps of the `.fuc3.h`
+  arrays, but `falcon_write_imem/dmem` loads them as little-endian `u32` words.
+  This byte-swapped every instruction; `FECS` decoded garbage and branched to
+  unmapped virtual page `0xd8` (`UC_PC=0xd804`, `VTLB` no-hit).
+- Re-extracted the binaries with `firmware/gk104/extract_fw.py` (`<I`) so the
+  first FECS word is `0x039b0ef5` (a branch to the real entry) and data words
+  are `0x00000300`, etc.
+- Updated `add.py` `imem[0]` expectation and added a `_dump_fecs_tlb()` helper
+  in the `TimeoutError` path for future diagnostics.
+- `--probe-falcon` now succeeds: `FECS+GPCCS loaded and started OK`,
+  `UC_PC=0x567`, `UC_CTRL=0x20` (running), `0x409800 bit31` set.
