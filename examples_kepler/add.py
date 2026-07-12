@@ -401,8 +401,7 @@ def elf_loader(blob, force_section_align=1, link_libs=None):
   e_shentsize, e_shnum = struct.unpack_from("<HH", blob, 0x3a)
   return {"phoff": e_phoff, "shoff": e_shoff, "phnum": e_phnum, "shnum": e_shnum}
 
-def elf_section_bytes(blob, wanted):
-  """Return one ELF64 section payload by name (used to upload SASS, not ELF)."""
+def elf_section(blob, wanted):
   shoff = struct.unpack_from("<Q", blob, 0x28)[0]
   entsz, count = struct.unpack_from("<HH", blob, 0x3a)
   shstrndx = struct.unpack_from("<H", blob, 0x3e)[0]
@@ -413,8 +412,17 @@ def elf_section_bytes(blob, wanted):
     h = sh(i)
     end = names.find(b"\0", h[0])
     if names[h[0]:end].decode(errors="replace") == wanted:
-      return bytes(blob[h[4]:h[4] + h[5]])
+      return h, bytes(blob[h[4]:h[4] + h[5]])
   raise KeyError(wanted)
+
+def elf_section_bytes(blob, wanted):
+  """Return one ELF64 section payload by name (used to upload SASS, not ELF)."""
+  return elf_section(blob, wanted)[1]
+
+def cubin_register_count(blob, kernel):
+  regs = (elf_section(blob, f".text.{kernel}")[0][7] >> 24) & 0x3f
+  if not regs: raise ValueError(f"cubin has no register count for {kernel}")
+  return regs
 
 
 # ============================================================================
@@ -1367,14 +1375,16 @@ def compile_kepler_cubin_docker(tag="nvidia/cuda:10.2-devel-ubuntu18.04"):
     return None
 
 def get_kepler_cubin():
-  env_path = os.environ.get("KEPLER_CUBIN")
-  if env_path and os.path.exists(env_path):
-    with open(env_path, "rb") as f: return f.read()
-  compiled = compile_kepler_cubin_docker()
-  if compiled and os.path.exists(compiled):
-    with open(compiled, "rb") as f: return f.read()
-  # Offline placeholder — structure only, not executable SASS.
-  return build_cubin()
+  path = os.environ.get("KEPLER_CUBIN")
+  if not path or not os.path.exists(path): path = compile_kepler_cubin_docker()
+  if not path or not os.path.exists(path):
+    raise RuntimeError("live hardware requires a real sm_30 add cubin; set KEPLER_CUBIN or start Docker")
+  with open(path, "rb") as f: cubin = f.read()
+  if len(cubin) < 0x40 or cubin[:4] != b"\x7fELF" or struct.unpack_from("<I", cubin, 0x30)[0] & 0xff != 0x30:
+    raise ValueError(f"KEPLER_CUBIN must be an sm_30 ELF cubin: {path}")
+  elf_section_bytes(cubin, ".text.E_4")
+  cubin_register_count(cubin, "E_4")
+  return cubin
 
 
 # ============================================================================
@@ -2029,7 +2039,12 @@ def describe_args(method, args):
     return [f"invalidate_flags=0x{args[0]:08x}"]
   return [f"arg{i}=0x{arg:08x}" for i, arg in enumerate(args)]
 
-def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=256, regs=4):
+def build_cuda_param_cbuf(*ptrs):
+  cbuf = bytearray(0x200)
+  struct.pack_into(f"<{len(ptrs)}Q", cbuf, 0x140, *ptrs)
+  return cbuf
+
+def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=0x200, regs=4):
   """Build a GK104 Compute Work Descriptor (0x100 bytes) per envytools
   gk104_compute.xml GK104_COMPUTE_LAUNCH_DESC decode (plan §24.3):
     0x20 PROG_START (offset from CODE_ADDRESS), 0x30 GRIDDIM_X, 0x34 GRIDDIM_YZ
@@ -2096,6 +2111,15 @@ def kepler_selftest():
   assert any(m == 0x02b4 for _, _, _, m, _, _ in decoded), "expected KEPLER_COMPUTE_LAUNCH_DESC_ADDRESS method"
   sem_methods = [m for _, _, _, m, _, _ in decoded if m == 0x0010]
   assert len(sem_methods) == 2, "expected two GK104 semaphore sequences"
+  assert gk104_mp_trap_addrs(0, 0) == (0x504648, 0x504650)
+  assert gk104_mp_trap_addrs(1, 1) == (0x50ce48, 0x50ce50)
+  params = build_cuda_param_cbuf(0x1122334455667788, 2, 3)
+  assert len(params) == 0x200 and struct.unpack_from("<3Q", params, 0x140) == (0x1122334455667788, 2, 3)
+  regs = cubin_register_count(cubin, "E_4")
+  assert regs == 14
+  cwd = build_cwd(0, (1, 1, 1), (256, 1, 1), cbuf_addr=0x123400, regs=regs)
+  assert struct.unpack_from("<I", cwd, 0x78)[0] == (0x200 << 15)
+  assert struct.unpack_from("<I", cwd, 0xb8)[0] == (regs << 24)
 
   # helpers sanity
   assert lo32(0x123456789abcdef0) == 0x9abcdef0
@@ -2137,7 +2161,8 @@ def run_software_demo(dev):
   executes — the add is performed host-side to validate alloc/map/copy/CWD)."""
   import random
   N = 256
-  prog = dev.runtime("E_4", build_cubin())
+  cubin = build_cubin()
+  prog = dev.runtime("E_4", cubin)
   allocator = NVAllocator(dev)
 
   a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
@@ -2147,13 +2172,9 @@ def run_software_demo(dev):
   b_dev = allocator.alloc(N * 4)
   out_dev = allocator.alloc(N * 4)
   # Code + constant (param) buffers for the launch descriptor.
-  code = build_cubin()
-  code_dev = allocator.alloc(len(code))
-  allocator._copyin(code_dev, code)
-  cbuf = bytearray(0x100)
-  struct.pack_into("<Q", cbuf, 0x00, a_dev.va_addr)   # c0[0]: a
-  struct.pack_into("<Q", cbuf, 0x08, b_dev.va_addr)   # c0[8]: b
-  struct.pack_into("<Q", cbuf, 0x10, out_dev.va_addr)  # c0[16]: out
+  code_dev = allocator.alloc(len(cubin))
+  allocator._copyin(code_dev, cubin)
+  cbuf = build_cuda_param_cbuf(a_dev.va_addr, b_dev.va_addr, out_dev.va_addr)
   cbuf_dev = allocator.alloc(len(cbuf))
   allocator._copyin(cbuf_dev, cbuf)
 
@@ -2161,7 +2182,8 @@ def run_software_demo(dev):
   allocator._copyin(b_dev, b_host.tobytes())
 
   # Build + map a CWD, then emit the Kepler compute launch words.
-  cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(N, 1, 1), cbuf_addr=cbuf_dev.va_addr)
+  cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(N, 1, 1), cbuf_addr=cbuf_dev.va_addr,
+                  regs=cubin_register_count(cubin, "E_4"))
   cwd_dev = allocator.alloc(len(cwd))
   allocator._copyin(cwd_dev, cwd)
   words = build_launch_words(0x1000, 1, 2, cwd_dev.va_addr, code_dev.va_addr)
@@ -2200,6 +2222,10 @@ CHAN_START_REG  = 0x800004
 PFIFO_RUNLIST_SUBMIT = 0x2274
 USERD_GP_GET = 0x88
 USERD_GP_PUT = 0x8c
+
+def gk104_mp_trap_addrs(gpc, tpc):
+  base = 0x504000 + gpc * 0x8000 + tpc * 0x800
+  return base + 0x648, base + 0x650
 
 # GK104 GPFIFO entries are 8 bytes: a push-buffer address followed by a
 # length/flags word. GP_PUT/GP_GET are ring-entry indices, not byte addresses.
@@ -3000,15 +3026,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # GPC MMU setup (gf100_gr_init_gpc_mmu): the GPC MMU needs buffer
     # addresses for virtual address translation.  Without this, compute
     # kernels can't access buffers via virtual addresses.
-    # This must be done BEFORE ctx_chan, while the GPC_BCAST domain is
-    # still accessible (ctx_chan's redswitch power-cycles the GPC).
-    # First, ensure the GPC_BCAST domain is powered via RED_SWITCH.
-    dev.write32(0x409614, 0x00000070)   # POWER_MAIN|GPC|ROP
-    time.sleep(0.00001)
-    dev.write32(0x409614, 0x00000770)   # ENABLE_MAIN|GPC|ROP | POWER_MAIN|GPC|ROP
-    time.sleep(0.00001)
-    _red_switch_pre = dev.read32(0x409614)
-    print(f"[kepler] RED_SWITCH before GPC MMU: {_red_switch_pre:#x}", flush=True)
+    # This must be done BEFORE ctx_chan while the initialized GPC_BCAST domain
+    # is accessible.  Do not reset RED_SWITCH here: gf100_gr_fecs_reset already
+    # did that during engine init, and repeating it with a live context is unsafe.
     # Allocate mmu_rd and mmu_wr buffers (1 page each, 0x1000 bytes).
     if use_vram_inst:
       mmu_rd_pa = bar1_alloc(0x1000)
@@ -3047,11 +3067,6 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     print(f"[kepler] GPC_BCAST test: 0x418804={_gpc_bcast_test:#x} "
           f"PWR_GATE={_pwr_gate_pre:#x} PMC_ENABLE={_pmc_enable_pre:#x} "
           f"PGRAPH_CTRL={_pgraph_ctrl_pre:#x}", flush=True)
-    # Try writing to a GPC_BCAST register to test if writes stick
-    dev.write32(0x4188a4, 0x03000000)
-    _gpc_bcast_readback = dev.read32(0x4188a4)
-    print(f"[kepler] GPC_BCAST write test: 0x4188a4 wrote 0x03000000 "
-          f"readback={_gpc_bcast_readback:#x}", flush=True)
     # Diagnostic: dump FECS and GR state before golden context init.
     fecs_stat0 = dev.read32(0x409800)
     fecs_cpustat = dev.read32(0x409128)   # CPUSTAT
@@ -3504,13 +3519,14 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                      f"userd_push_get={[hex(x) for x in push_get]}, regs={diag}, "
                      f"top={[hex(x) for x in top if x]})")
 
-def run_hardware_demo(dev):
+def run_hardware_demo(dev, cubin=None):
   """End-to-end add on the real GTX 770 over TinyGPU (sysmem compute path,
   plan §24.1).  Requires TinyGPU.app, a GK104 firmware tree ($NV_FIRMWARE_DIR),
   and on-silicon FIFO validation."""
   import random
   N = 256
-  prog = dev.runtime("E_4", get_kepler_cubin())
+  if cubin is None: cubin = get_kepler_cubin()
+  prog = dev.runtime("E_4", cubin)
   allocator = NVAllocator(dev)
 
   a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
@@ -3521,20 +3537,17 @@ def run_hardware_demo(dev):
   out_dev = allocator.alloc(N * 4)
   signal = allocator.alloc(16)
   # Code + constant (param) buffers for the launch descriptor.
-  cubin = get_kepler_cubin()
   sass = elf_section_bytes(cubin, ".text.E_4")
   code_dev = allocator.alloc(round_up(len(sass), 0x100))
   allocator._copyin(code_dev, sass)
-  cbuf = bytearray(0x100)
-  struct.pack_into("<Q", cbuf, 0x00, a_dev.va_addr)   # c0[0]: a
-  struct.pack_into("<Q", cbuf, 0x08, b_dev.va_addr)   # c0[8]: b
-  struct.pack_into("<Q", cbuf, 0x10, out_dev.va_addr)  # c0[16]: out
+  cbuf = build_cuda_param_cbuf(a_dev.va_addr, b_dev.va_addr, out_dev.va_addr)
   cbuf_dev = allocator.alloc(len(cbuf))
   allocator._copyin(cbuf_dev, cbuf)
   # build_launch_words() begins with a semaphore wait for wait_value=1.
   # Seed the coherent semaphore before submitting the push buffer.
   allocator._copyin(signal, struct.pack("<I", 1))
-  cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(N, 1, 1), cbuf_addr=cbuf_dev.va_addr)
+  cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(N, 1, 1), cbuf_addr=cbuf_dev.va_addr,
+                  regs=cubin_register_count(cubin, "E_4"))
   cwd_dev = allocator.alloc(len(cwd))
   allocator._copyin(cwd_dev, cwd)
   allocator._copyin(a_dev, a_host.tobytes())
@@ -3561,15 +3574,6 @@ def run_hardware_demo(dev):
   # The PGRAPH FE (method parser) must be powered for the engine to process
   # methods from the push buffer.  Without this, the semaphore never releases.
   if dev.dev_impl.hw is not None:
-    # Set RED_SWITCH to fully enabled (POWER+ENABLE for MAIN/GPC/ROP).
-    # The FECS ctx_redswitch normally does this during context switch, but
-    # since we skipped the context switch, we need to do it manually.
-    dev.write32(0x409614, 0x00000070)   # POWER_MAIN|GPC|ROP
-    time.sleep(0.00001)
-    dev.write32(0x409614, 0x00000770)   # ENABLE_MAIN|GPC|ROP | POWER_MAIN|GPC|ROP
-    time.sleep(0.00001)
-    _red_switch = dev.read32(0x409614)
-    # Also force FE power ON
     dev.write32(0x404170, 0x00000012)  # NV_PGRAPH_FE_PWR_MODE_FORCE_ON
     _fe_deadline = time.time() + 2.0
     while time.time() < _fe_deadline:
@@ -3578,15 +3582,9 @@ def run_hardware_demo(dev):
       time.sleep(0.001)
     _fe_pwr_final = dev.read32(0x404170)
     _pgraph_status_pre = dev.read32(0x400000)
-    # Test PGRAPH register accessibility by writing/reading a scratch register
-    # 0x405b00 is a GR register used in grctx_main
-    _test_val = 0x12345678
-    dev.write32(0x405b00, _test_val)
-    _test_readback = dev.read32(0x405b00)
     print(f"[kepler] FE_PWR before launch: {_fe_pwr_final:#x} "
-          f"RED_SWITCH={_red_switch:#x} "
-          f"PGRAPH_STATUS={_pgraph_status_pre:#x} "
-          f"GR_test_write={_test_readback:#x} (expected {_test_val:#x})", flush=True)
+          f"RED_SWITCH={dev.read32(0x409614):#x} "
+          f"PGRAPH_STATUS={_pgraph_status_pre:#x}", flush=True)
   if DEBUG:
     pgd_idx = (signal.va_addr >> 27) & 0x1fff
     spt_idx = (signal.va_addr >> 12) & 0x7fff
@@ -3626,12 +3624,13 @@ def run_hardware_demo(dev):
     _pgraph_exc = dev.read32(0x400108)
     # Check MP trap registers (per-GPC)
     _mp_trap = []
-    for _gpc in range(4):
-      for _tpc in range(2):
-        _mp_addr = 0x500000 + _gpc * 0x8000 + _tpc * 0x800
-        _mp_stat = dev.read32(_mp_addr + 0x428)
-        if _mp_stat:
-          _mp_trap.append(f"GPC{_gpc}.TPC{_tpc}: {_mp_stat:#x}")
+    for _gpc in range(dev.read32(0x409604) & 0x1f):
+      _tpc_nr = dev.read32(0x500000 + _gpc * 0x8000 + 0x2608) & 0x1f
+      for _tpc in range(_tpc_nr):
+        _warp_addr, _global_addr = gk104_mp_trap_addrs(_gpc, _tpc)
+        _warp, _global = dev.read32(_warp_addr), dev.read32(_global_addr)
+        if _warp or _global:
+          _mp_trap.append(f"GPC{_gpc}.TPC{_tpc}: warp={_warp:#x} global={_global:#x}")
     print(f"[kepler] post-launch: PGRAPH_INTR={_pgraph_intr_post:#x} "
           f"ADDR={_pgraph_addr_post:#x} DATA={_pgraph_data_post:#x} "
           f"STATUS={_pgraph_status_post:#x} STATUS2={_pgraph_status2_post:#x} "
@@ -3784,6 +3783,12 @@ def main():
     if a == "--cubin" and i + 1 < len(sys.argv):
       os.environ["KEPLER_CUBIN"] = sys.argv[i + 1]
   backend = os.environ.get("NV_BACKEND", "kepler")
+  cubin = None
+  if backend != "software":
+    try: cubin = get_kepler_cubin()
+    except (RuntimeError, ValueError, KeyError, struct.error) as e:
+      print(f"hardware launch refused: {e}", file=sys.stderr)
+      sys.exit(2)
   try:
     dev = NVDevice("NV", backend=backend)
   except (NotImplementedError, OSError) as e:
@@ -3796,7 +3801,7 @@ def main():
   if backend == "software":
     run_software_demo(dev)
   else:
-    run_hardware_demo(dev)
+    run_hardware_demo(dev, cubin)
 
 if __name__ == "__main__":
   main()
