@@ -914,3 +914,175 @@ register dump, and to the channel-bind debug print.
   the GR re-enablement fixes the semaphore timeout. If GR is still not
   accessible after re-enablement, the issue may be deeper (e.g., GPC
   clock domain gating that requires PMU/devinit).
+
+## Session 2026-07-13 — kernel executes but SMs are power-gated (all-zero output)
+
+### Symptom shift: timeout → "hardware add mismatch"
+
+After the GR auto-power-gating fix, the live run no longer times out at
+the semaphore. The kernel launch path now completes: the semaphore
+releases, `submit_launch()` returns, and the result buffer is read back.
+However the result is **all zeros** — `hardware add mismatch`. The
+compute kernel is being "executed" from the FIFO's perspective but is
+not actually performing any computation.
+
+### Evidence: SMs (MPs) are power-gated
+
+- `PGRAPH_STATUS = 0xbadf1000` is still observed at the post-launch
+  diagnostic dump. The GR engine reports the power/clock-gated sentinel
+  even though the launch appeared to complete.
+- **MP trap registers read `0xbadf1000`** — the Streaming Multiprocessor
+  trap status registers return the power-gated sentinel, proving the
+  SMs are clocked off and never executed the kernel SASS. The launch
+  reached the FIFO/FE dispatch layer but the work never landed on a
+  powered SM.
+- `FE_PWR (0x404170) = 0x0` during FECS stop — the front-end power
+  register drops to zero while FECS is halting.
+- `PWR_GATE (0x020004) = 0x40110068` — bits `[31:30]=01b` (bit30=1,
+  bit31=0) means top-level GR power-gating is **DISABLED** at the
+  PWR_GATE level, yet PGRAPH still power-gates. So the gating is
+  happening below PWR_GATE, inside the GR/GPC domain.
+- `PMC_ENABLE` GR bit is set; not the cause.
+- GPCCS (`CPUCTL=0x20`) keeps running when FECS stops (`CPUCTL=0x0`),
+  confirming FECS and GPCCS live in different power domains. FECS
+  auto-halts within ~10 ms of ctx_chan completion.
+
+### FECS path taken
+
+- Bypassed the golden save and reloaded the channel context via
+  `ctx_chan` (cmd 1) **without** the redswitch path. FECS completes
+  `ctx_chan` and the kernel dispatches, but produces zero output.
+- `CHSW` interrupt is disabled on this path, so no GPU-triggered
+  context-switch save/reload happens — the channel context is loaded
+  once and the launch is issued directly.
+
+### GPC_BCAST / GPC MMU investigation
+
+- The context buffer is mapped (PTE is non-zero) — VMM is not the
+  blocker for the launch itself.
+- `0x418804` (GPC_BCAST MMU control) reads `0xbadf1000`, suggesting
+  the GPC_BCAST domain is power-gated.
+- However, **writes to GPC_BCAST registers (e.g. `0x4188a4`) stick** —
+  readback returns the written value, not the sentinel. So the
+  GPC_BCAST domain *is* reachable for writes; `0x418804` itself just
+  returns the sentinel. All GPC MMU setup writes appeared to stick.
+- Even after explicitly setting `RED_SWITCH` and moving the GPC MMU
+  setup earlier (before `ctx_chan`), the SMs remain power-gated.
+  Manual GPC MMU setup is necessary but not sufficient.
+
+### Launch sequence verified
+
+A subagent walk-through of the Kepler compute kernel launch sequence
+confirmed correct usage of `LAUNCH`, `LAUNCH_DESC_ADDRESS`,
+`CODE_ADDRESS_LO/HI`, `CB_CONFIG`, and `INVALIDATE_SHADER_CACHES`. The
+launch packet encoding is not the blocker — the SMs simply are not
+powered on to receive it.
+
+### Current blocker
+
+The SMs (and the GPC_BCAST compute domain that contains them) are
+power-gated. The redswitch operation that normally powers on the
+GPCs/SMs is not being performed on this direct bring-up path, because
+the CHSW/golden-save sequence was bypassed to avoid the earlier
+`0x409804=0xffffffff` hang. The manual GPC MMU writes and RED_SWITCH
+host writes are not enough to bring the SMs out of power-gate.
+
+### STUCK — macOS host crash on live run
+
+The current state of `add.py` **crashes the macOS host** when run on
+the live eGPU. The crash happens during the SM power-on / GPC_BCAST
+bring-up attempts described under "Next step" below. This is a hard
+blocker: the host goes down, so no further live diagnostics can be
+collected from this code path without risking repeated crashes.
+
+Likely crash vectors (not yet isolated because the host dies before
+any post-failure dump can be captured):
+
+- Driving `RED_SWITCH` `0x41a614` (per-GPC) or the GPC_BCAST
+  `ctx_xfer` path from the host while the GPC power domain is in an
+  inconsistent state. A malformed power-on sequence can assert a
+  GPU-level fault that the macOS IOMMU/PCIe layer escalates into a
+  host panic.
+- Re-enabling the CHSW interrupt after the bypass: the FECS resume
+  command previously left `0x409804=0xffffffff` and never returned
+  status 1. If CHSW fires while the firmware is in that state, the
+  GPU may issue an invalid DMA or an unmapped host access.
+- Writes to GPC_BCAST registers that stick on this un-POSTed card may
+  be landing in a power domain that macOS did not claim, triggering a
+  PCIe abort that propagates to the host.
+
+### Next step (blocked on crash isolation)
+
+Manually enable the SMs and the GPC_BCAST power domain. Options being
+explored — **all currently blocked by the macOS crash**:
+
+1. Explicitly trigger the GPC_BCAST `ctx_xfer` command (the GPCCS
+   firmware path that normally powers on the GPCs/SMs during a context
+   switch), instead of relying on host RED_SWITCH writes alone.
+2. Mimic the redswitch logic of the GPCCS firmware: drive
+   `RED_SWITCH` `0x41a614` (per-GPC) through the GPCCS command FIFO
+   rather than from the host, so the GPC power sequencing is done by
+   the falcon that owns that domain.
+3. Re-enable the CHSW interrupt and let FECS perform a real
+   context-switch load (which includes the GPC power-on sequence),
+   while avoiding the `0x409804=0xffffffff` resume hang that forced
+   the bypass in the first place.
+
+Before any of these can be tried again on live hardware, the crash
+must be isolated. The safe approach is to gate each candidate fix
+behind an env flag and run them one at a time with a minimal
+reproduction, so a single offending write can be identified without
+re-crashing the host. A host-side PCIe error log (if available from
+`ioreg` / `log show` after reboot) would also help pin the faulting
+transaction.
+
+### Verification
+
+- `py_compile` passes.
+- `--middle-selftest` passes.
+- `NV_BACKEND=software` demo passes.
+- Live hardware: **crashes macOS**. Not yet a `hardware_demo=ok`
+  result. The all-zero-output / SMs-power-gated state from the
+  previous run is the last non-crashing data point.
+
+## Session 2026-07-13 — corrected false power-gating diagnosis and add launch ABI
+
+The previous conclusion that the all-zero result proved powered-off SMs was
+incorrect. The diagnostic used `0x500000 + gpc*0x8000 + tpc*0x800 + 0x428`,
+which is neither the GK104 TPC base nor either MP trap register. Nouveau defines
+`TPC_UNIT` at `0x504000`; `gf100_gr_trap_mp()` reads warp/global errors at
+TPC offsets `0x648` and `0x650`. Reads from the old address therefore could not
+support the SM power-gating diagnosis.
+
+Two actual correctness bugs were present in the hardware add path:
+
+1. `get_kepler_cubin()` silently used `build_cubin()` when Docker or
+   `KEPLER_CUBIN` was unavailable, even though that builder explicitly contains
+   non-executable placeholder SASS. The live path now refuses to initialize the
+   GPU unless it has an ELF `sm_30` cubin with `.text.E_4`.
+2. The three CUDA kernel arguments were placed at c0 offsets `0x0/0x8/0x10` in
+   a 0x100-byte buffer. An nvcc `sm_30` kernel reads its parameter area at
+   c0 offsets `0x140/0x148/0x150`. The parameter buffer is now 0x200 bytes, the
+   CWD advertises that size, and GPR allocation comes from `.text.E_4` metadata.
+
+The host-crashing experiments were removed from the submission path: no
+RED_SWITCH reset is repeated around a live context, the duplicate GPC_BCAST
+write probe is gone, and the arbitrary pre-launch GR register write is gone.
+RED_SWITCH remains only in the normal Nouveau-derived engine initialization and
+in the explicit clock probe. MP diagnostics now use the real topology and
+Nouveau register addresses.
+
+### Verification
+
+- `python3 -m py_compile examples_kepler/add.py` passes.
+- `python3 examples_kepler/add.py --middle-selftest` passes, including checks for
+  the CUDA parameter ABI, CWD size/GPR fields, and MP trap addresses.
+- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+  `software_demo=ok N=256` with a correct 256-element add result.
+- With no real cubin and Docker unavailable, the default command exits before
+  touching the GPU with: `hardware launch refused: live hardware requires a
+  real sm_30 add cubin; set KEPLER_CUBIN or start Docker`.
+- A real-hardware result still requires a genuine nvcc-built `sm_30` add cubin
+  supplied with `--cubin PATH` or `KEPLER_CUBIN=PATH`. No further live run was
+  attempted without that prerequisite, so `hardware_demo=ok` is not yet
+  claimed.
