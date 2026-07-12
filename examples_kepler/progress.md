@@ -750,3 +750,167 @@ and begins processing ctx_chan commands.
   is now exact and below packet syntax: make CPU framebuffer writes visible
   to GPU clients, most likely by completing the GK104 BAR1/VRAM initialization
   that macOS did not perform.
+
+## Session 2026-07-12 — LTC/FB/BAR1 subdev init added
+
+### Root cause analysis
+
+The PBDMA zero-GP-entry issue (IB_CRC = CRC of eight zero bytes) was caused
+by missing GK104 subdev initialization steps that a proper VBIOS POST or
+nouveau driver init would have performed:
+
+1. **LTC (L2 cache) not initialized.** `gk104_ltc_init()` writes `ltc_nr`
+   to `0x17e8d8` and `0x17e000`, `tag_base` to `0x17e8d4`, and the big-page
+   bit to `0x17e8c0`. Without this, the L2 cache is not properly configured
+   and GPU internal clients (PBDMA, GR, etc.) read stale/zero data from
+   VRAM. The LTC topology is read from `0x022438` (parts), `0x022554`
+   (mask), and `0x17e8dc` (lts_nr/slice).
+
+2. **FB sysmem flush page not programmed.** `gf100_fb_sysmem_flush_page_init()`
+   writes a sysmem DMA page address >> 8 to `0x100c10`. The GPU uses this
+   page to flush dirty cache lines to sysmem. Without it, the L2 cache may
+   retain stale zeros and PBDMA/GR read incorrect data.
+
+3. **BAR1 VMM disabled (0x1704=0).** The previous BAR1 identity bootstrap
+   mapped only 16 MiB (not enough to cover the 0x400000+ channel VMM page
+   table heap), used the wrong VMM flush type (`0x80000005`
+   PAGE_ALL|HUB_ONLY instead of just PAGE_ALL), and encoded PTEs with the
+   VRAM aperture (aper=0) instead of the HOST aperture (aper=2, VOL=1)
+   required for the sysmem-backed eGPU. It was also gated behind
+   `KEPLER_INIT_BAR1=1`.
+
+### Fixes applied
+
+1. **Added `_gk104_ltc_init(dev)`** — reads LTC topology from hardware
+   registers (`0x022438` parts, `0x022554` mask, `0x17e8dc` lts_nr),
+   computes `ltc_nr`, sets `tag_base=0` (no compression tags: eGPU has no
+   VBIOS-initialized VRAM, matching the no-ram path in
+   `gf100_ltc_oneinit_tag_ram()`), and writes `ltc_nr` to `0x17e8d8`/
+   `0x17e000`, `tag_base` to `0x17e8d4`, and the big-page bit to
+   `0x17e8c0`. Matches `gk104_ltc_init()` in `ltc/gk104.c` and
+   `gf100_ltc_oneinit()` in `ltc/gf100.c`.
+
+2. **Added `_gk104_fb_init_page(dev)`** — sets 17-bit (128 KiB) big-page
+   mode by clearing bit 0 of `0x100c80`. Matches `gf100_fb_init_page()`.
+
+3. **Added FB sysmem flush page** — writes `dev.bus_base >> 8` to
+   `0x100c10` after sysmem allocation. Matches
+   `gf100_fb_sysmem_flush_page_init()` in `fb/gf100.c`.
+
+4. **Fixed `_gk104_init_bar1_identity()`**:
+   - Increased default mapping from 16 MiB to 128 MiB (full BAR1 aperture)
+   - Removed the post-enable VMM flush; nouveau only does
+     `gf100_bar_bar1_init()` (write 0x1704) + `gf100_bar_bar1_wait()` (two
+     BAR flushes).  The pre-enable VMM flush now correctly includes
+     HUB_ONLY (0x4), matching `gf100_vmm_flush()` when
+     `engref[NVKM_SUBDEV_BAR] > 0` (BAR1's VMM has this incremented by
+     `gf100_bar_oneinit_bar()`)
+   - Writes PTEs in 4 KiB chunks to stay within the PRAMIN window
+   - Fixed PTE encoding to use the HOST aperture (aper=2<<33, VOL=1<<32)
+     with `bus_base + page*0x1000` as the physical address, matching
+     `gf100_vmm_valid()` for `NVKM_MEM_TARGET_HOST`. The previous code used
+     aperture 0 (VRAM) with address 0, which is wrong for the sysmem-backed
+     eGPU and caused BAR1 reads to return 0xbad0...
+   - Added `bus_base` parameter so PTEs can be built with the correct
+     sysmem bus address
+
+5. **BAR1 bootstrap remains opt-in** (`KEPLER_INIT_BAR1=1`). It is still
+   not enabled by default because it has not been validated on live
+   hardware. The normal path uses the direct PCI BAR mapping that TinyGPU
+   exposes.
+
+6. **Updated init order** in `_init_hardware()`:
+   - LTC init (no sysmem needed)
+   - FB init_page (no sysmem needed)
+   - Clear any stale BAR1 bootstrap mapping
+   - Sysmem allocation
+   - FB sysmem flush page (needs sysmem bus address)
+   - BAR1 identity bootstrap (opt-in, needs sysmem bus address for PTEs)
+   - Memory manager creation
+
+### Key references
+
+- `gk104_ltc_init()`: `ltc/gk104.c` lines 27-36
+- `gf100_ltc_oneinit()`: `ltc/gf100.c` lines 208-223 (LTC topology read)
+- `gf100_ltc_oneinit_tag_ram()`: `ltc/gf100.c` (no-ram path: num_tags=0)
+- `gf100_ltc_flush()/invalidate()`: `ltc/gf100.c` lines 126-149
+- `gf100_fb_sysmem_flush_page_init()`: `fb/gf100.c` lines 81-87
+- `gf100_fb_init_page()`: `fb/gf100.c` lines 68-78
+- `gf100_bar_bar1_init()`: `bar/gf100.c` lines 52-58
+- `gf100_vmm_valid()`: `vmmgf100.c` (PTE type encoding: BIT(0) | vol<<32 | aper<<33)
+- `gf100_vmm_pgt_pte()`: `vmmgf100.c` (data = (addr>>8) | map->type)
+- `gf100_vmm_pgd_pde()`: `vmmgf100.c` (SPT PDE pt[1]: aper<<32 | addr<<24 for VRAM)
+- `gf100_vmm_join_()`: `vmmgf100.c` (instance PDB: aper<<0 | pd->addr)
+
+### Verification
+
+- `py_compile` passes.
+- `--middle-selftest` passes.
+- `NV_BACKEND=software` demo passes.
+- NOT yet tested on live hardware. The next live run should show whether
+  the LTC init + FB sysmem flush page fixes the PBDMA zero-GP-entry issue
+  (IB_CRC should match the real GP entry, not eight zero bytes). The BAR1
+  identity bootstrap (KEPLER_INIT_BAR1=1) can be tested separately once the
+  basic path is working.
+
+## Session 2026-07-13 — GR auto-power-gating fix (semaphore timeout debug)
+
+### Root cause analysis
+
+After the LTC/FB/BAR1 fixes, the PBDMA zero-GP-entry issue was resolved:
+the PBDMA now consumes GP entries and parses push buffer methods. The new
+failure is `TimeoutError: semaphore did not reach 2 (last=1)`.
+
+Register dump analysis from the timeout:
+- PBDMA0: IB_PUT=1, IB_GET=1 (entry consumed), DMA_GET=0x09000020,
+  DMA_PUT=0x09000060 (16 dwords remaining), 0x118=0x20040004 (SEMAPHOREA
+  header — last method parsed)
+- VM_FAULT: HUB unit 0, FE client (client=4), PTE fault (reason=2) at VA
+  0xd000, inst=0x60d000
+- PGRAPH_STATUS=0xbadf1000 (GR engine NOT accessible/clocked)
+- PBDMA SEM/CTX regs all = 0xbad0011f (register block not accessible)
+
+The PBDMA successfully:
+1. Consumed the GP entry
+2. Parsed SET_OBJECT (binding compute class to subch 1)
+3. Parsed SEMAPHOREA (ACQUIRE_GEQUAL at VA 0x4000, value=1)
+4. The semaphore was pre-seeded to 1, so the ACQUIRE passed
+
+Then the PBDMA tried to forward INVALIDATE_SHADER_CACHES (subch 1) to the
+GR engine, but GR was not accessible (PGRAPH_STATUS=0xbadf1000). The FE
+client faulted at VA 0xd000 (unmapped gap between runlist VA 0xc000 and
+gr_ctx VA 0x08000000).
+
+### Root cause: GR auto-power-gating
+
+The GR engine was initialized during `_init_hardware()` (PGRAPH_PACK_MMIO
+writes + PMC_ENABLE=0xffffffff), but auto-power-gated by the time
+`submit_launch()` runs. On the un-POSTed eGPU, GR power-gates within
+seconds of no MMIO access. The FECS golden context init (ctx_chan +
+grctx_main + golden save) may also trigger GR power state changes.
+
+### Fix applied
+
+Added GR accessibility checks and re-enablement at two points in
+`submit_launch()`:
+
+1. **Before FECS golden ctx init**: Check PGRAPH_STATUS; if 0xbad0...,
+   re-assert PMC_ENABLE=0xffffffff, re-run PGRAPH_PACK_MMIO with
+   PGRAPH master disable/enable cycle, and re-apply FECS clock-gating
+   init (matching `gf100_gr_init` + `gf100_gr_fecs_reset`).
+
+2. **Before runlist commit**: Same re-enablement if GR is still
+   inaccessible after the golden context init.
+
+Also added PGRAPH_STATUS and PGRAPH_CTRL to the timeout diagnostic
+register dump, and to the channel-bind debug print.
+
+### Verification
+
+- `py_compile` passes
+- `--middle-selftest` passes
+- `NV_BACKEND=software` demo passes
+- NOT yet tested on live hardware. The next live run should show whether
+  the GR re-enablement fixes the semaphore timeout. If GR is still not
+  accessible after re-enablement, the issue may be deeper (e.g., GPC
+  clock domain gating that requires PMU/devinit).
