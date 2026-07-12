@@ -363,3 +363,321 @@ Each tested on real HW with full MMIO traces:
   reports `0xbad0...` from the already-corrupted BAR1 mapping, so another live
   result requires a real device/function reset before it can validate the new
   reservation.
+
+## Session 2026-07-12 — FECS golden context: wrong command interface (cmd 3/9 vs cmd 1/2)
+
+### Root cause identified
+
+The `bind_pointer` timeout and `CTXNOTVALID` errors were caused by using the
+**wrong FECS command interface**. The add.py code was sending:
+
+- Command 3 (`bind_pointer`) — write `0x409500=inst_tag`, `0x409504=0x3`, poll
+  `0x409800` bit4
+- Command 9 (`golden_save`) — write `0x409500=inst_tag`, `0x409504=0x9`, poll
+  `0x409800` bit0
+
+These two commands belong to Nouveau's **secure-boot firmware path**
+(`gr->firmware` / `gf100_gr_init_ctxctl_ext`), implemented by
+`gf100_gr_fecs_bind_pointer()` and `gf100_gr_fecs_wfi_golden_save()` in
+`ref/linux/.../engine/gr/gf100.c` lines 834-850.
+
+However, the FECS firmware loaded by add.py is the **internal Nouveau
+firmware** (`hubgk104.fuc3`), which corresponds to the `!gr->firmware` /
+`gf100_gr_init_ctxctl_int` path. Reading the actual FECS microcode source
+(`ref/linux/.../engine/gr/fuc/hub.fuc`) confirmed that the firmware's main
+loop only handles three command IDs:
+
+- **Command 0x0001** (`ctx_chan`): Set current channel — hub.fuc lines 278-283
+- **Command 0x0002** (`ctx_save`): Save context — hub.fuc lines 286-294
+- **Command 0x4001**: GPU-triggered context switch (internal, from CHSW IRQ)
+
+Any other command ID hits `E_BAD_COMMAND` at hub.fuc lines 296-299, which
+sets SCRATCH(5) to the error code and raises INTR_UP. This is exactly why the
+`bind_pointer` poll timed out: the firmware rejected command 3 as a bad
+command and never set the completion bit.
+
+The diagnostic prints also showed `IREN=0x0` because the register addresses
+were wrong:
+- `0x409210` was being read as `INTR_EN_SET` — the correct address is
+  `0x409010` (confirmed in `fuc/macros.fuc` line 49)
+- `0x409208` was being read as `INTR_UP` — the correct address for interrupt
+  status is `0x409008` (`NV_PGRAPH_FECS_INTR`, macros.fuc line 41)
+- `0x409128` was labeled `UC_PC` — it is actually `CPUSTAT`
+  (`NV_PGRAPH_FECS_CPUSTAT`); the real PC is not directly exposed as a single
+  MMIO register on this falcon version
+
+### Fix applied
+
+Replaced the bind_pointer/golden_save block (add.py lines ~2300-2343) with
+the correct `!gr->firmware` (`_int`) path from `ctxgf100.c` lines 1505-1535:
+
+1. **Make channel current** (`ctx_chan`, FIFO cmd 1):
+   - Clear `CC_SCRATCH(0)` bit31 via `CC_SCRATCH_CLR(0)` at `0x409840`
+   - Write `0x409500 = inst_tag` (FIFO data = instance tag)
+   - Write `0x409504 = 0x00000001` (FIFO cmd = 1 = set channel)
+   - Poll `0x409800` for bit31 (FECS sets this in `main_done` after
+     `ctx_chan` returns)
+
+2. **Trigger context unload** (golden save via CHSW):
+   - Clear `CHAN_NEXT` bit31 at `0x409b04` (no next channel to load)
+   - Write `0x409000 = 0x00000100` (IRQMSET bit8 = INTR_CHSW) to trigger a
+     context-switch interrupt; the FECS ISR enqueues cmd 0x4001, and the
+     main loop's ctx_switch handler saves the current context because
+     CHAN_NEXT bit31 is clear (the `chsw_prev_no_next` branch at hub.fuc
+     lines 254-262)
+   - Poll `0x409b00` for bit31 to clear (context switch complete)
+
+3. **Clear CHAN_ADDR** bit31 at `0x409b00` so FECS returns to idle.
+
+The `inst_tag` calculation (`0x80000000 | ((base + ramin_pa) >> 12)`) was
+already correct and is unchanged.
+
+Also fixed the diagnostic register labels in the FECS trace section
+(add.py line ~872):
+- `UC_STATUS` → `CPUSTAT` for `0x409128`
+- Added `INTR_EN` (`0x409010`) to the pre-start dump
+- Removed the incorrect `0x409210` / `0x409208` reads from the golden-context
+  diagnostic block
+
+### Key references
+
+- FECS firmware main loop: `ref/linux/.../engine/gr/fuc/hub.fuc` lines 218-306
+- FECS register definitions: `ref/linux/.../engine/gr/fuc/macros.fuc` lines 40-131
+- `_int` path golden context: `ref/linux/.../engine/gr/ctxgf100.c` lines 1505-1535
+- `_ext` path (secure boot, NOT applicable): `ref/linux/.../engine/gr/gf100.c`
+  lines 834-850
+- `gf100_gr_init_ctxctl` dispatch: `ref/linux/.../engine/gr/gf100.c` lines 1883-1893
+
+### Verification
+
+- `py_compile` passes on the edited add.py.
+- The fix has NOT yet been tested on live hardware (requires the eGPU to be
+  re-attached after the previous session's BAR1 VMM crash). The next live run
+  should show whether `FECS ctx_chan (cmd 1)` completes (CC_SCRATCH0 bit31
+  sets) and whether the subsequent context unload saves the golden image
+  (CHAN_ADDR bit31 clears).
+
+### Remaining blocker
+
+The BAR1 VMM configuration issue (semaphore does not reach 2,
+`userd_gp_get=0xffffffff`) is still unresolved. The PDE format for 4KB pages
+was fixed in the previous session (SPT fields instead of LPT), but the BAR1
+VMM setup function itself was reverted after causing a system crash. The
+next step is to carefully re-evaluate the BAR1 VMM setup, ensuring it does
+not overwrite TinyGPU's existing BAR1 mapping.
+
+## Session: grctx->main() implementation (2026-01-23)
+
+### Problem
+
+The FECS golden context save was saving an **empty/uninitialized context**
+because `grctx->main()` was never called. In Nouveau (ctxgf100.c line 1515),
+`grctx->main()` is called between making the channel current (cmd 1) and
+triggering the context unload. It writes:
+1. GR register init lists (hub/gpc_0/zcull/gpc_1/tpc/ppc) via `gf100_gr_mmio()`
+2. Pagepool, bundle_cb, attrib_cb addresses via `gf100_grctx_patch_wr32()`
+3. Attrib configuration (alpha/beta tables)
+4. icmd bundles via `gf100_gr_icmd()` (0x400200/0x400204 interface)
+5. mthd bundles via `gf100_gr_mthd()` (0x404488/0x40448c interface)
+6. Various grctx fixups (unkn, gpc_tpc_nr, r419f78, r419cb8)
+
+Without these, the GR engine has no valid context to load when the channel
+is started, which is why the FIFO/channel launch was failing.
+
+### Fixes applied
+
+1. **Removed _ext-path ctx_header writes** (add.py): The writes to
+   `data[0x1c/0x20/0x28/0x2c]` were from the secure-boot `_ext` path
+   (ctxgf100.c lines 1499-1504). The `_int` path does NOT write them.
+   The context buffer starts zeroed, and grctx->main() populates the GR
+   registers before the context unload saves the golden image.
+
+2. **Added VMM limit at inst 0x0208** (add.py): Nouveau's
+   `gf100_vmm_join_()` writes `vmm->limit - 1` at inst offset 0x0208.
+   For GK104, the VMM limit is 40-bit (1TB), so the value is `(1<<40) - 1`.
+   Without this, the channel VMM has no limit configured.
+
+3. **Extended grctx_gk104.py** to extract the `data` field from init entries:
+   - The `gf100_gr_init` struct is `{u32 addr, u8 count, u32 pitch, u64 data}`.
+   - The parser now extracts all 4 fields (was only extracting 3).
+   - Added `mmio_writes()` function to expand entries into (addr, value) pairs.
+   - Added `mmio_pack()`, `icmd_pack()`, `mthd_pack()` helper functions.
+   - Added `MMIO_PACKS`, `ICMD_PACKS`, `MTHD_PACKS`, `GK104_GRCTX_CONSTS`.
+
+4. **Implemented `_gk104_grctx_main()`** (add.py): Replicates
+   `gf100_grctx_generate_main()` for GK104:
+   - Writes mmio packs (hub, gpc_0, zcull, gpc_1, tpc, ppc) via direct MMIO
+   - Saves and zeros idle timeout (0x404154)
+   - Writes pagepool address (0x40800c/0x408010/0x419004/0x419008/0x4064cc)
+   - Writes bundle address (0x408004/0x408008/0x418808/0x41880c/0x4064c8)
+   - Writes attrib_cb address (0x418810/0x419848)
+   - Writes attrib config (0x405830/0x4064c4)
+   - Writes unkn fixups (0x418c6c/0x41980c/0x41be08/0x4064c0/0x405800/0x419c00)
+   - Writes gpc_tpc_nr (0x405b00)
+   - Writes r419f78 fixup
+   - Writes icmd bundles via 0x400200/0x400204 interface
+   - Restores idle timeout
+   - Writes mthd bundles via 0x404488/0x40448c interface
+   - Writes r419cb8 fixup
+
+5. **Allocated pagepool, bundle_cb, attrib_cb** (add.py):
+   - pagepool: 0x8000 bytes (gk104_grctx.pagepool_size)
+   - bundle_cb: 0x3000 bytes (gk104_grctx.bundle_size)
+   - attrib_cb: 0x100000 bytes (safe default for 8 TPCs)
+
+6. **Called `_gk104_grctx_main()`** between ctx_chan (cmd 1) and context
+   unload, matching Nouveau's sequence. GPC/TPC topology is read from
+   0x409604 and GPC_UNIT(i, 0x2608).
+
+7. **Added BAR1 VMM diagnostics** (add.py): Enhanced the existing BAR1
+   diagnostic to decode the PDB format (target/VOL/address), read the VMM
+   limit, and dump the first few PGD entries to see what's mapped.
+
+### Key references
+
+- `gf100_grctx_generate_main()`: ctxgf100.c lines 1342-1431
+- `gf100_gr_mmio()`: gf100.c lines 1079-1093
+- `gf100_gr_icmd()`: gf100.c lines 1096-1133
+- `gf100_gr_mthd()`: gf100.c lines 1136-1158
+- `gf100_grctx_patch_wr32()`: ctxgf100.c lines 994-1004
+- `gf100_grctx_generate_pagepool()`: ctxgf100.c lines 1023-1029
+- `gf100_grctx_generate_bundle()`: ctxgf100.c lines 1014-1020
+- `gf100_grctx_generate_attrib_cb()`: ctxgf100.c lines 1053-1057
+- `gf117_grctx_generate_attrib()`: ctxgf117.c lines 244-275
+- `gk104_grctx_generate_unkn()`: ctxgk104.c lines 894-903
+- `gk104_grctx_generate_gpc_tpc_nr()`: ctxgk104.c lines 915-919
+- GK104 grctx function table: ctxgk104.c lines 970-992
+- `gf100_vmm_join_()`: vmmgf100.c lines 342-363
+- BAR1 control (0x1704): gf100.c (bar) lines 52-58
+- USERD BAR1 window (0x2254): gk104.c (fifo) lines 744-753
+
+### Verification
+
+- `py_compile` passes on add.py and grctx_gk104.py.
+- `--middle-selftest` passes.
+- `NV_BACKEND=software` demo passes.
+- NOT yet tested on live hardware.
+
+### Remaining blockers
+
+1. **FECS ctx_chan DMA hangs — VMM join format for FECS VM DMA** (CURRENT BLOCKER):
+   - FECS firmware successfully loads, starts, and posts ready (0x409800 bit31).
+   - FECS starts all 4 GPC falcons (GPC0-3 CTRL=0x20, SCRATCH0=0x80000000).
+   - ctx_chan (cmd 1) is sent with inst_tag. FECS begins ctx_load but hangs at
+     PC 0x1097a (after `xdwait`) waiting for a VM DMA to complete.
+   - MEM_BASE=0x00080800 (correct: GR ctx VA 0x08080000 >> 8).
+   - MEM_TARGET=0x00000001 (VM mode — FECS walks the channel VMM page tables).
+   - The VMM page directory is stored in the inst block at offset 0x200.
+   - **Root cause**: The FECS VM DMA engine walks page tables that must be in
+     VRAM (BAR1-backed), but the software VMM's page tables are in host sysmem.
+     A BAR1-backed VMM was created (PGD at 0x503000, SPT at 0x513000) with
+     PDE/PTE entries mapping the GR context VA range to grctx_vram_pa.
+     PTE format: bit0=PRESENT, bits[4:31]=addr>>12, bits[33:34]=TARGET
+     (0=VRAM, 2=SYSRAM). PDE format: bit0=LPT_PRESENT, bit32=SPT_PRESENT,
+     bits[4:31]=LPT_ADDR>>12, bits[36:63]=SPT_ADDR>>12.
+   - **Still hangs after BAR1 VMM**: The VMM join value format may be wrong.
+     Two formats tried:
+     (a) `pgd = vmm_pgd_pa` (full address, per gf100_vmm_join_)
+     (b) `pgd = ((vmm_pgd_pa >> 12) << 4)` (PDB register format, per
+         gf100_vmm_invalidate)
+   - **Next**: Verify the exact VMM join format by checking what nouveau
+     actually writes to inst[0x200] on hardware, or try using the existing
+     software VMM's page tables but copied to BAR1 VRAM (preserving the
+     PDE/PTE encoding that the software VMM already uses). Also check
+     whether the PDE needs bit32 (SPT_PRESENT) set, and whether the PTE
+     needs the PRIV/VOL bits.
+
+2. **BAR1 VMM**: The PBDMA reads USERD through the BAR1 window (0x2254),
+   which goes through the BAR1 VMM. If TinyGPU's BAR1 VMM doesn't map the
+   USERD VA, the read returns 0xffffffff. The enhanced diagnostics will
+   show what TinyGPU's BAR1 VMM maps, so we can determine if USERD's VA
+   is mapped or if we need to add a mapping.
+
+3. **grctx->main() on hardware**: The icmd/mthd bundles write to GR
+   registers via indirect interfaces (0x400200/0x404488). These need to
+   be tested on hardware to verify they work correctly.
+
+## Session 2026-07-12 (continued) — FECS DMEM auto-power-gating FIXED
+
+### Major breakthrough: FECS firmware now runs and posts ready
+
+The FECS DMEM auto-power-gating issue was diagnosed and fixed. The FECS
+firmware now successfully loads, starts, posts ready (0x409800 bit31),
+and begins processing ctx_chan commands.
+
+### What was fixed
+
+1. **PGRAPH disable (0x400500)**: Changed from `write32(0x400500, 0)` to
+   `write32(0x400500, read32(0x400500) & ~0x00010001)` (masked write, only
+   clearing bits 0+16, matching nouveau's `nvkm_mask`). Writing 0 to the
+   entire register power-gates the FECS, making DMEM return 0xbadf5000.
+
+2. **Second pgob after PGRAPH init**: After the PGRAPH pack MMIO writes
+   and FECS clock-gating/power/enable sequence, a second `gk104_pmu_pgob`
+   is called to restore FECS DMEM accessibility. The PGRAPH init
+   re-gates the FECS power; pgob un-gates it.
+
+3. **Skip ctxctl gate (0x260)**: The ctxctl gate (0x260=0) was causing
+   FECS DMEM to become inaccessible. Since the falcon is already STOPPED
+   (UC_CTRL=0x10), the gate is unnecessary. IMEM loads fine without it.
+
+4. **FECS DMEM + csdata + start as one continuous write stream**: The
+   FECS auto-power-gates within a few MMIO operations of no DMEM access.
+   To prevent this, FECS DMEM load, csdata upload, and FECS start are
+   done as one continuous write-only sequence with no reads in between.
+   - GPCCS DMEM is loaded first (doesn't auto-gate).
+   - FECS DMEM is loaded via FALCON_DATA_INDEX/DATA write stream.
+   - csdata method words are appended at the known FUC data tail offset
+     (0x304 for FECS, 0x6c for GPCCS) without reading the tail pointer.
+   - FECS is started immediately after the last csdata write.
+
+### Key findings
+
+- FECS DMEM accessibility is auto-gated by the FECS power domain after
+  ~50ms of no DMEM access. DMEM reads return 0xbadf5000 (power-gate
+  sentinel) when gated.
+- `gk104_pmu_pgob` un-gates the FECS, making DMEM accessible.
+- PGRAPH disable (0x400500=0) re-gates the FECS.
+- PGRAPH pack MMIO writes re-gate the FECS (one of the ~140 registers).
+- The ctxctl gate (0x260=0) also causes DMEM to become inaccessible.
+- IMEM access is NOT power-gated (works regardless of gate state).
+- The FECS FUC data has head=0x300, tail=0x304 (FECS) and head=0x6c,
+  tail=0x6c (GPCCS) at DMEM offsets 0/4.
+
+### Current state
+
+- FECS firmware: LOADS, STARTS, POSTS READY (0x409800 bit31 set).
+- GPC falcons: All 4 started by FECS (CTRL=0x20, SCRATCH0=0x80000000).
+- ctx_chan (cmd 1): FECS begins processing but hangs at PC 0x1097a
+  (xdwait) waiting for VM DMA to complete.
+- **Blocker**: FECS VM DMA cannot walk the VMM page tables. The page
+  tables need to be in VRAM (BAR1-backed), and the VMM join value format
+  in the inst block at offset 0x200 may be incorrect.
+
+## Session 2026-07-12 — macOS crash fixed; golden context proven
+
+- Root cause of the crash-era VMM code was unsafe/malformed channel state:
+  one SPT was aliased beneath multiple PGD entries, HOST leaf PTEs used target
+  bits in the wrong positions, and RAMIN used the TLB-invalidate PDB encoding
+  instead of `gf100_vmm_join_()`'s full address.  The live path now clones the
+  validated host VMM into distinct VRAM SPTs and uses the correct join value.
+- Added Nouveau's required `g84_bar_flush()` sequence after framebuffer writes.
+  A complete 4-KiB RAMIN upload followed by the flush is deterministic; the
+  earlier per-word/partial BAR writes were the source of random PBDMA state.
+- VBIOS devinit is now enabled by default for the un-POSTed macOS eGPU (explicit
+  `KEPLER_VBIOS_DEVINIT=0` remains available for power-gating diagnostics).
+- Fixed `wait_cond` at `ctx_chan`: the callback returned `0x80000000`, which was
+  incorrectly compared to boolean `True` and reported a timeout after success.
+- Live hardware now completes all golden-context stages:
+  `FECS ctx_chan done`, `grctx_main done`, and `FECS golden save done` with
+  `gpc_nr=4`, `tpc_total=8`.
+- Corrected RAMFC `DEVM` from `0xfff` to Nouveau's GR-only `BIT(0)`.
+- The macOS system no longer crashes in repeated live runs.  PBDMA0 loads clean,
+  stable channel state (`IB_PUT=1`, `IB_ADDR=0x10010000`, `IB_CFG=0x000a0000`,
+  signature `0xface`, no HCE/PBDMA interrupt), but does not consume entry 0:
+  `IB_GET=0`, `IB_ENTRY=0`, and USERD `GP_GET=0`.
+- A VRAM-backed GPFIFO ring, CHID 0 vs 1, a post-kick channel start, and an
+  explicit USERD BAR flush all produced the same fault-free stall.  Those
+  no-effect experiments were removed.  The remaining blocker is now narrowly
+  the runlist/PBDMA dispatch gate before GP entry fetch, not VMM encoding,
+  context validity, USERD visibility, or GPFIFO memory aperture.
