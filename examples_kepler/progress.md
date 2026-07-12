@@ -681,3 +681,72 @@ and begins processing ctx_chan commands.
   no-effect experiments were removed.  The remaining blocker is now narrowly
   the runlist/PBDMA dispatch gate before GP entry fetch, not VMM encoding,
   context validity, USERD visibility, or GPFIFO memory aperture.
+
+## Session 2026-07-12 — first GPFIFO entry consumed
+
+- The supposed fault-free stall was a diagnostic blind spot.  PFIFO master
+  status was `0x50000000`; `VM_FAULT_SOURCE=0x80` identified fault slot 7
+  (HOST0).  Added decoding of all active `0x2800 + unit*0x10` records.
+- The concrete fault was a HOST0 read at GPFIFO VA `0x10010000`, reason
+  `UNSUPPORTED_APERTURE`.  Both coherent HOST aperture 2 and NCOH aperture 3
+  fault at that address on this bring-up path.
+- A VRAM leaf alone did not fix VA `0x10010000`.  Moving push/GPFIFO to
+  `0x09000000/0x09010000`, inside PGD slot 1 already proven by FECS context DMA,
+  removed the MMU fault.  This proves the remaining bug was specific to the
+  second PGD traversal/slot, not PBDMA scheduling.
+- With `KEPLER_VRAM_GPFIFO=1`, hardware now advances PBDMA `IB_GET=1` and USERD
+  `GP_GET=1`: the first GP entry is consumed for the first time.
+- The VRAM GP entry now reads back identically through BAR1 and PRAMIN
+  (`0x09000000`, high word `0x00001400`).  PBDMA's post-consume
+  `IB_ENTRY_LOW=0xfffffffd` is an idle/sentinel value, not the backing ring
+  contents.
+
+## Session 2026-07-12 — dispatch narrowed past runlist completion
+
+- Added the exact `gk104_fifo_intr_runlist()` acknowledgement of `0x2a00`
+  after the runlist DMA completes.  This clears PFIFO master bit `0x40000000`;
+  the live timeout now has master, scheduler, runlist, PBDMA, and HCE interrupt
+  state all zero.
+- Added optional VRAM backing for the pushbuffer and semaphore, including leaf
+  PTE replacement, PRAMIN repair, BAR flush, and direct VRAM polling.  The
+  push PTE reads back correctly (`0x6101` in the tested layout), but the same
+  post-consume state remains.  Therefore host aperture access is not the cause
+  of the push-method stall.
+- Compared the stream against `cl906f.h` and `nvif/chan506f.c`: the entry size
+  is correctly encoded in dwords, the incrementing method header is
+  `0x20040004`, and both MAIN/NOT_MAIN plus NO_PREFETCH variants were tested.
+  They do not change the result.
+- Tested Nouveau's host semaphore WFI-disabled operation (`0x00100002`) and
+  the older GK104 driver's second post-runlist START trigger.  Neither changes
+  the stall.
+- The decisive live boundary is now: `IB_PUT=IB_GET=USERD_GP_GET=1`, while
+  `DMA_GET=DMA_PUT=0`, USERD TOP_LEVEL_GET is invalid, and all PBDMA semaphore
+  state registers remain zero.  Thus PBDMA retires the GP entry without ever
+  parsing the first pushbuffer method; the next investigation is the GP-entry
+  accept/skip condition and RAMFC state, not GR compute or semaphore syntax.
+
+## Session 2026-07-12 — IB CRC proves GPU reads a zero GP entry
+
+- The late CPU readback exposed bitwise-inverted push words on uncleared VRAM
+  (`0x20040004 -> 0xdffbfffb`).  Replaced blind PRAMIN writes with verified
+  stores: read the old word, apply the XOR delta used by this macOS path,
+  verify, and fall back to a literal store.  Ring, push, RAMFC prefix, USERD,
+  and runlist now read back exactly before the kick.
+- Added SET_REFERENCE and NON_STALL_INTERRUPT host methods ahead of the
+  semaphore.  Neither side effect appears, proving this is not merely an
+  unreadable semaphore destination.
+- The key diagnostic is PBDMA `IB_CRC=0x6904bb59` with `PB_CRC=0`.  Using the
+  CRC definition in envytools, `0x6904bb59` is exactly the CRC of eight zero
+  bytes, not of the CPU-visible entry (`0x09000000`, `0x00002400`).  Hardware
+  therefore fetches a zero GP entry, advances GET, and never starts a
+  pushbuffer read.
+- Nouveau LTC flush (`0x70010`) plus invalidate (`0x70004`), last-moment
+  PRAMIN rewrites, MAIN/NOT_MAIN, and placing push and ring in the same
+  physical page do not change the zero-entry CRC.
+- Found BAR1 disabled (`0x1704=0`) on the unclaimed eGPU.  A first identity
+  BAR1 bootstrap is retained behind `KEPLER_INIT_BAR1=1` only: it is not yet
+  correct (BAR1 still reads a malformed instance view and it disrupts the
+  FECS PTE readback), so the normal path remains unchanged.  The next blocker
+  is now exact and below packet syntax: make CPU framebuffer writes visible
+  to GPU clients, most likely by completing the GK104 BAR1/VRAM initialization
+  that macOS did not perform.
