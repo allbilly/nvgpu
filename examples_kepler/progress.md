@@ -178,3 +178,188 @@ Each tested on real HW with full MMIO traces:
   in the `TimeoutError` path for future diagnostics.
 - `--probe-falcon` now succeeds: `FECS+GPCCS loaded and started OK`,
   `UC_PC=0x567`, `UC_CTRL=0x20` (running), `0x409800 bit31` set.
+
+### Current test result (2026-07-12) – FIFO descriptor correction
+
+- Read `ref/linux/.../engine/fifo/gk104.c`: RAMFC uses a push-buffer base/limit
+  at `0x48/0x4c`, while the GPFIFO is a 16-byte descriptor ring and USERD
+  `GP_PUT` is an entry index. Fixed `submit_launch()` to create that layout
+  instead of placing method dwords directly in the ring and writing a byte
+  address to `GP_PUT`.
+- `--middle-selftest`, software demo, Falcon probe, and VBIOS inspectors pass.
+- Full hardware `python3 examples_kepler/add.py` now reaches channel submission
+  and times out with semaphore `0` (no crash). The remaining hardware blocker is
+  GR context/channel execution: the current RAMIN still supplies a zero-filled
+  placeholder instead of nouveau's generated GK104 context, so the compute
+  engine has not yet been proven to execute the push buffer.
+
+### Current test result (2026-07-12) – Kepler FIFO layout and runlist
+
+- DeepWiki search did not expose pages for the requested repositories; the
+  available NVIDIA/GK20A DeepWiki-adjacent source confirms GP entries use 8
+  bytes and encode push-buffer length at bit 10. Local Nouveau `gk104.c` and
+  `gf100.c` were authoritative for the remaining details.
+- Corrected the earlier 16-byte/newer-GPU descriptor: GK104 now uses 8-byte GP
+  entries, RAMFC points to the GPFIFO ring, and a real `(chid, 0)` runlist entry
+  is committed through `0x2270/0x2274`.
+- Live timeout diagnostics show `GP_GET=0`, PFIFO channel remains unscheduled,
+  and no semaphore update. This narrows the next issue to runlist memory target/
+  address or the missing GR context bind, rather than push-buffer encoding.
+- TOP-table decoding confirms the GR engine is assigned to runlist 0. Added the
+  Nouveau `gk104_fifo_init()` PFIFO BAR1/interrupt initialization before the
+  runlist commit; the live result is unchanged (`GP_GET=0`). The sysmem-only
+  BAR1/userd assumption is now the leading scheduling blocker.
+- Corrected initialization ordering so PFIFO setup happens before channel bind
+  and start. Hardware still clears the start state and leaves `GP_GET=0`, while
+  `PFIFO_BAR1=0x10030000` and the instance bind register retain their values.
+  This confirms the remaining failure is in the BAR1 aperture / PBDMA access
+  path, not a late FIFO reset.
+- Replaced the fake sysmem USERD with the actual PCI BAR1 address returned by
+  TinyGPU (`bar_info(1)`), programmed PFIFO BAR1 from that address, and wrote
+  `GP_PUT` through BAR1. The channel still does not advance; BAR1 reads return
+  nonzero GPU contents but `GP_GET` does not become 1. This is the first test
+  that exercises the real Nouveau USERD aperture rather than a sysmem alias.
+- Added an immediate BAR1 readback: `GP_PUT` writes `1` and reads back `1`, with
+  BAR1 address `0x110000000` and size `0x8000000`. Therefore the remaining
+  failure is after USERD visibility—runlist/PBDMA scheduling or channel
+  instance/context validation—not a transport write failure.
+- Filled all remaining `gk104_chan_ramfc_write()` fields, then corrected the
+  address domains using `gk104_ectx_bind()`: GR context, GPFIFO, and push-buffer
+  pointers now use mapped GPU VAs (GR context `VA|4`), while the runlist commit
+  retains the physical bus address. The live result is still `GP_GET=0`; the
+  channel instance is now structurally much closer to Nouveau.
+- Also applied `gk104_fifo_init_pbdmas()` essentials (`0x204` PBDMA enable and
+  scheduler error-disable release at `0x2a04`). No change: BAR1 `GP_PUT` remains
+  writable, but PBDMA never consumes the runlist entry.
+- Compared the complete GK104 FIFO init sequence; no additional `0x2200` or
+  `0x2628` write belongs to `gk104_fifo_init()` (those are GF100-only). The
+  current failure is therefore not explained by omitted generic FIFO enables;
+  next diagnostics must focus on channel instance validation/context-switch
+  fault state.
+- Added the previously missing `gf100_runq_init()`/`gk104_runq_init()` sequence
+  for all three PBDMAs and mapped each PBDMA to runlist 0 at `0x2390`. The live
+  channel still does not advance `GP_GET`; the next evidence needed is the
+  per-PBDMA HCE/interrupt status and context-valid fault state.
+- Corrected a diagnostic/initialization address typo: Nouveau PBDMA registers
+  are based at `0x040000`, not `0x004000`. With the real registers initialized,
+  PBDMA0 reports HCE `CTXNOTVALID` (`0x040108 bit31`) and channel 0, proving the
+  runlist is now reaching the PBDMA. The remaining blocker is the missing valid
+  GK104 GR golden context image; the zero-filled placeholder is rejected during
+  context switch.
+- Matched `ctxgf100.c`'s context pointer convention (`ctx + 0x80000 | 4`) and
+  initialized its header words at `CB_RESERVED+0x1c` (`1,0,0,0`). The HCE fault
+  remains, so a complete generated `gf100_grctx_generate_main()` image and its
+  required pagepool/bundle/attrib buffers are still needed.
+- Compared allocation domains: Nouveau uses `NVKM_MEM_TARGET_INST` for the
+  golden context. Tested a BAR1-backed 1 MiB context region with the same
+  header; HCE `CTXNOTVALID` remains. This rules out the simple sysmem-versus-
+  instance-memory placement mismatch; the complete generated image and engine
+  context resources are still required.
+- DeepWiki's available NVIDIA command-processing page independently confirms
+  that RAMFC/PBDMA state is separate from the engine context image and that
+  context switching is a distinct stage after runlist selection. The local
+  Nouveau source remains the GK104-specific authority; no requested mirror
+  repository had a deeper indexed GK104 context page.
+- Live FECS reports the GK104 golden-context image size as `0x2d000`; Nouveau
+  allocates `CB_RESERVED + gr->size` and then fills it through
+  `gf100_grctx_generate_main()`. The current 1 MiB allocation is large enough,
+  but contains no generated image, confirming that image generation—not buffer
+  capacity—is the active missing implementation.
+- After correcting the PBDMA base and re-testing with the context pointer as a
+  VMM GPU VA (`gr_ctx.va_addr + 0x80000 | 4`), PBDMA0 HCE status is now clear
+  (`0x040108=0`) rather than `CTXNOTVALID`. Context switching therefore passes;
+  the remaining failure is post-switch GPFIFO/USERD fetch (`GP_GET` stays 0).
+- Added PBDMA GP state diagnostics. The HCE fault is clear, but the live
+  PBDMA GP registers do not show a consumed entry; the next fix is to reconcile
+  the RAMFC GPFIFO base/limit encoding with the GK104 PBDMA `GP_BASE` register
+  after context load.
+- Read `nouveau_channel_new()` in the Linux source: Kepler channels use a VMM,
+  `args.offset = ioffset + chan->push.addr`, and `args.length = 0x2000`; the
+  RAMFC limit encoding (`ilog2(length/8)=10`) matches the current script. This
+  confirms the remaining GP fetch issue is the exact push/GPFIFO allocation
+  address relationship, not the limit exponent.
+- Decisive fix from `ref/linux/drivers/gpu/drm/nouveau/nvif/chan506f.c`:
+  Kepler USERD uses `GP_GET=0x88` and host `GP_PUT=0x8c` (the script had them
+  reversed). After correcting this, live hardware reports `userd_gp_get=1`,
+  proving the GPFIFO descriptor is consumed. The remaining failure is now in
+  pushbuffer method execution/semaphore completion, after FIFO fetch.
+- Seeded the initial semaphore to `1`; the live stream now passes the wait and
+  stalls after the compute launch with `last=1`. Read `gk104_compute.xml` and
+  fixed CWD `CB_CONFIG_1.SIZE` from `<<8` to `<<15`, and changed hardware code
+  upload to extract `.text.E_4` from the cubin instead of uploading the ELF.
+  The fallback structural cubin is still not executable SASS when Docker/CUDA
+  is unavailable, so the remaining live failure may now be the placeholder
+  kernel itself rather than FIFO infrastructure.
+- Workspace search found no verified real `sm_30` `E_4` cubin. The local
+  `nvcc` is a Docker shim and Docker is unavailable; the only other cubin is a
+  32-bit Multi2Sim sample for a different kernel/format.
+- Fetched the requested `xiuxiazhang/KeplerAs` reference and assembled a valid
+  `sm_35` control kernel (`S2R; EXIT;`) from the existing `E_4` cubin template.
+  It also stalls after launch with the done semaphore at `1`, proving the
+  fallback SASS is not the sole cause; the zero/un-generated GR context or
+  launch-state setup still blocks even an immediate-exit kernel.
+- Tested the Nouveau `gf100_gr_fecs_start_ctxsw`/bind/golden-save mailbox
+  sequence. On this direct bring-up path the resume command leaves
+  `0x409804=0xffffffff` and never returns status `1`, so it was removed from
+  the live path rather than leaving a new hard timeout.
+- Forced the uploaded `.text` allocation to a 256-byte VA alignment and
+  retested the KeplerAs immediate-exit kernel; it still stalls with semaphore
+  `1`. Code alignment is therefore not the remaining launch blocker.
+- Replaced the incorrect G80-style 3-level page-table builder with the
+  GK104/GF100 2-level format from `ref/linux/.../vmmgf100.c` and
+  `vmmgk104.c`: 13-bit PGD, 15-bit small-page index, PTE address `paddr>>8`,
+  system-coherent/non-coherent aperture bits, and the VMM join record at
+  RAMIN `0x200`. Offline GMMU self-tests still pass.
+- Replaced the semaphore stream's invalid NVC56F `0x005c` packet with the
+  NV906F incrementing methods `0x10/0x14/0x18/0x1c`, matching Nouveau's
+  `nvc0_fence.c`/`nvif/chan906f.c`. The hardware stream still needs a valid
+  FIFO dispatch before this can be judged by the completion value.
+- Added an opt-in `KEPLER_VRAM_INST=1` probe that places the channel instance
+  and GR context in BAR1-backed instance memory, matching Nouveau's
+  `NVKM_MEM_TARGET_INST`. This clears the earlier PBDMA signature error and
+  confirms the instance-memory target mattered; the remaining live error is
+  `PBDMA0 INTR=0x00004000` (`GPPTR`) with USERD `GP_GET=0`.
+- Matched the GK104 GPFIFO allocation to RAMFC `LIMIT2=10` (`0x2000` bytes),
+  reserved VA zero so absolute ring alignment is honored, reset reused BAR1
+  USERD state, and used masked channel start/stop writes. These fixes remove
+  stale signature/HCE errors, but the current BAR1-instance probe still does
+  not fetch the first GPFIFO entry. Offline gates remain green:
+  `kepler_selftest=ok`, `software_demo=ok N=256 launch_words=24`.
+- Tested the alternate GPFIFO external-entry `BIT(9)` encoding after the
+  aligned-ring/reset fixes; it produced the same `GP_GET=0`/`GPPTR` result.
+  The remaining issue is therefore not the main-vs-external flag alone.
+- Mirrored Nouveau's main-push VA relationship (`push_va` and
+  `gpfifo_va = push_va + 0x10000`) with a `0x10000`-aligned push allocation;
+  the BAR1-instance probe still reports `GPPTR` and `GP_GET=0`. The unresolved
+  issue is now in the channel's live GPFIFO pointer/context wiring rather than
+  ring size, VA alignment, entry flag, USERD reset, or instance placement.
+- Re-read the exact GK104 paths in `gk104.c`, `gf100.c`, `vmmgf100.c`, and
+  `chan506f.c`. Added an opt-in GK104 PFIFO reset using MC FIFO bit `0x100`,
+  corrected channel runlist selection bits `0xf0000`, cleared runlist fault
+  `0x262c`, unblocked runlist 0 at `0x2630`, and changed `0x2a04` to the exact
+  Nouveau mask/value `0xbfffffff`. Also wait for the asynchronous GK104
+  runlist pending bit at `0x2284` before writing USERD `GP_PUT`.
+- The FIFO reset test proved the stale-cache hypothesis: PBDMA `CTRL_ADDR_LOW`
+  changed from an old BAR1 address to the current USERD address. The old
+  address path raised `GPPTR`; the source-shaped physical USERD path removes
+  `GPPTR` and loads `GP_PUT=1`, but `GP_GET` still remains 0.
+- Corrected the USERD domain in the VRAM-instance probe: Nouveau RAMFC `0x08`
+  contains the USERD memory object's VRAM address, while PFIFO `0x2254` is the
+  BAR1 GPU-virtual mapping base. A diagnostic BAR1-VMM replacement was tested
+  and reverted because it invalidated TinyGPU's existing BAR1 mapping
+  (`0xbad0...` reads); the remaining blocker is to use that existing mapping
+  rather than overwrite it.
+- DeepWiki search was attempted for the requested repositories. The available
+  NVIDIA command-processing page confirms the same PBDMA roles (`GP_PUT` q+0,
+  `GP_GET` q+0x14, `GP_BASE` q+0x48, channel q+0x08); no indexed page exposed a
+  deeper GK104-specific implementation than the local Nouveau source.
+- Current verified gates remain green: `py_compile`, `--middle-selftest`, and
+  `NV_BACKEND=software`. Hardware semaphore-only probes are still blocked at
+  `GP_GET=0`, so `hardware_demo=ok` has not yet been claimed.
+- Read-only inspection of TinyGPU `0x1704` found its live BAR1 instance at
+  VRAM `0x102000`. Earlier probes had allocated channel RAMIN at that exact
+  address and overwrote the BAR1 instance; the allocator now starts at
+  `0x400000` to preserve this reserved object. The current attached GPU still
+  reports `0xbad0...` from the already-corrupted BAR1 mapping, so another live
+  result requires a real device/function reset before it can validate the new
+  reservation.

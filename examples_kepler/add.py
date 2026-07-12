@@ -170,7 +170,7 @@ class TLSFAllocator:
     self._insert_block(start - self.base, self.blocks[start - self.base][0])._merge_block(start - self.base)
 
 class AddrSpace(enum.Enum):
-  PHYS = enum.auto(); SYS = enum.auto(); PEER = enum.auto()
+  PHYS = enum.auto(); SYS = enum.auto(); NCOH = enum.auto(); PEER = enum.auto()
 
 @dataclasses.dataclass(frozen=True)
 class VirtMapping:
@@ -180,7 +180,8 @@ class VirtMapping:
 # ============================================================================
 # GK104 GMMU page tables
 # ----------------------------------------------------------------------------
-# Kepler GK104 uses a 3-level GMMU (PD[2] -> PD[1] -> PT).  Entries are 8 bytes.
+# Kepler GK104 uses the GF100 2-level GMMU layout: a PGD covering VA bits
+# 39:27 and a 4-KiB small-page table covering bits 26:12. Entries are 8 bytes.
 # Big-page / 4KB-page support is present; we implement the 4KB (and 64KB big)
 # path here.  The exact PTE/PDE bit layout below follows the nouveau gk104_mmu
 # definitions and MUST be validated against the silicon during bring-up.
@@ -188,29 +189,22 @@ class VirtMapping:
 #   GK104_PTE_VALID  (1 << 0)
 #   GK104_PTE_WRITE  (1 << 1)
 #   GK104_PTE_READ   (1 << 2)
-#   GK104_PTE_APERTURE: 0 = VRAM, 2 = SYS (coherent)   (bits 4:3)
-#   address field: bits [28:8] of the page frame (i.e. (paddr >> 8) << 8 ...)
+#   GF100_PTE target is at bits 33:34, storage kind at 36:43, and the
+#   physical address is stored as (paddr >> 8) in bits 4:31.
 #
 # KEPLER-TODO: confirm PTE/PDE bit positions against running nouveau / an
 # nvkm register dump on the GTX 770 (especially the aperture bits and the
 # big-page encoding for 64KB pages).
 # ============================================================================
 class GK104PageTableEntry:
-  # GK104 GMMU PTE/PDE follow the G80-derived 8-byte layout (envytools
-  # rnndb/memory/g80_vm.xml, reused on Kepler):
-  #   bit  0     : PRESENT  (also the low bit of PDE PT_TYPE)
-  #   bit  3     : READ_ONLY (set => read-only, clear => read/write)
-  #   bits 4-5   : TARGET   (0=VRAM, 1=P2P, 2=SYSRAM, 3=SYSRAM_NO_SNOOP)
-  #   bits 12-39 : ADDRESS  (page frame >> 12)
-  # PDE PT_TYPE (bits 0-1): 0=NOT_PRESENT, 1=64K, 2=16K, 3=4K.
+  # GF100_VM/GK104 uses the same PDE/PTE format as the GF100 Nouveau VMM.
   PTE_VALID = 1 << 0
-  PTE_READ_ONLY = 1 << 3
-  PTE_PDE_4K = 0x3            # PDE PT_TYPE = 4K page table (bits 0-1)
-  PTE_APER_VRAM = 0 << 4
-  PTE_APER_SYS  = 2 << 4
-  PTE_FRAME = 0xFFFFFF000     # bits [39:12] of the page frame
-  # Convenience flags (NOT real G80 bits) kept for the offline self-test so the
-  # assertions read naturally; set on every writable leaf.
+  PTE_READ_ONLY = 1 << 2
+  PTE_PDE_4K = 2 << 32         # HOST small-page table in a GF100 PDE
+  PTE_APER_VRAM = 0 << 33
+  PTE_APER_SYS  = 2 << 33
+  PTE_FRAME = 0xFFFFFFF0       # address field bits [4:31], paddr >> 8
+  # Convenience flags retained for the offline self-test.
   PTE_READ  = 1 << 1
   PTE_WRITE = 1 << 2
 
@@ -223,7 +217,8 @@ class GK104PageTableEntry:
   def entry(self, idx):
     return self._read64(idx)
   def valid(self, idx):
-    return (self.entry(idx) & self.PTE_VALID) != 0
+    present = (0x3 << 32) if self.lv == 1 else self.PTE_VALID
+    return (self.entry(idx) & present) != 0
   def is_page(self, idx):
     # A level-0 entry is a leaf page.
     return self.lv == 0
@@ -235,33 +230,33 @@ class GK104PageTableEntry:
     # can index the next level with the same offsets the allocator uses.
     base = getattr(self.dev, "mm", None)
     bus = base.bus_base if base else 0
-    return (self.entry(idx) & self.PTE_FRAME) - bus
+    entry = self.entry(idx)
+    if self.lv == 1:
+      return ((entry >> 36) << 12) - bus
+    return ((entry & self.PTE_FRAME) << 8) - bus
   def set_entry(self, idx, paddr, table=False, valid=True, aspace=AddrSpace.PHYS, uncached=False, snooped=False, frag=0):
-    # Build the 8-byte PTE/PDE (G80-derived, see plan §24.1).  For a leaf page
-    # we set PRESENT and the TARGET aperture bit; READ_ONLY (bit 3) stays clear
-    # so the page is writable.  The frame is the GPU-visible physical address
-    # (bus_base + paddr) in bits [39:12].  For an upper-level PDE we set
-    # PT_TYPE=4K and point at the next table's frame.
-    aper = self.PTE_APER_SYS if aspace is AddrSpace.SYS else self.PTE_APER_VRAM
+    # Build the GF100/GK104 8-byte leaf or small-page PDE.
     base = getattr(self.dev, "mm", None)
-    bus = base.bus_base if base else 0
-    frame = ((bus + paddr) & self.PTE_FRAME)
+    bus = base.bus_base if base and aspace is not AddrSpace.PHYS else 0
     if table:
-      val = frame | self.PTE_PDE_4K | aper
+      val = self.PTE_PDE_4K | (1 << 34) | ((bus + paddr) << 24)
     else:
-      val = frame | self.PTE_VALID | aper
+      aper = (self.PTE_APER_SYS if aspace is AddrSpace.SYS else
+              (3 << 33) if aspace is AddrSpace.NCOH else self.PTE_APER_VRAM)
+      vol = (1 << 32) if aspace is AddrSpace.SYS else 0
+      val = ((bus + paddr) >> 8) | self.PTE_VALID | vol | aper
     self._write64(idx, val)
   def palloc(self, size, zero=False, boot=False, ptable=False):
     return self.dev.mm.palloc(size, zero=zero, boot=boot, ptable=ptable)
 
 
 class GK104MemoryManager:
-  """Kepler GK104 GMMU memory manager (3-level)."""
+  """Kepler GK104 GMMU memory manager using Nouveau's GF100 layout."""
   va_allocator = None
   va_bits = 40
-  # 3 levels: PD2 (top), PD1, PT.  va_shifts are the per-level address decode.
-  va_shifts = [9, 9, 12]   # KEPLER-TODO: confirm against gk104_mmu level decode
-  pte_cnt = [512, 512, 512]
+  # PGD index is VA[39:27], SPT index is VA[26:12].
+  va_shifts = [15, 13, 12]
+  pte_cnt = [1 << 15, 1 << 13]
   pt_t = GK104PageTableEntry
 
   def __init__(self, dev, vram_size, boot_size, bus_base=0):
@@ -269,18 +264,20 @@ class GK104MemoryManager:
     self.bus_base = bus_base  # GPU-visible base of `vram` (sysmem bus addr)
     self.boot_allocator = TLSFAllocator(boot_size, base=0)
     self.pa_allocator = TLSFAllocator(vram_size - boot_size, base=boot_size)
-    GK104MemoryManager.va_allocator = TLSFAllocator(1 << 36, base=0x1000)
-    self.root_pa = self.palloc(0x1000, zero=True, boot=True)
-    self.root_page_table = self.pt_t(self.dev, self.root_pa, lv=2)
+    # Keep VA zero reserved, but use an absolute allocator base so hardware
+    # ring/context alignment is not skewed by a 0x1000 allocator offset.
+    GK104MemoryManager.va_allocator = TLSFAllocator(1 << 36, base=0)
+    GK104MemoryManager.va_allocator.alloc(0x1000, 0x1000)
+    self.root_pa = self.palloc(0x10000, zero=True, boot=True)
+    self.root_page_table = self.pt_t(self.dev, self.root_pa, lv=1)
     self.vram = dev.vram
   def alloc_vaddr(self, size, align=0x1000):
     return GK104MemoryManager.va_allocator.alloc(size, max((1 << (size.bit_length() - 1)), align))
   def map_range(self, vaddr, size, paddrs, aspace, uncached=False, snooped=False, boot=False):
-    # 3-level GK104 GMMU walk.  VA decode (4KB pages):
+    # GF100/GK104 2-level walk for 4-KiB pages:
     #   [11:0]   page offset
-    #   [20:12]  level-0 (PT)  index  (9 bits)
-    #   [29:21]  level-1 (PD1) index  (9 bits)
-    #   [38:30]  level-2 (PD2) index  (9 bits)
+    #   [26:12]  small-page table index (15 bits)
+    #   [39:27]  PGD index (13 bits)
     # `paddrs` is a list of (paddr, seg_size) physical segments; we walk VA and
     # PA together and populate PDE/PTE entries (allocated from the boot region
     # as page-table pages).
@@ -294,19 +291,21 @@ class GK104MemoryManager:
     for i in range(pages):
       v = vaddr + i * 0x1000
       p = pa_at(i * 0x1000)
-      lv0 = (v >> 12) & 0x1FF
-      lv1 = (v >> 21) & 0x1FF
-      lv2 = (v >> 30) & 0x1FF
-      pd2 = self.root_page_table
-      if not pd2.valid(lv2):
-        pd1_pa = self.palloc(0x1000, zero=True, boot=True, ptable=True)
-        pd2.set_entry(lv2, pd1_pa, table=True)
-      pd1 = self.pt_t(self.dev, pd2.address(lv2), lv=1)
-      if not pd1.valid(lv1):
-        pt_pa = self.palloc(0x1000, zero=True, boot=True, ptable=True)
-        pd1.set_entry(lv1, pt_pa, table=True)
-      pt = self.pt_t(self.dev, pd1.address(lv1), lv=0)
-      pt.set_entry(lv0, p, table=False, aspace=aspace)
+      pgd_idx = (v >> 27) & 0x1FFF
+      spt_idx = (v >> 12) & 0x7FFF
+      pgd = self.root_page_table
+      if not pgd.valid(pgd_idx):
+        spt_pa = self.palloc(0x40000, zero=True, boot=True, ptable=True)
+        # GF100_PDE: SPT present at bit 32, HOST target at bits 33:34,
+        # and SPT address at bits 36:63 (physical address << 24).
+        # The SPT itself is allocated from the boot/system pool; this target
+        # describes the page-table storage, not the mapped leaf pages.
+        pde_target = (2 << 32) | (1 << 34)
+        struct.pack_into("<Q", self.dev.vram, pgd.paddr + pgd_idx * 8,
+                         pde_target |
+                         ((self.bus_base + spt_pa) << 24))
+      spt = self.pt_t(self.dev, pgd.address(pgd_idx), lv=0)
+      spt.set_entry(spt_idx, p, table=False, aspace=aspace)
     return VirtMapping(vaddr, size, [p for p, _ in paddrs], aspace, uncached, snooped)
   def palloc(self, size, align=0x1000, zero=True, boot=False, ptable=False):
     allocator = self.boot_allocator if boot else self.pa_allocator
@@ -401,6 +400,21 @@ def elf_loader(blob, force_section_align=1, link_libs=None):
   e_phentsize, e_phnum = struct.unpack_from("<HH", blob, 0x36)
   e_shentsize, e_shnum = struct.unpack_from("<HH", blob, 0x3a)
   return {"phoff": e_phoff, "shoff": e_shoff, "phnum": e_phnum, "shnum": e_shnum}
+
+def elf_section_bytes(blob, wanted):
+  """Return one ELF64 section payload by name (used to upload SASS, not ELF)."""
+  shoff = struct.unpack_from("<Q", blob, 0x28)[0]
+  entsz, count = struct.unpack_from("<HH", blob, 0x3a)
+  shstrndx = struct.unpack_from("<H", blob, 0x3e)[0]
+  def sh(i): return struct.unpack_from("<IIQQQQIIQQ", blob, shoff + i * entsz)
+  shstr = sh(shstrndx)
+  names = blob[shstr[4]:shstr[4] + shstr[5]]
+  for i in range(count):
+    h = sh(i)
+    end = names.find(b"\0", h[0])
+    if names[h[0]:end].decode(errors="replace") == wanted:
+      return bytes(blob[h[4]:h[4] + h[5]])
+  raise KeyError(wanted)
 
 
 # ============================================================================
@@ -626,8 +640,9 @@ class PCIIfaceBase:
     # initialized by a VBIOS on an eGPU.
     dev_impl = self.dev.dev_impl
     mm = dev_impl.mm
-    aspace = AddrSpace.SYS if dev_impl.hw is not None else AddrSpace.PHYS
-    mapping = mm.valloc(size, uncached=uncached, contiguous=contiguous, aspace=aspace)
+    aspace = kwargs.get("aspace", AddrSpace.SYS if dev_impl.hw is not None else AddrSpace.PHYS)
+    mapping = mm.valloc(size, align=kwargs.get("align", 0x1000),
+                        uncached=uncached, contiguous=contiguous, aspace=aspace)
     pa = mapping.paddrs[0]
     cpu = dev_impl.vram[pa:pa + size]
     return HCQBuffer(mapping.va_addr, size, meta={"pa": pa}, _base=cpu)
@@ -765,6 +780,7 @@ class NVDevice:
     dev = self.dev_impl
     dev.hw = self.iface.pci_dev
     dev.hw.bar_info(0)  # MAP_BAR: map the register BAR before any MMIO
+    dev.bar1_addr, dev.bar1_size = dev.hw.bar_info(1)  # real BAR1 USERD aperture
     # 1. Identify + enable engines.
     boot0 = self.read32(0x0)  # PMC_BOOT_0 (dev_id/step)
     if DEBUG: print(f"[kepler] PMC_BOOT_0={boot0:#x}")
@@ -1809,7 +1825,10 @@ def find_kepler_firmware():
 # ============================================================================
 METHOD_NAMES = {
   0x0000: "SET_OBJECT",
-  0x005c: "NVC56F_SEM_ADDR_LO",
+  0x0010: "NV906F_SEMAPHORE_ADDRESS_HIGH",
+  0x0014: "NV906F_SEMAPHORE_ADDRESS_LOW",
+  0x0018: "NV906F_SEMAPHORE_SEQUENCE",
+  0x001c: "NV906F_SEMAPHORE_TRIGGER",
   0x02b4: "KEPLER_COMPUTE_LAUNCH_DESC_ADDRESS",
   0x02bc: "KEPLER_COMPUTE_LAUNCH",
   0x160c: "KEPLER_COMPUTE_CODE_ADDRESS_LO",
@@ -1821,21 +1840,25 @@ METHOD_NAMES = {
 def nvm(subchannel, method, *args, typ=2):
   return [(typ << 28) | (len(args) << 16) | (subchannel << 13) | (method >> 2), *args]
 
+def gk104_semaphore(addr, value, operation):
+  """Emit the GK104/NV906F subchannel semaphore sequence."""
+  return [*nvm(0, 0x0010, (addr >> 32) & 0xffffffff,
+              addr & 0xffffffff, value, operation)]
+
 def build_launch_words(timeline_addr, wait_value, done_value, launch_desc_addr, code_va=0):
   # Kepler compute launch (envytools gk104_compute.xml, plan §24.3): bind the
   # compute class via SET_OBJECT, set the shader PC via CODE_ADDRESS_LO/HI
   # (0x160c/0x1608), point at the CWD via LAUNCH_DESC_ADDRESS (0x02b4, VA>>8),
   # then LAUNCH (0x02bc, value=3) to trigger.  Semaphore + cache-invalidate wrap.
-  lo, hi = timeline_addr & 0xffffffff, timeline_addr >> 32
   return [
     *nvm(1, 0x0000, KEPLER_COMPUTE_A),            # SET_OBJECT: bind compute class
-    *nvm(0, 0x005c, lo, hi, wait_value, 0, 0x01000003),
+    *gk104_semaphore(timeline_addr, wait_value, 0x00000004), # ACQUIRE_GEQUAL
     *nvm(1, 0x1698, 0x00001011),                  # INVALIDATE_SHADER_CACHES
     *nvm(1, 0x160c, code_va & 0xffffffff),        # CODE_ADDRESS_LO (shader PC base)
     *nvm(1, 0x1608, code_va >> 32),               # CODE_ADDRESS_HI
     *nvm(1, 0x02b4, launch_desc_addr >> 8),       # LAUNCH_DESC_ADDRESS (VA<<8 by HW)
     *nvm(1, 0x02bc, 0x3),                          # LAUNCH (trigger, value=3)
-    *nvm(0, 0x005c, lo, hi, done_value, 0, 0x03100001),
+    *gk104_semaphore(timeline_addr, done_value, 0x00000002), # RELEASE, WFI enabled
     *nvm(0, 0x0020, 0),
   ]
 
@@ -1849,10 +1872,9 @@ def decode_words(words):
     index += size + 1
 
 def describe_args(method, args):
-  if method == 0x005c and len(args) == 5:
-    sem_addr = (args[1] << 32) | args[0]
-    payload = (args[3] << 32) | args[2]
-    return [f"sem_addr=0x{sem_addr:x}", f"payload={payload}", f"execute=0x{args[4]:08x}"]
+  if method == 0x0010 and len(args) == 4:
+    sem_addr = (args[0] << 32) | args[1]
+    return [f"sem_addr=0x{sem_addr:x}", f"sequence={args[2]}", f"trigger=0x{args[3]:08x}"]
   if method == 0x02b4 and len(args) == 1:
     return [f"cwd_addr=0x{args[0] << 8:x}"]
   if method == 0x02bc and len(args) == 1:
@@ -1880,7 +1902,7 @@ def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=256, regs
   struct.pack_into("<I", desc, 0x4c, block_y | (block_z << 16))  # BLOCKDIM_YZ
   struct.pack_into("<I", desc, 0x50, 0x1)                      # CB_VALID: c0 enabled
   struct.pack_into("<I", desc, 0x74, cbuf_addr & 0xffffffff)   # CB_CONFIG_0 (c0 addr lo)
-  struct.pack_into("<I", desc, 0x78, ((cbuf_addr >> 32) & 0xff) | (cbuf_size << 8))  # CB_CONFIG_1
+  struct.pack_into("<I", desc, 0x78, ((cbuf_addr >> 32) & 0xff) | (cbuf_size << 15))  # CB_CONFIG_1: SIZE[31:15]
   struct.pack_into("<I", desc, 0xb8, (regs & 0x3f) << 24)      # GPR_ALLOC (bits 24-29)
   return bytes(desc)
 
@@ -1894,7 +1916,7 @@ class NVProgram:
   kernargs_alloc_size = 256
 class NVAllocator:
   def __init__(self, dev): self.dev = dev
-  def alloc(self, size): return self.dev.iface.alloc(size)
+  def alloc(self, size, **kwargs): return self.dev.iface.alloc(size, **kwargs)
   def _copyin(self, dst, src):
     # dev.vram is a CPU-coherent buffer on both backends (host bytearray for
     # software, mmap'd sysmem for hardware), so a plain slice write is enough.
@@ -1906,7 +1928,7 @@ class NVAllocator:
 
 
 MIDDLE_CUBIN_BYTES = 2856
-MIDDLE_LAUNCH_WORDS = 26   # 9 methods: SET_OBJECT(2)+SEM(6)+INV(2)+CODE_LO(2)+CODE_HI(2)+LDESC(2)+LAUNCH(2)+SEM(6)+INT(2) = 26 words
+MIDDLE_LAUNCH_WORDS = 24   # SET_OBJECT(2)+SEM(5)+INV(2)+CODE_LO(2)+CODE_HI(2)+LDESC(2)+LAUNCH(2)+SEM(5)+INT(2)
 
 def kepler_selftest():
   """Tier 1 offline gate (no eGPU required): cubin structure + GMMU helpers
@@ -1926,8 +1948,8 @@ def kepler_selftest():
   assert len(words) == MIDDLE_LAUNCH_WORDS, f"launch word count {len(words)} != {MIDDLE_LAUNCH_WORDS}"
   assert any(m == 0x02bc for _, _, _, m, _, _ in decoded), "expected KEPLER_COMPUTE_LAUNCH method"
   assert any(m == 0x02b4 for _, _, _, m, _, _ in decoded), "expected KEPLER_COMPUTE_LAUNCH_DESC_ADDRESS method"
-  sem_methods = [m for _, _, _, m, _, _ in decoded if m == 0x005c]
-  assert len(sem_methods) == 2, "expected two semaphore methods"
+  sem_methods = [m for _, _, _, m, _, _ in decoded if m == 0x0010]
+  assert len(sem_methods) == 2, "expected two GK104 semaphore sequences"
 
   # helpers sanity
   assert lo32(0x123456789abcdef0) == 0x9abcdef0
@@ -1941,25 +1963,24 @@ def kepler_selftest():
   # GK104 GMMU helper sanity: PTE bit construction (no device needed)
   pte = GK104PageTableEntry(None, 0, 0)
   # Writable VRAM leaf: PRESENT set, READ_ONLY (bit 3) clear, TARGET=VRAM.
-  leaf = pte.PTE_VALID | (0x1000 & pte.PTE_FRAME) | pte.PTE_APER_VRAM
+  leaf = pte.PTE_VALID | (0x1000 >> 8) | pte.PTE_APER_VRAM
   assert leaf & pte.PTE_VALID, "Kepler PTE must be valid"
   assert not (leaf & pte.PTE_READ_ONLY), "Kepler leaf PTE must be writable (READ_ONLY clear)"
-  assert (leaf & 0x30) == pte.PTE_APER_VRAM, "Kepler PTE aperture must be VRAM"
+  assert (leaf & (0x3 << 33)) == pte.PTE_APER_VRAM, "Kepler PTE aperture must be VRAM"
 
-  # GK104 GMMU 3-level walk sanity (software VRAM stand-in, no eGPU needed)
+  # GK104/GF100 2-level walk sanity (software VRAM stand-in, no eGPU needed)
   class _FakeDev:
     def __init__(self, vram): self.vram = vram; self.mm = None
   fd = _FakeDev(memoryview(bytearray(1 << 20)))
-  fd.mm = GK104MemoryManager(fd, 1 << 20, 1 << 16)
+  fd.mm = GK104MemoryManager(fd, 1 << 20, 1 << 19)
   mp = fd.mm.map_range(0x1000, 0x3000, [(0x2000, 0x3000)], AddrSpace.PHYS)
-  pd2 = fd.mm.root_page_table
-  assert pd2.valid((0x1000 >> 30) & 0x1FF), "PD2 entry must be present"
-  pd1 = GK104PageTableEntry(fd, pd2.address((0x1000 >> 30) & 0x1FF), lv=1)
-  assert pd1.valid((0x1000 >> 21) & 0x1FF), "PD1 entry must be present"
-  pt = GK104PageTableEntry(fd, pd1.address((0x1000 >> 21) & 0x1FF), lv=0)
-  assert pt.valid((0x1000 >> 12) & 0x1FF), "PTE must be present"
+  pgd = fd.mm.root_page_table
+  pgd_idx, spt_idx = (0x1000 >> 27) & 0x1FFF, (0x1000 >> 12) & 0x7FFF
+  assert pgd.valid(pgd_idx), "PGD entry must be present"
+  spt = GK104PageTableEntry(fd, pgd.address(pgd_idx), lv=0)
+  assert spt.valid(spt_idx), "PTE must be present"
   # leaf frame should resolve back to the mapped physical page
-  assert pt.address((0x1000 >> 12) & 0x1FF) == 0x2000, "PTE frame must match paddr"
+  assert spt.address(spt_idx) == 0x2000, "PTE frame must match paddr"
   assert mp.size == 0x3000 and mp.paddrs == [0x2000]
 
   print(f"kepler_selftest=ok cubin_sha={sha} launch_words={len(words)} sections={eh['shnum']}")
@@ -2023,7 +2044,7 @@ def run_software_demo(dev):
 # nouveau (allbilly/linux_drm) + pascal-egpu:
 #   RAMIN instance: pgd base @0x00/0x04, USERD base @0x08/0x0c,
 #     GR ctx ptr @0x0210/0x0214, GP_PUT @0x48, GP_GET @0x4c.
-#   USERD GP_PUT offset = 0x88 (RAMFC_GP_PUT).
+#   USERD GP_GET=0x88, GP_PUT=0x8c (nvif/chan506f.c).
 #   Channel bind: 0x800000 + id*8  = 0x80000000 | (inst_addr >> 12)
 #   Channel start: 0x800004 + id*8 |= 0x400
 #   PFIFO_RUNLIST_SUBMIT = 0x2274
@@ -2031,15 +2052,31 @@ def run_software_demo(dev):
 CHAN_SUBMIT_REG = 0x800000
 CHAN_START_REG  = 0x800004
 PFIFO_RUNLIST_SUBMIT = 0x2274
-RAMFC_GP_PUT = 0x88
+USERD_GP_GET = 0x88
+USERD_GP_PUT = 0x8c
+
+# GK104 GPFIFO entries are 8 bytes: a push-buffer address followed by a
+# length/flags word. GP_PUT/GP_GET are ring-entry indices, not byte addresses.
+GPFIFO_ENTRY_BYTES = 8
 
 def _gk104_pgd_entry(dev, table_pa):
-  """Build the GMMU page-directory entry written into the channel RAMIN (PDE
-  4K format: PRESENT + PT_TYPE=4K + aperture + frame@bus addr)."""
+  """Build the VMM join value for a system-memory page directory."""
   mm = dev.dev_impl.mm
-  aper = GK104PageTableEntry.PTE_APER_SYS  # sysmem path (plan §24.1)
-  frame = (mm.bus_base + table_pa) & GK104PageTableEntry.PTE_FRAME
-  return GK104PageTableEntry.PTE_PDE_4K | aper | frame
+  return (mm.bus_base + table_pa) | 0x6  # HOST target + VOL
+
+def _gk104_vmm_flush(dev):
+  """Flush the GF100/GK104 page tables after populating new mappings."""
+  mm = dev.dev_impl.mm
+  pdb = mm.bus_base + mm.root_pa
+  # gf100_vmm_invalidate(): HOST PDB target (2), PDB address in bits 4:.
+  dev.write32(0x100cb8, 2 | ((pdb >> 12) << 4))
+  dev.write32(0x100cbc, 0x80000001)  # PAGE_ALL
+  deadline = time.time() + 0.2
+  while time.time() < deadline:
+    if dev.read32(0x100c80) & 0x00008000:
+      return True
+    time.sleep(0.001)
+  return False
 
 def submit_launch(dev, words, signal_pa, wait_value, done_value):
   """Set up a GK104 compute channel (RAMIN + USERD + GPFIFO), push `words` into
@@ -2052,51 +2089,309 @@ def submit_launch(dev, words, signal_pa, wait_value, done_value):
   alloc = NVAllocator(dev)
   ramin = alloc.alloc(0x1000)
   userd = alloc.alloc(0x200)
-  gpfifo = alloc.alloc(0x1000)   # 256 entries x 16 bytes
+  gpfifo = alloc.alloc(0x2000, align=0x2000)   # 512 entries x 8 bytes, limit2=10
+  runlist = alloc.alloc(0x1000, aspace=AddrSpace.NCOH)
+  push = alloc.alloc(0x10000, align=0x10000)  # Nouveau main push buffer
   # GR engine context buffer (RAMIN 0x0210).  nouveau allocates
   # CB_RESERVED(0x80000) + gr->size and fills it via gf100_grctx_generate_main
   # (bundle/pagepool/attrib_cb ctxsw bundles).  We allocate + zero it; the
   # ctxsw content is KEPLER-TODO (needs the gk104 grctx init data on silicon).
   gr_ctx = alloc.alloc(0x100000)
-  chan_id = 0
+  chan_id = int(os.environ.get("KEPLER_CHAN_ID", "1"))
+  userd_base_off = chan_id * 0x200
+  use_vram_inst = os.environ.get("KEPLER_VRAM_INST") == "1" and dev.dev_impl.hw is not None
+  use_vram_runlist = os.environ.get("KEPLER_VRAM_RUNLIST") == "1" and dev.dev_impl.hw is not None
+  if DEBUG and dev.dev_impl.hw is not None:
+    bar1_ctl = dev.read32(0x1704)
+    bar1_inst_pa = (bar1_ctl & 0x3fffffff) << 12
+    try:
+      bar1_head = dev.dev_impl.hw.mmio_read(1, bar1_inst_pa + 0x200, 16).hex()
+    except Exception as e:
+      bar1_head = f"read-error:{type(e).__name__}"
+    print(f"[kepler] existing_bar1 ctl={bar1_ctl:#x} inst={bar1_inst_pa:#x} "
+          f"pdb={bar1_head}")
+  # TinyGPU's pre-existing BAR1 VMM instance is at 0x102000 on this board;
+  # never allocate channel RAMIN/USERD over that live page-table object.
+  bar1_cursor = 0x400000
+  def bar1_alloc(size, align=0x1000):
+    nonlocal bar1_cursor
+    bar1_cursor = round_up(bar1_cursor, align)
+    pa = bar1_cursor
+    bar1_cursor += round_up(size, 0x1000)
+    if bar1_cursor > dev.dev_impl.bar1_size:
+      raise MemoryError("BAR1-backed instance allocation exceeds aperture")
+    return pa
+  def bar1_write(pa, data):
+    dev.dev_impl.hw.mmio_write(1, pa, bytes(data))
+  if use_vram_inst:
+    # gk104_chan_ramfc_write() puts the USERD memory object's VRAM address in
+    # RAMFC 0x08.  BAR1 is then the CPU mapping used to access that VRAM.  Keep
+    # those two address domains distinct; the PCI BAR resource address is not
+    # a GPU USERD address.
+    userd_vram_pa = bar1_alloc(0x2000, align=0x2000)
+    # Nouveau's nvkm_gpuobj_new() uses NVKM_MEM_TARGET_INST for the channel
+    # instance and GR context. Keep their direct physical addresses in the
+    # framebuffer aperture, while ordinary buffers remain in the VMM SYS path.
+    ramin_vram_pa = bar1_alloc(0x1000)
+    grctx_vram_pa = bar1_alloc(0x100000)
+    gr_ctx = HCQBuffer(0x08000000, 0x100000, meta={"pa": grctx_vram_pa})
+    dev.dev_impl.mm.map_range(gr_ctx.va_addr, gr_ctx.size,
+                              [(grctx_vram_pa, gr_ctx.size)], AddrSpace.PHYS)
+  else:
+    ramin_vram_pa = None
+    userd_vram_pa = None
+  if use_vram_runlist:
+    runlist_vram_pa = bar1_alloc(0x1000)
+  else:
+    runlist_vram_pa = None
+  # Kepler's main GPFIFO entry is laid out as push base + 0x10000. Mirror the
+  # Nouveau virtual layout even though the two backing allocations are local.
+  push_va = 0x10000000
+  gpfifo_va = push_va + 0x10000
+  mm.map_range(push_va, push.size, [(push.meta['pa'], push.size)], AddrSpace.SYS)
+  mm.map_range(gpfifo_va, gpfifo.size, [(gpfifo.meta['pa'], gpfifo.size)], AddrSpace.SYS)
+  push.va_addr, gpfifo.va_addr = push_va, gpfifo_va
+  if DEBUG:
+    print(f"[kepler] fifo_vas ramin={ramin.va_addr:#x} userd={userd.va_addr:#x} "
+          f"gpfifo={gpfifo.va_addr:#x} runlist={runlist.va_addr:#x} push={push.va_addr:#x} "
+          f"gr_ctx={gr_ctx.va_addr:#x}")
+  if DEBUG:
+    print(f"[kepler] vmm_flush={'done' if _gk104_vmm_flush(dev) else 'timeout'} "
+          f"pdb={dev.dev_impl.mm.bus_base + dev.dev_impl.mm.root_pa:#x}")
+  else:
+    _gk104_vmm_flush(dev)
 
   ramin_pa, userd_pa, gpfifo_pa = ramin.meta['pa'], userd.meta['pa'], gpfifo.meta['pa']
   grctx_pa = gr_ctx.meta['pa']
+  # ctxgf100.c allocates the golden context from INST/VRAM, not sysmem. Use a
+  # BAR1-backed 1 MiB region for the hardware path; the sysmem allocation is
+  # retained only as the software/offline backing object.
+  ctx_header = gr_ctx.meta['pa'] + 0x80000
+  if use_vram_inst:
+    header = bytearray(0x2c)
+    struct.pack_into("<IIII", header, 0x1c, 1, 0, 0, 0)
+    bar1_write(ctx_header, header)
+  else:
+    struct.pack_into("<IIII", vram, ctx_header + 0x1c, 1, 0, 0, 0)
   inst = bytearray(0x1000)
   pgd = _gk104_pgd_entry(dev, mm.root_pa)
-  struct.pack_into("<I", inst, 0x00, pgd & 0xffffffff)
-  struct.pack_into("<I", inst, 0x04, pgd >> 32)
-  struct.pack_into("<I", inst, 0x08, (base + userd_pa) & 0xffffffff)   # USERD lo
-  struct.pack_into("<I", inst, 0x0c, (base + userd_pa) >> 32)          # USERD hi
-  struct.pack_into("<I", inst, 0x0210, (base + grctx_pa) & 0xffffffff)  # GR ctx ptr lo
-  struct.pack_into("<I", inst, 0x0214, (base + grctx_pa) >> 32)        # GR ctx ptr hi
+  # gf100_vmm_join(): the channel VMM instance stores the page-directory
+  # pointer at 0x200, not in the RAMFC's 0x00 area.
+  struct.pack_into("<I", inst, 0x0200, pgd & 0xffffffff)
+  struct.pack_into("<I", inst, 0x0204, pgd >> 32)
+  userd_addr = ((userd_vram_pa + userd_base_off) if use_vram_inst else
+                (dev.dev_impl.bar1_addr + userd_base_off))
+  struct.pack_into("<I", inst, 0x08, userd_addr & 0xffffffff)   # USERD lo
+  struct.pack_into("<I", inst, 0x0c, userd_addr >> 32)          # USERD hi
+  # ctxgf100.c: RAMIN points at ctx->addr + CB_RESERVED (0x80000), not the
+  # allocation base; bit 2 marks the engine context pointer valid.
+  grctx_va = (gr_ctx.va_addr + 0x80000) | 4
+  struct.pack_into("<I", inst, 0x0210, grctx_va & 0xffffffff)  # GR ctx ptr lo
+  struct.pack_into("<I", inst, 0x0214, grctx_va >> 32)        # GR ctx ptr hi
   struct.pack_into("<I", inst, 0x48, 0)   # GP_PUT (relative)
   struct.pack_into("<I", inst, 0x4c, 0)   # GP_GET (relative)
-  vram[ramin_pa:ramin_pa + len(inst)] = bytes(inst)
+  if use_vram_inst:
+    bar1_write(ramin_vram_pa, inst)
+  else:
+    vram[ramin_pa:ramin_pa + len(inst)] = bytes(inst)
+  if DEBUG and use_vram_inst:
+    inst_read = dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + 0x48, 8)
+    print(f"[kepler] ramfc48={inst_read.hex()} userd={userd_addr:#x} "
+          f"gpfifo_va={gpfifo.va_addr:#x} ring_pa={gpfifo.meta['pa']:#x}")
 
-  # Write the GPFIFO ring.  GPFIFO entries are 8-byte METHOD headers; our
-  # `words` are already the raw dwords.
-  ring = bytearray(len(words) * 4)
+  # The methods live in a push buffer.  A GK104 GP entry is 8 bytes: the
+  # push-buffer GPU VA followed by its word count in bits 10..29.
+  push_bytes = bytearray(len(words) * 4)
   for i, w in enumerate(words):
-    struct.pack_into("<I", ring, i * 4, w)
-  vram[gpfifo_pa:gpfifo_pa + len(ring)] = bytes(ring)
+    struct.pack_into("<I", push_bytes, i * 4, w)
+  vram[push.meta['pa']:push.meta['pa'] + len(push_bytes)] = bytes(push_bytes)
+  ring = bytearray(GPFIFO_ENTRY_BYTES)
+  push_addr = push.va_addr
+  # This is the channel's main push buffer, matching nvif_chan_gpfifo_push_kick
+  # (main=true), so BIT(9) remains clear. The env override is a diagnostic for
+  # the alternate external-entry encoding used by nvif_chan_gpfifo_push().
+  gpfifo_external = os.environ.get("KEPLER_GPFIFO_EXTERNAL") == "1"
+  struct.pack_into("<II", ring, 0, push_addr & 0xffffffff,
+                   (push_addr >> 32) | ((1 << 9) if gpfifo_external else 0) |
+                   (len(words) << 10))
+  vram[gpfifo_pa:gpfifo_pa + len(ring)] = ring
+
+  # RAMFC GPFIFO base and ring-size log2, matching gk104_chan_ramfc_write().
+  gpfifo_va = gpfifo.va_addr
+  struct.pack_into("<II", inst, 0x48, gpfifo_va & 0xffffffff,
+                   (gpfifo_va >> 32) | (10 << 16))
+  # Remaining fields from gk104_chan_ramfc_write().
+  struct.pack_into("<I", inst, 0x10, 0x0000face)
+  struct.pack_into("<I", inst, 0x30, 0xfffff902)
+  struct.pack_into("<I", inst, 0x84, 0x20400000)
+  struct.pack_into("<I", inst, 0x94, 0x30000fff)
+  struct.pack_into("<I", inst, 0x9c, 0x00000100)
+  struct.pack_into("<I", inst, 0xac, 0x0000001f)
+  struct.pack_into("<I", inst, 0xe4, 0x00000000)
+  struct.pack_into("<I", inst, 0xe8, chan_id)
+  struct.pack_into("<I", inst, 0xb8, 0xf8000000)
+  struct.pack_into("<II", inst, 0xf8, 0x10003080, 0x10000010)
+  if use_vram_inst:
+    bar1_write(ramin_vram_pa, inst)
+  else:
+    vram[ramin_pa:ramin_pa + len(inst)] = bytes(inst)
+  if DEBUG and use_vram_inst:
+    inst_read = dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + 0x48, 8)
+    print(f"[kepler] ramfc48_final={inst_read.hex()} ring_words="
+          f"{struct.unpack_from('<II', vram, gpfifo_pa)} userd_ramfc="
+          f"{dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + 0x08, 8).hex()}")
+
+  # gk104_mc_reset[] maps NVKM_ENGINE_FIFO to PMC_ENABLE bit 0x100.  A
+  # previous TinyGPU process can leave the PBDMA context cache alive even
+  # though the RAMFC and USERD backing stores have been rewritten.  Keep this
+  # diagnostic opt-in until the live path is stable; it must happen before the
+  # PBDMA/runlist programming below.
+  if os.environ.get("KEPLER_FIFO_RESET") == "1":
+    before_fifo = dev.read32(PMC_ENABLE)
+    nvkm_mask(dev, PMC_ENABLE, 0x00000100, 0)
+    time.sleep(0.01)
+    nvkm_mask(dev, PMC_ENABLE, 0x00000100, 0x00000100)
+    if DEBUG:
+      print(f"[kepler] fifo_mc_reset PMC_ENABLE {before_fifo:#x} -> "
+            f"{dev.read32(PMC_ENABLE):#x}")
+
+  # gk104_runl_insert_chan(): runlist entries are (chid, 0), followed by a
+  # commit of the runlist GPU address and entry count.
+  runlist_pa = runlist_vram_pa if use_vram_runlist else runlist.meta['pa']
+  if use_vram_runlist:
+    bar1_write(runlist_pa, struct.pack("<II", chan_id, 0))
+  else:
+    struct.pack_into("<II", vram, runlist_pa, chan_id, 0)
+
+  # gf100_gr_fecs_bind_pointer() followed by gf100_gr_fecs_wfi_golden_save().
+  # These are required to make FECS materialize the golden GR image into the
+  # context buffer before PBDMA dispatches a compute method stream.
+  if dev.dev_impl.hw is not None:
+    inst_tag = 0x80000000 | ((base + ramin_pa) >> 12)
+
+  # gk104_fifo_init(): USERD is a BAR1-backed aperture on this generation.
+  # TinyGPU exposes the coherent allocation at the same GPU-visible base, so
+  # point PFIFO's BAR1 window at that base before submitting the runlist.
+  if os.environ.get("KEPLER_USERD_BAR1_ZERO") == "1":
+    userd_bar1_base = 0
+  else:
+    userd_bar1_base = (dev.dev_impl.bar1_addr
+                       if os.environ.get("KEPLER_USERD_BAR1_RESOURCE") == "1"
+                       else (userd_vram_pa if use_vram_inst else dev.dev_impl.bar1_addr))
+  dev.write32(0x2254, 0x10000000 | (userd_bar1_base >> 12))
+  # gk104_fifo_init_pbdmas(): enable the three GK104 PBDMAs and release the
+  # scheduler's error-disable latch before committing a runlist.
+  dev.write32(0x204, 0x7)
+  nvkm_mask(dev, 0x2a04, 0xbfffffff, 0xbfffffff)
+  # gf100_runq_init()/gk104_runq_init() for PBDMAs 0..2.  The 0x2390 values
+  # are hardware-provided runlist masks (gk104_runq_runm() only reads them),
+  # so do not overwrite them here.
+  for pbdma in range(3):
+    q = 0x40000 + pbdma * 0x2000
+    dev.write32(q + 0x13c, dev.read32(q + 0x13c) & ~0x10000100)
+    dev.write32(q + 0x108, 0xffffffff)
+    dev.write32(q + 0x10c, 0xfffffeff)
+    dev.write32(q + 0x148, 0xffffffff)
+    dev.write32(q + 0x14c, 0xffffffff)
+  dev.write32(0x2100, 0xffffffff)
+  dev.write32(0x2140, 0x7fffffff)
 
   # Bind + start the channel (nouveau gk104_chan_bind_inst / gk104_chan_start).
-  dev.write32(CHAN_SUBMIT_REG + chan_id * 8, 0x80000000 | ((base + ramin_pa) >> 12))
-  dev.write32(CHAN_START_REG + chan_id * 8, 0x400)
-  # Advance USERD GP_PUT past the written entries.
-  put = gpfifo_pa + len(ring)
-  vram[userd_pa + RAMFC_GP_PUT:userd_pa + RAMFC_GP_PUT + 4] = struct.pack("<I", put)
-  # Ring the PFIFO runlist to kick the channel.
-  dev.write32(PFIFO_RUNLIST_SUBMIT, chan_id)   # KEPLER-TODO: confirm arg/value
-
+  ramin_bind_addr = ramin_vram_pa if use_vram_inst else (base + ramin_pa)
+  # Tear down a channel left halted by an earlier diagnostic run before
+  # reusing CHID 0 and its BAR1 USERD state.
+  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x800, 0x800)
+  # gk104_chan_bind() also selects the runlist in bits 16..19 of the channel
+  # control word.  Do this explicitly for runlist 0; leaving the old value in
+  # place can bind the channel to a different scheduler than 0x2274 commits.
+  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x000f0000, 0)
+  dev.write32(CHAN_SUBMIT_REG + chan_id * 8, 0)
+  # gf100_chan_userd_clear(): a reused BAR1 USERD must start with matching
+  # GET/PUT and empty top-level pointers, otherwise PBDMA reports GPPTR.
+  userd_mmio_base = ((userd_vram_pa + userd_base_off) if use_vram_inst else
+                     userd_base_off)
+  for userd_off in (0x40, 0x44, 0x48, 0x4c, 0x50, 0x58, 0x5c, 0x60,
+                    USERD_GP_GET, USERD_GP_PUT):
+    dev.dev_impl.hw.mmio_write(1, userd_mmio_base + userd_off, struct.pack("<I", 0))
+  dev.write32(CHAN_SUBMIT_REG + chan_id * 8, 0x80000000 | (ramin_bind_addr >> 12))
+  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x400, 0x400)
+  # Make the channel visible to its runq before advancing USERD GP_PUT.
+  runlist_addr = runlist_pa if use_vram_runlist else (base + runlist_pa)
+  runlist_target = 0 if use_vram_runlist else 3
+  if DEBUG and use_vram_runlist:
+    print(f"[kepler] runlist_precommit="
+          f"{struct.unpack('<II', dev.dev_impl.hw.mmio_read(1, runlist_pa, 8))}")
+  # Match nvkm_runl_update_locked(): clear the pending runlist fault and
+  # unblock scheduler processing before submitting the new list.
+  dev.write32(0x262c, 1)
+  nvkm_mask(dev, 0x2630, 1, 0)
+  dev.write32(0x2270, (runlist_target << 28) | (runlist_addr >> 12))
+  dev.write32(PFIFO_RUNLIST_SUBMIT, 1)
+  if DEBUG and use_vram_runlist:
+    print(f"[kepler] runlist_vram pa={runlist_pa:#x} words="
+          f"{struct.unpack('<II', dev.dev_impl.hw.mmio_read(1, runlist_pa, 8))} "
+          f"runq_masks={[hex(dev.read32(0x2390 + i * 4)) for i in range(3)]}")
+  # gk104_runl_pending() is the per-runlist bit at 0x2284; nv50_runl_wait()
+  # waits for it to clear before a channel kick can rely on the new list.
+  deadline = time.time() + 0.2
+  while dev.read32(0x2284) & 0x00100000:
+    if time.time() >= deadline:
+      raise TimeoutError("GK104 runlist update did not complete")
+    time.sleep(0.001)
+  # Advance USERD GP_PUT past the written entry.
+  dev.dev_impl.hw.mmio_write(1, userd_mmio_base + USERD_GP_PUT, struct.pack("<I", 1))
+  userd_put_readback = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_mmio_base + USERD_GP_PUT, 4))[0]
+  if DEBUG:
+    print(f"[kepler] BAR1 USERD GP_PUT write=1 readback={userd_put_readback:#x} "
+          f"userd_pa={userd_addr:#x} bar1_off={userd_mmio_base:#x} "
+          f"bar1={dev.dev_impl.bar1_addr:#x} size={dev.dev_impl.bar1_size:#x}")
+  # Commit runlist 0.  Target 3 is non-coherent system memory in Nouveau's
+  # gf100_runl_commit(), and the count is separate from the channel ID.
   # Poll the host-visible semaphore page.
   for _ in range(2000):
     val = struct.unpack_from("<I", vram, signal_pa)[0]
     if val == done_value:
       return
     time.sleep(0.001)
-  raise TimeoutError(f"semaphore did not reach {done_value} (last={val})")
+  diag = {r: dev.read32(r) for r in (0x2254, 0x800000, 0x800004, 0x800008, 0x2270, 0x2274,
+                                     0x2100, 0x252c, 0x256c, 0x259c,
+                                     0x400000, 0x400004, 0x400014, 0x400048,
+                                     0x2800, 0x2804, 0x2808, 0x280c,
+                                     0x2810, 0x2814, 0x2818, 0x281c)}
+  for pbdma in range(3):
+    q = 0x40000 + pbdma * 0x2000
+    diag.update({q + off: dev.read32(q + off) for off in (0x108, 0x10c, 0x120, 0x13c,
+                                                            0x148, 0x14c, 0x150, 0x154,
+                                                            0x000, 0x004, 0x008, 0x010,
+                                                            0x014, 0x018, 0x048, 0x04c,
+                                                            0x054, 0x058, 0x05c, 0x064,
+                                                            0x0c0, 0x0c4,
+                                                            0x100, 0x104, 0x110, 0x114,
+                                                            0x118, 0x700, 0x704, 0x708,
+                                                            0x70c, 0x740, 0x744, 0x748,
+                                                            0x74c, 0x780, 0x784, 0x790)})
+  if DEBUG:
+    q0 = 0x40000
+    print("[kepler] pbdma0 pointers " + " ".join(
+      f"{name}=0x{dev.read32(q0 + off):08x}" for name, off in (
+        ("IB_PUT", 0x00), ("CTRL_LO", 0x08), ("SIG", 0x10),
+        ("IB_GET", 0x14), ("DMA_GET", 0x18), ("IB_ADDR", 0x48),
+        ("IB_CFG", 0x4c), ("IB_ENTRY", 0x54), ("DMA_PUT", 0x5c),
+        ("STATE0", 0x84), ("STATE1", 0x88), ("INTR", 0x108),
+        ("CH", 0x120))))
+  top = [dev.read32(0x22700 + i * 4) for i in range(64)]
+  gp_get = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_mmio_base + USERD_GP_GET, 4))[0]
+  push_get = struct.unpack("<II", dev.dev_impl.hw.mmio_read(1, userd_mmio_base + 0x58, 8))
+  remote_sem = None
+  if dev.dev_impl.hw is not None:
+    try:
+      remote_sem = dev.dev_impl.hw.sysmem_read(base + signal_pa, 4).hex()
+    except Exception as e:
+      remote_sem = f"read-error:{type(e).__name__}"
+  raise TimeoutError(f"semaphore did not reach {done_value} (last={val}, "
+                     f"remote_sem={remote_sem}, userd_gp_get={gp_get:#x}, "
+                     f"userd_push_get={[hex(x) for x in push_get]}, regs={diag}, "
+                     f"top={[hex(x) for x in top if x]})")
 
 def run_hardware_demo(dev):
   """End-to-end add on the real GTX 770 over TinyGPU (sysmem compute path,
@@ -2116,14 +2411,18 @@ def run_hardware_demo(dev):
   signal = allocator.alloc(16)
   # Code + constant (param) buffers for the launch descriptor.
   cubin = get_kepler_cubin()
-  code_dev = allocator.alloc(len(cubin))
-  allocator._copyin(code_dev, cubin)
+  sass = elf_section_bytes(cubin, ".text.E_4")
+  code_dev = allocator.alloc(round_up(len(sass), 0x100))
+  allocator._copyin(code_dev, sass)
   cbuf = bytearray(0x100)
   struct.pack_into("<Q", cbuf, 0x00, a_dev.va_addr)   # c0[0]: a
   struct.pack_into("<Q", cbuf, 0x08, b_dev.va_addr)   # c0[8]: b
   struct.pack_into("<Q", cbuf, 0x10, out_dev.va_addr)  # c0[16]: out
   cbuf_dev = allocator.alloc(len(cbuf))
   allocator._copyin(cbuf_dev, cbuf)
+  # build_launch_words() begins with a semaphore wait for wait_value=1.
+  # Seed the coherent semaphore before submitting the push buffer.
+  allocator._copyin(signal, struct.pack("<I", 1))
   cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(N, 1, 1), cbuf_addr=cbuf_dev.va_addr)
   cwd_dev = allocator.alloc(len(cwd))
   allocator._copyin(cwd_dev, cwd)
@@ -2131,6 +2430,16 @@ def run_hardware_demo(dev):
   allocator._copyin(b_dev, b_host.tobytes())
 
   words = build_launch_words(signal.va_addr, 1, 2, cwd_dev.va_addr, code_dev.va_addr)
+  if DEBUG:
+    pgd_idx = (signal.va_addr >> 27) & 0x1fff
+    spt_idx = (signal.va_addr >> 12) & 0x7fff
+    pgd_entry = dev.dev_impl.mm.root_page_table.entry(pgd_idx)
+    spt = GK104PageTableEntry(dev.dev_impl, dev.dev_impl.mm.root_page_table.address(pgd_idx), 0)
+    print(f"[kepler] vmm signal_va={signal.va_addr:#x} signal_pa={signal.meta['pa']:#x} "
+          f"bus={dev.dev_impl.mm.bus_base:#x} pgd={pgd_entry:#x} pte={spt.entry(spt_idx):#x}")
+  if os.environ.get("KEPLER_TEST_SEM_ONLY") == "1":
+    allocator._copyin(signal, struct.pack("<I", 0))
+    words = gk104_semaphore(signal.va_addr, 2, 0x00000002)
   submit_launch(dev, words, signal.meta['pa'], 1, 2)
 
   out_host = bytearray(N * 4)
