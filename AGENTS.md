@@ -1,5 +1,6 @@
-DO NOT attempt to remove files outside pwd
-working examples/add.py already but for another gpu model
+- DO NOT attempt to remove files outside pwd
+- DO NOT run commands or search that is too long
+- working examples/add.py already but for another gpu model
 
 ask deepwiki on ref repo
 - allbilly/nvgpu : this repo

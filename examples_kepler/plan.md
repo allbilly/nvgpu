@@ -1,3 +1,243 @@
+Do **not** “fix” this by mapping page `0xd8` yet. Nouveau’s loader deliberately assigns sequential virtual tags starting from the supplied initial tag; for the normal GK104 FECS upload that means `0x00, 0x01, …`. Your TLB dump therefore looks structurally correct. Nouveau writes one new tag every `0x100` bytes and pads only the final page; it does not create an extra `0xd8` mapping. ([Code Browser][1])
+
+The stronger conclusion is:
+
+> FECS is executing the wrong byte stream, starting at the wrong byte offset, or being disassembled with the wrong Falcon ISA configuration.
+
+A genuine GK104 FECS entry sequence should not immediately branch into a virtual page that the same firmware image never maps.
+
+## Most likely issue: firmware format or entry offset
+
+The first four bytes are:
+
+```text
+03 9b 0e f5
+```
+
+You previously treated the first three bytes as one unknown instruction and began the branch at byte 3:
+
+```text
+0000: 03 9b 0e      unknown
+0003: f5 98 00 d8   bra ae, 0xd803
+```
+
+That interpretation is suspect for two reasons:
+
+1. The very first instruction is unknown.
+2. The resulting second instruction branches outside the mapped image.
+
+That combination usually means **instruction-boundary desynchronization**, not a deliberate firmware path.
+
+The `f5` byte may be part of the first valid instruction, or the blob may include a header that must not be loaded as executable code.
+
+## Check these before modifying the loader
+
+### 1. Confirm exactly which file is being loaded
+
+At runtime, print:
+
+```python
+print("FECS code path:", fecs_code_path)
+print("FECS code size:", hex(len(fecs_code)))
+print("FECS code sha256:", hashlib.sha256(fecs_code).hexdigest())
+print("FECS first 64:", fecs_code[:64].hex(" "))
+```
+
+Also print the DMEM file’s path, size and hash. This catches common errors such as:
+
+* FECS data loaded as FECS code
+* GPCCS code loaded into FECS
+* an extracted container rather than the raw code segment
+* a stale file from another GPU generation
+* a symlink resolving to an unexpected firmware file
+
+A code size around `0xc00` is plausible. It does not itself prove the file is correct.
+
+### 2. Compare the file bytes with the words actually read back from IMEM
+
+Do not compare only `imem[0]`. Dump at least the first `0x40` bytes from both sources:
+
+```python
+def dump_words(data, count=16):
+    for i in range(count):
+        w = int.from_bytes(data[i * 4:i * 4 + 4], "little")
+        print(f"{i * 4:04x}: {w:08x}")
+
+print("FILE:")
+dump_words(fecs_code)
+
+print("IMEM:")
+for off in range(0, 0x40, 4):
+    falcon_set_imem_index(off)
+    print(f"{off:04x}: {rd32(FECS + 0x184):08x}")
+```
+
+The Nouveau implementation writes each host `u32` directly to the IMEM data port. On a normal little-endian host, the raw bytes `03 9b 0e f5` correspond to the MMIO word `0xf50e9b03`. ([Code Browser][1])
+
+Test all four possible transformations explicitly:
+
+```text
+file bytes:          03 9b 0e f5
+32-bit byte-swapped: f5 0e 9b 03
+16-bit swapped:      0e f5 03 9b
+halfword order:      9b 03 f5 0e
+```
+
+Do not apply any transformation unless one matches the known-good Nouveau image or produces a coherent disassembly.
+
+### 3. Verify `envydis` architecture and variant options
+
+An incorrect Falcon ISA version can decode valid opcodes as unknown and then lose synchronization.
+
+Run:
+
+```bash
+envydis --help
+```
+
+Then test the firmware using the Falcon generation/variant appropriate for Kepler FECS. Do not rely on a bare invocation if `envydis` supports chipset or Falcon-version selection.
+
+The acceptance criterion is not merely “no unknown instruction.” A correct decode should have:
+
+* a valid instruction at address zero
+* sensible instruction boundaries
+* branches landing inside mapped code
+* repeated valid code over several dozen instructions
+
+Try decoding from offsets `0`, `1`, `2`, `3`, and `4` as a diagnostic:
+
+```bash
+for n in 0 1 2 3 4; do
+    echo "=== offset $n ==="
+    dd if=gk104_fecs_code.bin bs=1 skip=$n status=none |
+        envydis <correct falcon options> - | head -30
+done
+```
+
+Only one offset should produce sustained coherent code. If offset `4` or a larger fixed offset works, the file likely contains a header.
+
+## Inspect the firmware file for a header
+
+Dump the first `0x100` bytes:
+
+```bash
+xxd -g1 -l 256 firmware/gk104/gk104_fecs_code.bin
+xxd -g4 -e -l 256 firmware/gk104/gk104_fecs_code.bin
+```
+
+Look for fields resembling:
+
+* magic/version
+* code size
+* data size
+* entry offset
+* code offset
+* bootloader offset
+
+Also check whether the file was extracted from a larger NVIDIA firmware package and whether the extraction tool already produced separate files such as:
+
+```text
+fecs_inst.bin
+fecs_data.bin
+fecs_code.bin
+hub.fuc
+```
+
+The filename alone is not sufficient evidence that byte zero is the executable entry.
+
+## Add an entry-point sweep—not a page-tag hack
+
+As a controlled diagnostic, set `UC_ENTRY` to candidate offsets within the existing image and observe the first PC sequence:
+
+```python
+for entry in (0x0, 0x1, 0x2, 0x3, 0x4, 0x8, 0x10, 0x20, 0x40, 0x100):
+    falcon_reset()
+    falcon_load_same_image()
+
+    wr32(FECS + 0x104, entry)
+    wr32(FECS + 0x100, 0x2)
+
+    pcs = []
+    for _ in range(32):
+        pcs.append(rd32(FECS + 0xff0))
+
+    print(f"entry={entry:#x}:",
+          " ".join(f"{pc:#x}" for pc in pcs[:12]),
+          f"ctrl={rd32(FECS + 0x100):#x}",
+          f"intr={rd32(FECS + 0x008):#x}")
+```
+
+This is only a discriminator. The correct entry must come from the firmware format or Nouveau’s firmware descriptor, not from whichever offset happens to run longest.
+
+## Patch direction for `add.py`
+
+At the loader, preserve sequential tags:
+
+```python
+def falcon_write_imem(base, code, start=0, tag=0, port=0):
+    index = start | (1 << 24)
+    wr32(base + 0x180 + port * 0x10, index)
+
+    word_count = (len(code) + 3) // 4
+
+    for i in range(word_count):
+        if (i & 0x3f) == 0:
+            wr32(base + 0x188 + port * 0x10, tag)
+            tag += 1
+
+        chunk = code[i * 4:i * 4 + 4]
+        word = int.from_bytes(chunk.ljust(4, b"\x00"), "little")
+        wr32(base + 0x184 + port * 0x10, word)
+
+    while word_count & 0x3f:
+        wr32(base + 0x184 + port * 0x10, 0)
+        word_count += 1
+```
+
+This mirrors Nouveau’s essential behavior: direct 32-bit writes, one sequential tag per 256-byte page, and final-page padding. ([Code Browser][1])
+
+Add assertions immediately afterward:
+
+```python
+assert len(code) <= physical_imem_size
+assert verify_imem_bytes(code)
+assert verify_identity_tlb((len(code) + 0xff) // 0x100)
+```
+
+Do **not** introduce:
+
+```python
+tag = 0xd8
+```
+
+That could turn the current deterministic no-hit into execution of arbitrary physical bytes while hiding the actual image/entry problem.
+
+## Current ranking
+
+1. **Wrong or incorrectly extracted firmware file**
+2. **Wrong `envydis` Falcon version causing false instruction boundaries**
+3. **A header or nonzero code entry offset is being loaded as instruction zero**
+4. **Byte/word transformation in `falcon_write_imem`**
+5. Wrong GPU firmware variant
+6. Actual firmware intentionally branching to `0xd8` — very unlikely
+
+The decisive next artifact is a side-by-side dump of:
+
+```text
+filename + SHA-256 + length
+first 64 file bytes
+first 16 IMEM words
+exact envydis command and version
+disassembly from offsets 0–4
+```
+
+That will identify whether the breakage is extraction, upload byte ordering, or disassembler configuration before any risky TLB changes.
+
+[1]: https://codebrowser.dev/linux/linux/drivers/gpu/drm/nouveau/nvkm/falcon/v1.c.html "v1.c source code [linux/drivers/gpu/drm/nouveau/nvkm/falcon/v1.c] - Codebrowser "
+
+
+====
+
 # Revised GTX 770 / GK104 `add.py` Bring-Up Plan
 
 ## Goal
