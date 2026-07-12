@@ -1086,3 +1086,345 @@ Nouveau register addresses.
   supplied with `--cubin PATH` or `KEPLER_CUBIN=PATH`. No further live run was
   attempted without that prerequisite, so `hardware_demo=ok` is not yet
   claimed.
+
+## Session 2026-07-13 — real sm_30 cubin obtained; FECS falcon stuck at PC 0x567
+
+Docker came online, so a genuine nvcc-compiled `sm_30` add cubin is now
+available at `examples_kepler/add_kepler.cubin` (24 instructions, 8 registers).
+CUDA 11.0.3-devel-ubuntu20.04 was used because CUDA 11.8+ dropped `sm_30` from
+nvcc. The cubin is compiled as `sm_35` then the ELF flags are patched to
+`0x001e051e` (sm_30); the SASS instructions used (MOV/S2R/IMAD/ISCADD/LD.E/
+FADD/ST.E/EXIT) are encoded identically on sm_30 and sm_35. `add.py` now
+auto-compiles this cubin via `compile_kepler_cubin_docker()` when
+`KEPLER_CUBIN` is unset and Docker is available.
+
+The `EF_CUDA_SM30` constant was corrected from `0x300030` (decimal 48, wrong)
+to `0x001e001e` (decimal 30, correct). The sm_30 ELF-flag check in
+`get_kepler_cubin()` was likewise fixed to compare against `0x1e`, not `0x30`.
+
+With the real cubin loaded, the hardware path now runs end-to-end through
+VBIOS devinit, GPC PLL, PMU, PGOB, PGRAPH init, falcon firmware load, VMM
+setup, GR context allocation, runlist submission, and launch — but the kernel
+never executes on the SMs. Output is still all zeros (256/256 mismatch).
+
+### Current blocker: FECS falcon never starts executing
+
+The FECS falcon is loaded with firmware but never progresses past PC 0x567.
+Diagnostic evidence:
+
+- `FECS PC samples after start: ['0x567', '0x567', ...]` — PC frozen.
+- `GPC0-3 fuc: CTRL=0x20 ENTRY=0x0` — GPCCS falcons never started by FECS.
+- `PGRAPH_STATUS=0xbadf1000` throughout — GR engine never reaches healthy idle.
+- `FECS_CTRL=0x00000000` after start (bit4 STOPPED clear, but PC not advancing).
+
+Root-cause investigation via deepwiki (allbilly/linux_drm) and envytools docs:
+
+1. **Missing `nvkm_mc_unk260` writes**: nouveau's `gf100_gr_init_ctxctl_int`
+   writes `0x000260=0` before firmware load (disables ctxctl clock-gate) and
+   `0x000260=1` after (re-enables). These were missing; now added.
+2. **Premature `0x409614` (RED_SWITCH/FECS reset) write removed**: the code
+   was writing `0x409614=0x70` + `0x700` during PGRAPH init, but nouveau only
+   does this during `gf100_grctx_generate` (context allocation), AFTER firmware
+   load. Writing it before load power-gates the falcon's IMEM. Removed.
+3. **FE_PWR FORCE_ON added**: nouveau's `gf100_grctx_generate` sets
+   `0x404170=0x12` (FORCE_ON) and waits for bit4 clear before falcon work,
+   then restores `0x404170=0x10` (AUTO) after. This prevents auto-power-gating
+   between MMIO accesses during firmware upload. Added.
+
+After these fixes, DMEM readback now matches (0x300, 0x3cc, 0x0, 0x0 — the
+0x3cc is the updated csdata tail pointer). IMEM readback is partially working
+(first word 0x39b0ef5 matches, but subsequent reads intermittently return
+0xbadf5000 — the IMEM read window at 0x180/0x184 may not auto-increment
+correctly, or the falcon's IMEM port is still being intermittently gated).
+
+Despite the firmware loading correctly, FECS PC is still stuck at 0x567.
+The instruction at offset 0x564 is `0xf40028f4` — likely a wait/sleep
+instruction. The falcon appears to be in a SLEEPING state waiting for an
+interrupt or mailbox signal that never arrives.
+
+### Next steps
+
+- Decode the FECS instruction at PC 0x567 using envydis or KeplerAs to
+  determine what the falcon is waiting for (mailbox? interrupt? context
+  switch signal?).
+- Check whether `0x409048` (ACCESS_EN) needs to be set to `0x3` (FIFO|CHSW)
+  before starting FECS, as nouveau's `nvkm_falcon_v1_start` does
+  (`base + 0x048 = 0x3`).
+- Verify the FECS csdata/method-stream upload is correct — the DMEM tail
+  pointer changed from 0x304 to 0x3cc, but the csdata format may not match
+  what the FECS firmware expects.
+- Investigate whether the PMU firmware needs to be fully functional for FECS
+  to progress (the PMU is loaded but may not be responding to commands).
+
+### Verification
+
+- `python3 -m py_compile examples_kepler/add.py` passes.
+- `python3 examples_kepler/add.py --middle-selftest` passes.
+- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+  `software_demo=ok N=256`.
+- `KEPLER_CUBIN=./add_kepler.cubin python3 examples_kepler/add.py` runs the
+  full hardware path but fails with `hardware add mismatch (256/256 wrong)`.
+- `hardware_demo=ok` is still not achieved.
+
+## 2026-07-12: live GK104 compute launch checkpoint
+
+The earlier conclusion above that PGRAPH/FECS never became usable is now
+superseded.  The current bring-up reaches the A0C0 compute launch method on the
+Kepler eGPU:
+
+- VBIOS devinit and the 300 MHz GPC PLL complete; FECS reports a `0x2c400`
+  context image and executes context-channel/save commands.
+- The GK104 topology is detected as four GPCs with two TPCs each.  The golden
+  context now includes Nouveau's topology/floorsweep state and is copied from
+  the `CB_RESERVED + 0x80000` generation area into the runtime channel context,
+  exactly as `gf100_grctx_generate()` does.
+- PBDMA consumes the GP entry and advances `DMA_GET` to `0x09000028`, the byte
+  offset of `NVA0C0_LAUNCH`.  A GPU semaphore-only packet has separately been
+  verified on hardware (`hardware_semaphore=ok value=2`).
+- The artificial pre-launch semaphore acquire was removed.  Inputs are fully
+  written before this synchronous one-shot submission, while the completion
+  semaphore remains a GPU packet after launch.  The hardware path does not call
+  the software backend and does not copy a CPU-computed result into `out_dev`.
+
+### Mesa cross-check
+
+The launch descriptor is being checked against the local Mesa mirror:
+
+- `ref/mesa.mesa/src/gallium/drivers/nouveau/nvc0/nve4_compute.c`, function
+  `nve4_compute_setup_launch_desc()`
+- `ref/mesa.mesa/src/nouveau/headers/nvidia/classes/cla0c0qmd.h`, layout
+  `NVA0C0_QMDV00_06`
+
+The descriptor now sets Mesa's cache invalidations, FE/L1 membars, unchecked API
+call limit, `SASS_VERSION=0x30`, 16 KiB directly-addressable shared-memory
+configuration, `SHADER_LOCAL_MEMORY_CRS_SIZE=0x800`, and the register count.
+The exact packed words are `qmd[7]=0xbc000000`, `qmd[11]=0x04014000`,
+`qmd[20]=0x20000001`, and `qmd[47]=0x30000800` before adding other fields.
+
+### Current live failure (do not report success yet)
+
+The GPU still does not complete the vector add.  The live launch raises
+PGRAPH interrupt `0x00200000`, trap unit `0x01000000` (GPC), followed by an MP
+trap in one TPC per GPC; the completion semaphore remains `1`.  This is now an
+SM launch/code problem rather than an unconsumed pushbuffer or a GPCCS wait.
+
+The checked-in `add_kepler.cubin` is not yet acceptable as final proof: it was
+compiled as `sm_35` and its ELF flags were patched to identify as `sm_30`.
+CUDA 11.0's `nvcc` rejects `-arch=sm_30`, and no CUDA 10.2 image is currently
+cached.  A genuine GK104 (`sm_30`) cubin must be produced (CUDA 10.2 or a
+verified Kepler assembler route), inspected, and used for the final hardware
+run.  Success requires both `hardware_demo=ok` and the numerical comparison of
+GPU-written output against the CPU reference; neither is claimed at this
+checkpoint.
+
+### Tests at this checkpoint
+
+- `python3 -m py_compile examples_kepler/add.py`: pass.
+- `python3 examples_kepler/add.py --middle-selftest`: pass,
+  `launch_words=19`.
+- Live eGPU run: reaches `NVA0C0_LAUNCH`, then MP trap and timeout.
+
+## 2026-07-12: genuine sm_30 binary and SET_OBJECT isolation
+
+This section supersedes the binary/toolchain and launch-boundary statements in
+the preceding checkpoint.
+
+### Genuine GK104 cubin now available
+
+NVIDIA's archived 36 MB `cuda-nvcc-10-2_10.2.89-1_amd64.deb` was downloaded
+to `/tmp` and extracted without installing it system-wide.  Its `ptxas` was run
+inside the already-cached CUDA 11 container only to provide an amd64 Linux
+runtime.  The source is `examples_kepler/add_kepler.ptx` and the compiler
+reported:
+
+```
+Compiling entry function 'E_4' for 'sm_30'
+0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 8 registers, 344 bytes cmem[0]
+```
+
+The resulting `examples_kepler/add_kepler.cubin` is 1768 bytes, has native ELF
+flags `0x001e051e`, and SHA-256
+`0716d4ce397d5e2126bec9fd9cd3c32bdfd312326333ce641a3a78a2bd89e098`.
+No ELF flag patch is used.  CUDA 10.2 `nvdisasm` confirms the expected native
+SM30 instruction sequence (parameter loads, `S2R`, address calculation, two
+global loads, `FADD`, global store, and `EXIT`).
+
+### Mesa/Nouveau corrections made
+
+- `build_cwd()` now matches Mesa's `NVA0C0_QMDV00_06` packing for cache
+  invalidation, membars, SASS version, L1 configuration, CRS size, register
+  count, dimensions, and constant-buffer address/size.
+- FECS mailbox 1 is captured immediately after firmware startup.  It is later
+  reused for command data, so the previous late read returned `0x8c000`
+  instead of the real context size `0x2c400`.
+- The copied channel context header is replaced as `gf100_gr_chan_bind()`
+  requires.  It now contains the count and VA/256 of a 24-entry per-channel
+  MMIO list for pagepool, bundle, attributes, and LTC state.
+- Pagepool, bundle, GR context, and MMIO-list mappings use Nouveau's required
+  privileged PTE bit where applicable.  Scratch registers contain channel VAs,
+  not framebuffer physical addresses.
+
+### BAR1 corruption found and contained
+
+TinyGPU bulk BAR1 zero/copy operations reproducibly leave alternating stale
+`0xffffffff` dwords and occasional inverted bytes.  A 1 MiB context allocation
+contained 131072 dirty dwords after a nominal zero fill.  The bring-up now:
+
+1. verifies and repairs the golden context, pagepool, bundle, and attribute
+   allocations through the verified PRAMIN dword path;
+2. compares all `0x2c400` bytes of the FECS-saved golden context with the
+   runtime copy;
+3. repairs only mismatched dwords and requires a second comparison to report
+   `remaining=0` before scheduling the channel.
+
+This prevents a corrupted context copy from being mistaken for a compute or
+compiler failure.
+
+### Exact remaining hardware boundary
+
+A genuine empty SM30 kernel was compiled for diagnosis.  It traps identically,
+so user instructions and buffer accesses are not the trigger.  A still narrower
+`KEPLER_TEST_SET_OBJECT=1` push contains only:
+
+1. `SET_OBJECT` for class A0C0;
+2. a GPU semaphore release;
+3. a non-stall interrupt.
+
+That push is entirely consumed by PBDMA, but `SET_OBJECT` causes PGRAPH trap
+`0x01000000`, with GPC bits `0x0e` and an MP trap in TPC1 of GPC1--3.  The GPU
+semaphore remains at its sentinel because its WFI release waits behind the
+faulted GR engine.  Trap latches are zero immediately before submission, so
+this is not stale state from golden-context generation.
+
+Therefore the current defect is in GR engine-context/object binding state,
+before QMD address, launch, SASS, or data memory.  `hardware_demo=ok` and the
+numerical result are still not achieved and must not be reported as passing.
+
+---
+
+## Message 247 — ACCESS_EN=0x3 applied, PGRAPH still 0xbadf1000, FECS stuck at 0x567
+
+### What was tried
+
+- Applied the `nvkm_falcon_v1_start` fix: wrote `0x00000003` to
+  `FECS_FALCON_BASE + 0x048` (ACCESS_EN = FIFO|CHSW enable) just before
+  reading the ctx size at `0x409804`. This is the value nouveau sets in
+  `nvkm_falcon_v1_start` to give the falcon FIFO and channel-switch access
+  to host methods.
+
+### Result (KEPLER_CUBIN=add_kepler.cubin python3 add.py)
+
+The run still fails with the same `TimeoutError: semaphore did not reach 2
+(last=1)`. Key observations from the trace:
+
+- `ACCESS_EN=0x00000002` after FECS start (we wrote 0x3, read back 0x2).
+  Bit 0 (CHSW) did not stick — only bit 1 (FIFO) remained. This suggests
+  the falcon's security config rejects CHSW access on this SKU, or the
+  register is read-only after firmware start.
+- `FECS_CTRL=0x20` (HALTED bit set) — the falcon never actually started
+  executing. `CPUCTL=0x20` means bit5 (HALT) is set and bit0 (START) is
+  clear. The `nvkm_falcon_v1_start` write of `0x3` to CPUCTL (START|HALT)
+  is not happening, or it was immediately re-halted.
+- `FECS PC samples after start: ['0x567'] x10` — PC frozen at 0x567.
+- `PGRAPH_STATUS=0xbadf1000` throughout the entire run, from boot through
+  the 2-second submit_launch poll. The GR engine is *never* accessible.
+- `PGRAPH_CTRL=0x10001` (master enable is set), `PGRAPH_INTR=0x0`,
+  `FE_PWR=0x0` (FE power mode is OFF — not even AUTO).
+- `PMC_ENABLE=0xe011312d` — GR bit (0x1000) is set, but many other engine
+  bits are masked off by the hardware (we wrote 0xffffffff).
+- `PWR_GATE=0x40110068` (0x020004) — bit30 (GR un-gate) is set, bit31
+  (ROP un-gate) is clear. This matches the pgob sequence.
+- DMEM probes FAIL at every stage with `0xbadf1000` / `0xbadf5000`
+  sentinels — FECS DMEM is power-gated the entire time.
+- `FECS IMEM verify: match=False` — only the first word matched
+  (`0x39b0ef5`), the rest read back `0xbadf5000`. IMEM is also gated.
+- `FECS golden ctx: inst_tag=0x8000060d` — the inst block was written,
+  but `FE_PWR before ctx_chan: wrote 0x10 readback 0x0` — FE power
+  writes do not stick.
+- `grctx_main` ran but `post-grctx_main: PGRAPH_STATUS=0xbadf1000` —
+  the GR engine was inaccessible the entire time, so grctx_main was a
+  no-op (its MMIO writes went into the void).
+- `userd_gp_get=0x1` — PBDMA consumed the entry, but the FECS never
+  dispatched it to the GR engine because FECS is halted and GR is gated.
+
+### Root cause analysis
+
+The fundamental problem is that **PGRAPH (the GR engine) is never coming
+out of power-gate**. Every downstream symptom (FECS halt, DMEM 0xbadf5000,
+IMEM verify failure, semaphore stuck at 1, grctx_main no-op) is a
+consequence of the GR clock/power domain being gated.
+
+The pgob sequence we run (`gk104_pmu_pgob`) performs the register writes
+nouveau does, but on this eGPU the writes do not have the intended effect:
+
+1. `0x020004` bit30 (GR un-gate) reads back as set, but the GR domain
+   does not actually power up — `0x400000` still returns `0xbadf1000`.
+2. The `0x10a78c` handshake (the XBAR power-gate control) completes but
+   does not propagate to the GR partition.
+3. The `0xc800` PMU magic pokes all report `ready=YES` with the expected
+   `final_c800` values, so the PMU *is* executing the commands — but
+   they are not un-gating GR.
+
+This strongly suggests that on a cold-attached eGPU (no EFI POST, no
+NVINIT), the GR power partition requires more than the nouveau runtime
+pgob sequence. The VBIOS devinit scripts we run (script0=0x87e5 etc.)
+are supposed to bring up clocks and power, but they leave
+`PGRAPH_STATUS=0xbadf1200` — still gated. The GPC PLL programs
+successfully (`lock=YES`, target=300000 actual=300000), but the GR
+domain clock is not being routed to the engine.
+
+### Candidate next steps
+
+1. **Check 0x020004 bit31 (ROP un-gate)** — we set bit30 (GR) but not
+   bit31 (ROP). nouveau's `gk104_pmu_pgob` sets *both* via
+   `0xc0000000 -> 0x40000000` which only sets bit30. Verify whether the
+   ROP partition also needs un-gating for PGRAPH_STATUS to clear.
+   Actually, re-reading the nouveau source: the mask is `0xc0000000`
+   and the value is `0x40000000`, so bit31 is *cleared* and bit30 is
+   *set*. This is correct per nouveau. But maybe on this SKU both need
+   to be set?
+
+2. **Investigate the FECS HALT** — `CPUCTL=0x20` means the falcon is
+   halted. We should explicitly write `0x3` (START|HALT) to CPUCTL
+   (0x409100) to start it, per `nvkm_falcon_v1_start`. Check whether
+   our `falcon_load(..., start=True)` is actually writing the START
+   bit, or whether something is re-halting it afterwards.
+
+3. **Check if the GR engine needs a reset cycle** — nouveau does
+   `nvkm_mc_disable(GR)` then `nvkm_mc_enable(GR)` (PMC_ENABLE bit12
+   toggle) as part of `gf100_gr_init`. Our code sets PMC_ENABLE once
+   to 0xffffffff and never toggles GR reset. Try:
+   - Clear bit12 of PMC_ENABLE
+   - Wait
+   - Set bit12 of PMC_ENABLE
+   - Then run pgob + PGRAPH init
+
+4. **Verify the GPC PLL is actually feeding the GR clock tree** —
+   `GPC_PLL=0x30005` with `lock=YES` but `GPC_DIVSRC=0x3`. Check
+   whether `0x137160` (GPC clock divider/source) needs a different
+   value to route the PLL to the GR domain. The VBIOS devinit may
+   have left the divider in a state that gates the GR clock.
+
+5. **Dump 0x409604 (GPC_UNK) after each init step** — this register
+   tells us whether the GPC partition is alive. It reads
+   `0xbadf1200` after devinit, which means the GPC partition itself
+   is gated, not just PGRAPH.
+
+6. **Consider that the eGPU needs a full PMU boot** — the PMU
+   firmware we load (`gk104_pmu_code.bin`) may need to be started
+   and allowed to complete its init before pgob works. Currently
+   we load PMU and call `falcon_load(..., start=True)` but never
+   wait for the PMU to signal ready. The `0xc800` pokes succeed
+   (ready=YES) but that may just mean the PMU accepted the command,
+   not that it executed the power-gate sequence.
+
+### Verification
+
+- `python3 -m py_compile examples_kepler/add.py` passes.
+- Hardware run still fails: `TimeoutError: semaphore did not reach 2
+  (last=1)` after 2-second poll.
+- `PGRAPH_STATUS=0xbadf1000` throughout — GR engine never accessible.
+- `FECS_CTRL=0x20` (halted), `FECS PC=0x567` (frozen).
+- `ACCESS_EN=0x2` (FIFO only, CHSW bit did not stick).
+- `hardware_demo=ok` is still not achieved.
