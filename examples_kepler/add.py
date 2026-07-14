@@ -29,7 +29,7 @@ NO imports from tinygrad.runtime.support / ops / device / renderer / uop / helpe
 are permitted on the live path — those have been vendored inline below.
 """
 from __future__ import annotations
-import os, sys, ctypes, ctypes.util, time, mmap, struct, math, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib
+import os, sys, ctypes, ctypes.util, time, mmap, struct, math, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib, json
 from typing import cast, Any, ClassVar, Generic, TypeVar
 
 # --- autogen ctypes (allowed: "ctypes constants only") ---
@@ -440,6 +440,9 @@ class RemoteCmd(enum.IntEnum):
   # followed by `readout` payload bytes when present.
   MAP_BAR       = 1
   MAP_SYSMEM_FD = 2
+  CFG_READ      = 3
+  CFG_WRITE     = 4
+  RESET         = 5
   SYSMEM_READ   = 9
   SYSMEM_WRITE  = 10
   MMIO_READ     = 6
@@ -490,7 +493,11 @@ class RemoteMMIOInterface(MMIOInterface):
   def write32(self, off, val): return self.pci_dev.mmio_write32(self.bar, off, val)
 
 def _temp_sock():
-  return os.path.join(tempfile.mkdtemp(prefix="tinygpu_"), "tinygpu.sock")
+  # Match the proven examples/add.py client: one stable server/socket is reused
+  # across invocations.  Spawning a new DriverKit server on every Kepler run
+  # and terminating it during close caused avoidable service detach/rebind
+  # churn on the Apple PCIe path.
+  return temp("tinygpu.sock")
 
 class APLRemotePCIDevice(RemotePCIDevice):
   """macOS: TinyGPU.app signed DriverKit extension exposes raw PCIe BAR access
@@ -506,7 +513,17 @@ class APLRemotePCIDevice(RemotePCIDevice):
     self.dev_id = dev_id
     self.sock_path = sock_path or os.environ.get("APL_REMOTE_SOCK", _temp_sock())
     self._sock = None
-    self._connect(timeout_ms)
+    self._server_proc = None
+    self._pci_config_available = False
+    self._fini_done = False
+    self._sock_lock = __import__('threading').Lock()
+    try:
+      self._connect(timeout_ms)
+    except Exception:
+      # __init__ failures never reach NVDevice.close().  Roll back this client
+      # socket, but leave the shared signed server lifecycle alone.
+      self.fini(reset_endpoint=False)
+      raise
 
   def _connect(self, timeout_ms):
     self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -517,8 +534,9 @@ class APLRemotePCIDevice(RemotePCIDevice):
         self._sock.connect(self.sock_path); connected = True; break
       except (ConnectionRefusedError, FileNotFoundError):
         if i == 0:
-          subprocess.Popen([self.APP_PATH, "server", self.sock_path],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          self._server_proc = subprocess.Popen(
+              [self.APP_PATH, "server", self.sock_path],
+              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.05)
     if not connected:
       raise RuntimeError(f"Failed to connect to TinyGPU server at {self.sock_path}")
@@ -533,20 +551,21 @@ class APLRemotePCIDevice(RemotePCIDevice):
     return bytes(buf)
 
   def _rpc(self, cmd, bar, *args, readout=0, payload=b'', has_fd=False):
-    self._sock.sendall(struct.pack("<BIIQQQ", int(cmd), self.dev_id, bar, *((tuple(args) + (0, 0, 0))[:3])) + payload)
-    if payload:  # writes: server sends no response (matches examples/add.py)
-      return None
-    if has_fd:
-      msg, anc, _, _ = self._sock.recvmsg(17, socket.CMSG_LEN(4))
-      fd = struct.unpack('<i', anc[0][2][:4])[0]
-    else:
-      msg = self._recvall(17); fd = None
-    status, value1, value2 = struct.unpack("<BQQ", msg)
-    if status != 0:
-      err = self._recvall(value1).decode('utf-8') if value1 > 0 else 'unknown error'
-      raise RuntimeError(f"TinyGPU RPC cmd={int(cmd)} bar={bar} args={args} failed: {err}")
-    data = self._recvall(readout) if readout else b""
-    return value1, value2, data, fd
+    with self._sock_lock:
+      self._sock.sendall(struct.pack("<BIIQQQ", int(cmd), self.dev_id, bar, *((tuple(args) + (0, 0, 0))[:3])) + payload)
+      if payload:  # writes: server sends no response (matches examples/add.py)
+        return None
+      if has_fd:
+        msg, anc, _, _ = self._sock.recvmsg(17, socket.CMSG_LEN(4))
+        fd = struct.unpack('<i', anc[0][2][:4])[0]
+      else:
+        msg = self._recvall(17); fd = None
+      status, value1, value2 = struct.unpack("<BQQ", msg)
+      if status != 0:
+        err = self._recvall(value1).decode('utf-8') if value1 > 0 else 'unknown error'
+        raise RuntimeError(f"TinyGPU RPC cmd={int(cmd)} bar={bar} args={args} failed: {err}")
+      data = self._recvall(readout) if readout else b""
+      return value1, value2, data, fd
 
   def bar_info(self, bar):
     v1, v2, _, _ = self._rpc(RemoteCmd.MAP_BAR, bar)
@@ -568,12 +587,44 @@ class APLRemotePCIDevice(RemotePCIDevice):
   def map_bar(self, bar, fmt='B', off=0, size=None):
     return RemoteMMIOInterface(self, bar, fmt=fmt)
 
-  def fini(self):
-    try:
-      if self._sock: self._sock.close()
-    except Exception:
-      pass
+  def read_config(self, offset, size):
+    value = self._rpc(RemoteCmd.CFG_READ, 0, offset, size)[0]
+    self._pci_config_available = True
+    return value
+
+  def write_config(self, offset, value, size):
+    self._rpc(RemoteCmd.CFG_WRITE, 0, offset, size, value)
+
+  def write_config_flush(self, offset, value, size):
+    self.write_config(offset, value, size)
+    return self.read_config(offset, size)
+
+  def reset(self):
+    self._rpc(RemoteCmd.RESET, 0)
+
+  def fini(self, reset_endpoint=False):
+    if getattr(self, "_fini_done", False):
+      return
+    self._fini_done = True
+    sock = getattr(self, "_sock", None)
+    # Deliberately match the working RTX 3080 client in examples/add.py: close
+    # only this client socket.  Do not issue Kepler-only CFG/RESET transactions
+    # and do not terminate/relaunch the signed TinyGPU DriverKit server.  The
+    # 11:35 panic caught the sole Python thread in recv_into after the FECS
+    # thread had been joined, which isolates the rejected request to the extra
+    # synchronous PCI shutdown path removed here.
+    if sock:
+      try:
+        sock.close()
+      except Exception:
+        pass
     self._sock = None
+    self._server_proc = None
+
+  def __del__(self):
+    # Fallback only; normal and partial-constructor paths call fini directly.
+    try: self.fini()
+    except Exception: pass
 
   def alloc_sysmem(self, size, vaddr=0, contiguous=False):
     """Allocate GPU-visible host memory.  Returns (memoryview, [bus_paddrs])
@@ -599,6 +650,52 @@ class APLRemotePCIDevice(RemotePCIDevice):
       return APLRemotePCIDevice(sock_path=sock_path, timeout_ms=timeout_ms)
     except (OSError, RuntimeError):
       return None
+
+
+def _disable_pci_bus_master(hw, disable_decode=False):
+  """Revoke endpoint DMA and prove the PCI_COMMAND write reached hardware."""
+  observed = None
+  forbidden = pci.PCI_COMMAND_MASTER
+  if disable_decode:
+    forbidden |= pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_IO
+  for _ in range(3):
+    command = hw.read_config(pci.PCI_COMMAND, 2)
+    command = ((command | pci.PCI_COMMAND_INTX_DISABLE) &
+               ~pci.PCI_COMMAND_MASTER)
+    if disable_decode:
+      command &= ~(pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_IO)
+    observed = hw.write_config_flush(pci.PCI_COMMAND, command, 2)
+    if not (observed & forbidden):
+      return observed
+    time.sleep(0.005)
+  raise RuntimeError(
+      f"PCI function disable did not stick (mask={forbidden:#06x}): "
+      f"PCI_COMMAND={observed:#06x}")
+
+
+def _reset_pci_function_for_close(hw, settle_s=0.1):
+  """Stop DMA, reset all endpoint state, and prove reset did not re-arm DMA."""
+  before = _disable_pci_bus_master(hw)
+  hw.reset()
+  if settle_s:
+    time.sleep(settle_s)
+  # Leave the reset function completely inert: no DMA and no BAR/IO decode.
+  after = _disable_pci_bus_master(hw, disable_decode=True)
+  hw._close_reset_done = True
+  return before, after
+
+
+def _shutdown_kepler_pci_for_close(hw):
+  """Revoke GK104 DMA/INTx without FLR or disabling BAR decode.
+
+  Apple T8103 port interrupt bit 21 is PCIe Completion Abort.  Unlike the
+  working newer/AMD paths, this consumer GK104 endpoint cannot be assumed to
+  support FLR, and DriverKit may still make final config/BAR transactions while
+  closing.  Keep those transactions completable while making DMA impossible.
+  """
+  command = _disable_pci_bus_master(hw, disable_decode=False)
+  hw._close_shutdown_done = True
+  return command
 
 
 class SoftwarePCIDevice:
@@ -737,12 +834,22 @@ class NVDevice:
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     backend = backend or os.environ.get("NV_BACKEND", "kepler")
     self.backend = backend
-    self.iface = PCIIface(self, self.device_id, software=(backend == "software"))
-    self.dev_impl = NVDev(self.iface.pci_dev)
-    if backend == "software":
-      self._init_software()
-    else:
-      self._init_hardware()
+    self.iface = None
+    self.dev_impl = None
+    try:
+      self.iface = PCIIface(self, self.device_id, software=(backend == "software"))
+      self.dev_impl = NVDev(self.iface.pci_dev)
+      if backend == "software":
+        self._init_software()
+      else:
+        self._init_hardware()
+    except Exception:
+      # main() cannot call close() when construction itself raises.  Ensure a
+      # partially initialized transport cannot leak its TinyGPU server/DEXT
+      # user client; fini() conditionally resets only after CFG_READ succeeded.
+      if self.iface is not None:
+        self.iface.pci_dev.fini()
+      raise
 
   def _init_software(self):
     self.dev_impl.vram = memoryview(bytearray(self.VRAM_SIZE))
@@ -793,8 +900,28 @@ class NVDevice:
     the real GTX 770 + TinyGPU.app + nouveau GK104 firmware are present."""
     dev = self.dev_impl
     dev.hw = self.iface.pci_dev
+    # TinyGPU exposes PCI config-space RPCs.  Keep legacy INTx disabled because
+    # this userspace driver polls, while explicitly enabling memory decoding
+    # and bus mastering only for the lifetime of this NVDevice.
+    _pci_command = dev.hw.read_config(pci.PCI_COMMAND, 2)
+    _pci_command = ((_pci_command | pci.PCI_COMMAND_MEMORY |
+                     pci.PCI_COMMAND_MASTER | pci.PCI_COMMAND_INTX_DISABLE) &
+                    ~(pci.PCI_COMMAND_SERR | pci.PCI_COMMAND_PARITY))
+    _pci_observed = dev.hw.write_config_flush(pci.PCI_COMMAND, _pci_command, 2)
+    _pci_required = pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER
+    if (_pci_observed & _pci_required) != _pci_required:
+      raise RuntimeError(
+          f"PCI memory/bus-master enable did not stick: PCI_COMMAND={_pci_observed:#06x}")
     dev.hw.bar_info(0)  # MAP_BAR: map the register BAR before any MMIO
     dev.bar1_addr, dev.bar1_size = dev.hw.bar_info(1)  # real BAR1 USERD aperture
+    # This userspace RM polls every GPU event; TinyGPU's DriverKit transport
+    # does not install a handler for NVIDIA's external interrupt.  Match
+    # nv04_mc_intr_unarm() and gt215_mc_intr_block() before enabling engines,
+    # otherwise a PFIFO/runlist event remains asserted at the Apple PCIe port
+    # and macOS panics with APCIECPort "unhandled interrupts" after exit.
+    self.write32(0x000140, 0x00000000)  # PMC_INTR_EN_0: unarm external IRQ
+    self.write32(0x000640, 0x00000000)  # GK104 MC leaf-0 source mask
+    self.read32(0x000140)               # posting read, as Nouveau does
     # 1. Identify + enable engines.
     boot0 = self.read32(0x0)  # PMC_BOOT_0 (dev_id/step)
     if DEBUG: print(f"[kepler] PMC_BOOT_0={boot0:#x}")
@@ -822,6 +949,18 @@ class NVDevice:
     print(f"[kepler] PGRAPH_STATUS after PMC_ENABLE: {self.read32(0x400000):#x}", flush=True)
     if DEBUG:
       print(f"[kepler] PMC_ENABLE enabled mask={self.read32(PMC_ENABLE):#x}")
+    # Put GR in Nouveau's non-clock-gated state.  gk104_clkgate_fini writes
+    # 0x54 = ENG_CLK=RUN + ENG_PWR=AUTO; PGOB below separately releases the
+    # GPC/ROP/LTC power-gated domains needed during bring-up.
+    # Lower byte encoding: bits[3:0]=ENG_CLK (4=RUN, 5=AUTO),
+    # bits[7:4]=ENG_PWR (4=RUN, 5=AUTO).  0x44 = both RUN.
+    nvkm_mask(self, 0x20200, 0x000000ff, 0x00000054)
+    # Also set the FECS idle filter (nouveau gk104_clkgate_enable writes
+    # 0x020288 = therm->idle_filter->fecs = 0x00001000).
+    self.write32(0x020288, 0x00001000)
+    self.write32(0x02028c, 0x00001000)
+    print(f"[kepler] GR clkgate+pwr disabled: 0x20200={self.read32(0x20200):#010x}",
+          flush=True)
     # 2. FALCON firmware (plan §24.1/§24.2): Kepler GK104 FALCONs are NOT
     #    secure-boot, so load IMEM/DMEM directly.  FECS/GPCCS ucode are the raw
     #    FUC arrays from hubgk104.fuc3.h / gpcgk104.fuc3.h (nouveau embeds them);
@@ -869,8 +1008,43 @@ class NVDevice:
       print(f"[kepler] after pgob: gpc/rop(0x409604)={self.read32(0x409604):#x} "
             f"GPC0 CTRL(0x502100)={self.read32(0x502100):#x} "
             f"GPCCS CTRL(0x41a100)={self.read32(0x41a100):#x}")
-    fecs_code = _rd("gk104_fecs_code.bin"); fecs_data = _rd("gk104_fecs_data.bin")
+    fecs_code = bytearray(_rd("gk104_fecs_code.bin")); fecs_data = _rd("gk104_fecs_data.bin")
     gpccs_code = _rd("gk104_gpccs_code.bin"); gpccs_data = _rd("gk104_gpccs_data.bin")
+    # Patch ctx_4170s: change `or $r15 0x10` to `or $r15 0x12`.
+    # ctx_4170s (at Falcon addr 0x7db) ORs $r15 with 0x10 and writes to FE_PWR
+    # (0x404170).  Bit 4 (0x10) = power-state request; bit 1 (0x02) = FORCE_ON.
+    # Several callers pass $r15=0 (via `clear b32 $r15`), so ctx_4170s writes
+    # only 0x10 — no FORCE_ON — allowing the FE domain to power-gate after
+    # context load.  Changing the OR immediate from 0x10 to 0x12 makes every
+    # call set FORCE_ON, keeping PGRAPH powered through ctx_xfer_post.
+    # The instruction `or $r15 0x10` is 3 bytes (f0 f5 10) at 0x7db-0x7dd;
+    # we change byte 0x7dd from 0x10 to 0x12.  No length change, no branch
+    # offset shifts — safe for variable-length Falcon ISA.
+    # NOTE: the previous approach patched a 4-byte word at 0xa44, but Falcon
+    # uses variable-length instructions, so 0xa44 spans `call 0x802` (4B at
+    # 0xa41) and `clear b32 $r15` (2B at 0xa45), corrupting both.
+    fecs_code[0x7dd] = 0x12  # or $r15 0x10 -> or $r15 0x12
+    if DEBUG:
+      print(f"[kepler] FECS patch: ctx_4170s[0x7db] or $r15 0x10 -> or $r15 0x12 "
+            f"(FORCE_ON on all ctx_4170s calls)")
+    # Patch ctx_4170w: replace first instruction with ret.
+    # ctx_4170w waits for bit 4 of 0x404170 to clear (PMU handshake).
+    # Without a PMU, it spins forever.  Patch to ret so it returns immediately.
+    # The keep-alive thread handles clearing bit 4.
+    # ctx_4170w is at binary offset 0x7ec; ret = 0xf01bf410.
+    _4170w_off = 0x7ec
+    _orig_4170w = struct.unpack_from('<I', fecs_code, _4170w_off)[0]
+    _patched_4170w = 0xf01bf410  # ret
+    if False:  # DISABLED - causes FECS init failure
+      struct.pack_into('<I', fecs_code, _4170w_off, _patched_4170w)
+    if DEBUG:
+      print(f"[kepler] FECS patch: ctx_4170w[0x{_4170w_off:x}] "
+            f"0x{_orig_4170w:08x} -> 0x{_patched_4170w:08x} (ret) [DISABLED]")
+    fecs_code = bytes(fecs_code)
+    # Cache firmware for FECS reload after pgob (FECS power-gates and pgob
+    # destroys it; we need to reload firmware to restore FECS functionality).
+    self._fecs_code = fecs_code
+    self._fecs_data = fecs_data
     # Clock/power diagnostics: why is PGRAPH_STATUS=0xbadf1000?
     if DEBUG or True:
       _rop_pll = self.read32(0x137020)
@@ -888,6 +1062,29 @@ class NVDevice:
     # nouveau gf100_gr_init: disable PGRAPH master (masked, only bits 0+16),
     # write main register init, then re-enable master.  Writing 0 to the entire
     # 0x400500 register power-gates the FECS, making DMEM return 0xbadf5000.
+    # CRITICAL DIAGNOSTIC: test if PGRAPH register block is accessible at all.
+    _pgraph_test = self.read32(0x400080)  # PGRAPH register
+    print(f"[kepler] PGRAPH access test: 0x400080={_pgraph_test:#x} "
+          f"0x400000={self.read32(0x400000):#x} "
+          f"0x400500={self.read32(0x400500):#x}", flush=True)
+    # Test accessibility of different PGRAPH sub-domains
+    _subdom_tests = []
+    for _addr in (0x400700, 0x404000, 0x4041f0, 0x404200, 0x404600, 0x405840, 0x407020, 0x408030):
+      _v = self.read32(_addr)
+      _accessible = (_v & 0xfffff000) != 0xbadf0000
+      _subdom_tests.append(f"0x{_addr:x}={_v:#x}{'(OK)' if _accessible else '(GATED)'}")
+    print(f"[kepler] PGRAPH sub-domains: {' '.join(_subdom_tests)}", flush=True)
+    # Try writing BLCG registers to disable clock gating for main block.
+    # BLCG value 0x00004046 has bit 6 set (clock gate enabled).
+    # Clear bit 6 to disable: 0x00000046.
+    # Only write if the register is accessible.
+    _blcg_main = self.read32(0x4041f0)
+    if (_blcg_main & 0xfffff000) != 0xbadf0000:
+      self.write32(0x4041f0, _blcg_main & ~0x40)  # clear bit 6
+      print(f"[kepler] BLCG main: 0x4041f0 was {_blcg_main:#x} now {self.read32(0x4041f0):#x}",
+            flush=True)
+    else:
+      print(f"[kepler] BLCG main: 0x4041f0 GATED ({_blcg_main:#x})", flush=True)
     _before = self.read32(0x400500)
     self.write32(0x400500, _before & ~0x00010001)
     for addr, val in GK104_PGRAPH_PACK_MMIO:
@@ -913,11 +1110,30 @@ class NVDevice:
     # (restores DMEM), then re-enable PGRAPH_CTRL (the MMIO pack was already
     # written while PGRAPH was accessible, so just the master enable is needed).
     gk104_pmu_pgob(self)
+    print(f"[kepler] after pgob in init: PGRAPH_STATUS={self.read32(0x400000):#x} "
+          f"PGRAPH_CTRL={self.read32(0x400500):#x} "
+          f"FE_PWR={self.read32(0x404170):#x} "
+          f"PWR_GATE={self.read32(0x020004):#x} "
+          f"RED_SWITCH={self.read32(0x409614):#x}",
+          flush=True)
     # Re-enable PGRAPH master.  The PGRAPH init already wrote the MMIO pack
     # and FECS clock-gating registers.  Only the master enable was reset by pgob.
     self.write32(0x400500, 0x00010001)
-    # Restore FE power to AUTO mode (PGRAPH_PACK_MMIO set it to 0).
-    self.write32(0x404170, 0x00000010)
+    # Restore FE power to FORCE_ON mode (PGRAPH_PACK_MMIO set it to 0).
+    # AUTO mode (0x10) allows the FE domain to power-gate when idle, which
+    # gates all PGRAPH method/FIFO sub-domains (0x400700, 0x404200, etc.)
+    # and prevents method processing.  FORCE_ON (0x12) keeps them accessible.
+    self.write32(0x404170, 0x00000012)
+    # Verify PGRAPH sub-domains are accessible after FE_PWR restore.
+    _subdom_after = []
+    for _addr in (0x400700, 0x404000, 0x404200):
+      _v = self.read32(_addr)
+      _ok = (_v & 0xfffff000) != 0xbadf0000
+      _subdom_after.append(f"0x{_addr:x}={_v:#x}{'(OK)' if _ok else '(GATED)'}")
+    print(f"[kepler] PGRAPH sub-domains after FE_PWR restore: "
+          f"{' '.join(_subdom_after)} FE_PWR={self.read32(0x404170):#x} "
+          f"PGRAPH_STATUS_MAIN={self.read32(0x400000):#x}",
+          flush=True)
     # Complete the post-MMIO portion of gf100_gr_init() before ctxctl starts.
     # In particular, the FECS/GPC exception routing is also how context-switch
     # work reaches the GPCCS falcons; without it GPCCS remains in wait (0x50b).
@@ -987,6 +1203,55 @@ class NVDevice:
     print(f"[kepler] after pgob+ctrl: PGRAPH_CTRL={self.read32(0x400500):#x} "
           f"PGRAPH_INTR={self.read32(0x400100):#x} "
           f"FE_PWR={self.read32(0x404170):#x}", flush=True)
+    # Disable BLCG (block-level clock gating) for all GR sub-domains.
+    # Without this, GPC/TPC blocks (especially MPC) clock-gate during kernel
+    # execution, causing mpc=0xbadf1000 and mp_warp=0x3fffff traps.
+    # Also clear NV_PMC_ENABLE_BLG (bit 27 of 0x200) to disable the BLG
+    # controller entirely.
+    nvkm_mask(self, 0x000200, 0x08000000, 0x00000000)
+    _blcg_regs = [
+      0x4041f0,                          # main
+      0x409890, 0x4098b0,                # FECS ctxctl
+      0x4078c0,                          # rstr2d
+      0x406000, 0x405860, 0x40590c,      # unk_0
+      0x408040,                          # gcc
+      0x407000,                          # sked
+      0x405bf0,                          # unk_1
+      0x41a890, 0x41a8b0,                # gpc_ctxctl
+      0x418500, 0x418608, 0x418688, 0x418718,  # gpc_unk_0
+      0x418828,                          # gpc_esetup
+      0x418bbc,                          # gpc_tpbus
+      0x418970,                          # gpc_zcull
+      0x418c70,                          # gpc_tpconf
+      0x418cf0, 0x418d70, 0x418f0c, 0x418e0c,  # gpc_unk_1
+      0x419020, 0x419038,                # gpc_gcc
+      0x418898,                          # gpc_ffb
+      0x419a40, 0x419a48, 0x419a50, 0x419a58,  # gpc_tex
+      0x419a60, 0x419a68, 0x419a70, 0x419a78,
+      0x419a80, 0x419acc,
+      0x419868,                          # gpc_poly
+      0x419ccc, 0x419cd4, 0x419cdc,      # gpc_l1c
+      0x419c70,                          # gpc_unk_2
+      0x419fd0, 0x419fd8, 0x419fe0, 0x419fe8,  # gpc_mp/TPC
+      0x419ff0, 0x419ff8,
+      0x41be28, 0x41bfe8, 0x41bed0,      # gpc_ppc
+      0x408810, 0x408818,                # rop_zrop
+      0x408a80, 0x408a88, 0x408a90, 0x408a98,  # rop
+      0x408aa0, 0x408aa8,
+      0x4089a8, 0x4089b0, 0x4089b8,      # rop_crop
+      0x13c820, 0x13cbe0,                # pxbar
+    ]
+    _blcg_ok = 0
+    _blcg_gated = 0
+    for _r in _blcg_regs:
+      _v = self.read32(_r)
+      if (_v & 0xfffff000) != 0xbadf0000:
+        self.write32(_r, 0x00000000)
+        _blcg_ok += 1
+      else:
+        _blcg_gated += 1
+    print(f"[kepler] BLCG disabled: {_blcg_ok} regs cleared, "
+          f"{_blcg_gated} gated (skipped)", flush=True)
     print(f"[kepler] before falcon load: FECS_CTRL={self.read32(0x409100):#x} GPCCS_CTRL={self.read32(0x41a100):#x} PGRAPH_CTRL={self.read32(0x400500):#x} PGRAPH_STATUS={self.read32(0x400000):#x} RED_SWITCH={self.read32(0x409614):#x}")
     # nouveau gf100_grctx_generate: FE_PWR FORCE_ON (0x12) before falcon work
     # to prevent auto-power-gating between MMIO accesses.  Wait for bit4 clear.
@@ -1012,6 +1277,8 @@ class NVDevice:
         fecs_packs.append((info["starstar"], words))
       else:
         gpccs_packs.append((info["starstar"], words))
+    # Cache fecs_packs for FECS reload after pgob.
+    self._fecs_packs = fecs_packs
     # Upload GPCCS csdata (GPCCS doesn't auto-gate as aggressively).
     # All GPCCS sub-streams start at 0x6c; csdata is appended sequentially.
     gpccs_star = 0x6c
@@ -1024,7 +1291,6 @@ class NVDevice:
       self.write32(GPCCS_FALCON_BASE + FALCON_DATA_INDEX, 0x01000000 | (starstar + 4))
       self.write32(GPCCS_FALCON_BASE + FALCON_DATA, gpccs_star)
     # FECS DMEM load + csdata + start in one continuous write stream (no reads).
-    # The FECS FUC data has head=0x300, tail=0x304.  csdata is appended at 0x304.
     fecs_data_words = struct.unpack_from(f"<{len(fecs_data)//4}I", fecs_data)
     self.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX, FALCON_IDX_WRITE)
     for w in fecs_data_words:
@@ -1043,23 +1309,55 @@ class NVDevice:
     # clock-gate after firmware + csdata load.  Then clear FECS mailbox and
     # start FECS — the FECS firmware will start the GPC falcons itself.
     self.write32(0x000260, 0x00000001)
-    # Restore FE_PWR to AUTO (nouveau does this after fecs_reset in grctx).
-    self.write32(0x404170, 0x00000010)
-    # Verify IMEM load: read back first 4 instructions and compare
-    self.write32(FECS_FALCON_BASE + FALCON_CODE_INDEX, 0)  # IMEM read mode, addr 0
-    _imem_rb = [self.read32(FECS_FALCON_BASE + FALCON_CODE) for _ in range(4)]
+    # Keep FE_PWR at FORCE_ON (not AUTO) to prevent the FE domain from
+    # power-gating, which would gate all PGRAPH method/FIFO sub-domains.
+    # Nouveau uses AUTO here, but nouveau also has a PMU that manages
+    # power-gating; without a PMU, AUTO causes FECS to gate during idle.
+    self.write32(0x404170, 0x00000012)
+    # Verify IMEM load: read back first 4 instructions with auto-increment
+    # and a read barrier (FECS CPUCTL read) to prevent clock-gating between reads.
+    _imem_rb = []
+    for _i in range(4):
+      _ = self.read32(0x409100)  # read barrier: wake FECS clock
+      self.write32(FECS_FALCON_BASE + FALCON_CODE_INDEX, 0x80000000 | (_i * 4))  # auto-incr read
+      _imem_rb.append(self.read32(FECS_FALCON_BASE + FALCON_CODE))
     _imem_exp = [struct.unpack_from('<I', fecs_code, i)[0] for i in range(0, 16, 4)]
     print(f"[kepler] FECS IMEM verify: read={[hex(x) for x in _imem_rb]} expected={[hex(x) for x in _imem_exp]} match={_imem_rb == _imem_exp}")
-    # Verify DMEM load: read back first 4 words
-    self.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX, 0x02000000)  # DMEM read mode, addr 0
-    _dmem_rb = [self.read32(FECS_FALCON_BASE + FALCON_DATA) for _ in range(4)]
+    # Full IMEM verify: read every word and count mismatches.
+    # CODE_INDEX bits 0-15 are byte offset (low 2 bits masked for 4-byte
+    # alignment), so multiply word index by 4.  Use AINCR (bit 25) for
+    # auto-increment read.
+    _imem_full_mismatches = []
+    _imem_words = len(fecs_code) // 4
+    for _i in range(_imem_words):
+      _ = self.read32(0x409100)  # read barrier
+      self.write32(FECS_FALCON_BASE + FALCON_CODE_INDEX, _i * 4)
+      _val = self.read32(FECS_FALCON_BASE + FALCON_CODE)
+      _exp = struct.unpack_from('<I', fecs_code, _i * 4)[0]
+      if _val != _exp and _val != 0xbadf5000:
+        _imem_full_mismatches.append((_i, _val, _exp))
+    if _imem_full_mismatches:
+      print(f"[kepler] FECS IMEM FULL verify: {len(_imem_full_mismatches)}/{_imem_words} mismatches", flush=True)
+      for _idx, _val, _exp in _imem_full_mismatches[:10]:
+        print(f"  IMEM[0x{_idx:03x}]: got=0x{_val:08x} exp=0x{_exp:08x}", flush=True)
+    else:
+      print(f"[kepler] FECS IMEM FULL verify: all {_imem_words} words match", flush=True)
+    # Verify DMEM load: read back first 4 words with auto-increment
+    _dmem_rb = []
+    for _i in range(4):
+      _ = self.read32(0x409100)  # read barrier
+      self.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX, 0x82000000 | (_i * 4))  # DMEM auto-incr read
+      _dmem_rb.append(self.read32(FECS_FALCON_BASE + FALCON_DATA))
     _dmem_exp = [struct.unpack_from('<I', fecs_data, i)[0] for i in range(0, 16, 4)]
     print(f"[kepler] FECS DMEM verify: read={[hex(x) for x in _dmem_rb]} expected={[hex(x) for x in _dmem_exp]} match={_dmem_rb == _dmem_exp}")
     self.write32(0x409800, 0x00000000)
     self.write32(FECS_FALCON_BASE + 0x10c, 0x00000000)
     self.write32(FECS_FALCON_BASE + FALCON_UC_CTRL, FALCON_UC_CTRL_START)
     print(f"[kepler] FECS started immediately after DMEM+csdata load")
-    print(f"[kepler] after FECS start: FECS_CTRL=0x{self.read32(0x409100):08x} FECS_SIGNAL=0x{self.read32(0x409400):08x} GPCCS_CTRL=0x{self.read32(0x41a100):08x} FECS_MMIO_BASE=0x{self.read32(0x409724):08x} FECS_MMIO_CTRL=0x{self.read32(0x409728):08x} ACCESS_EN=0x{self.read32(0x409048):08x} INTR=0x{self.read32(0x409008):08x} INTR_EN=0x{self.read32(0x409010):08x} HWCFG2=0x{self.read32(0x40916c):08x} CPUSTAT=0x{self.read32(0x409128):08x} XFER_STATUS=0x{self.read32(0x409120):08x}")
+    print(f"[kepler] after FECS start: FECS_CTRL=0x{self.read32(0x409100):08x} FECS_SIGNAL=0x{self.read32(0x409400):08x} GPCCS_CTRL=0x{self.read32(0x41a100):08x} FECS_MMIO_BASE=0x{self.read32(0x409724):08x} FECS_MMIO_CTRL=0x{self.read32(0x409728):08x} ACCESS_EN=0x{self.read32(0x409048):08x} INTR=0x{self.read32(0x409008):08x} IRQMSET=0x{self.read32(0x409010):08x} IRQMASK=0x{self.read32(0x409018):08x} HWCFG2=0x{self.read32(0x40916c):08x} CPUSTAT=0x{self.read32(0x409128):08x} XFER_STATUS=0x{self.read32(0x409120):08x}")
+    # Check if FECS firmware changed FE_PWR
+    _fe_pwr_after_start = self.read32(0x404170)
+    print(f"[kepler] FE_PWR after FECS start: {_fe_pwr_after_start:#x}", flush=True)
     # Sample FECS PC to see if it's executing
     import time as _time
     pcs = []
@@ -1140,6 +1438,22 @@ class NVDevice:
       # fetching an unmapped page or a real exit instruction.
       self._dump_fecs_tlb()
       raise
+    # FECS firmware sets FE_PWR=0 during its init, gating PGRAPH sub-domains.
+    # Re-assert FORCE_ON now that FECS is ready and idle.  This keeps the FE
+    # domain powered so PGRAPH method/FIFO sub-domains (0x400700, 0x404200)
+    # remain accessible for channel dispatch and method processing.
+    self.write32(0x404170, 0x00000012)  # FE_PWR FORCE_ON
+    # Disable the FECS idle filter (0x020288) to prevent auto clock-gating.
+    # nouveau's gk104_clkgate_enable writes 0x00001000 to this register, which
+    # tells the therm subsystem to clock-gate FECS after an idle period.
+    # Without a PMU managing power state, this causes FECS to power-gate
+    # when idle, making all FECS registers read 0xbadf1000.  Setting it to 0
+    # disables the idle filter and keeps FECS clocked.
+    self.write32(0x020288, 0x00000000)  # FECS idle filter disabled
+    self.write32(0x02028c, 0x00000000)  # HUBMMU idle filter disabled
+    _fe_pwr_ready = self.read32(0x404170)
+    print(f"[kepler] FE_PWR after FECS ready: {_fe_pwr_ready:#x} "
+          f"idle_filter={self.read32(0x020288):#x}", flush=True)
     self.write32(FECS_FALCON_BASE + 0x048, 0x00000003)
     ctx_size = self.read32(0x409804)
     # Save this immediately.  FECS mailbox 1 is reused by the context
@@ -1189,13 +1503,12 @@ class NVDevice:
     # so the GPU can flush dirty cache lines to sysmem.  Without this, the L2
     # cache may retain stale zeros and PBDMA/GR read incorrect data.
     self.write32(0x100c10, dev.bus_base >> 8)
-    # BAR1 identity mapping is opt-in.  TinyGPU exposes BAR1 as a direct
-    # PCI BAR mapping to sysmem; writing 0x1704 replaces that with a VMM
-    # aperture.  The PTEs must point to the sysmem bus address with the HOST
-    # aperture bits (aper=2<<33, VOL=1<<32) or BAR1 reads return 0xbad0...
-    # Enable for diagnostics with KEPLER_INIT_BAR1=1.
-    if os.environ.get("KEPLER_INIT_BAR1") == "1":
-      _gk104_init_bar1_identity(self, bus_base=dev.bus_base)
+    # GK104 PFIFO polls USERD through BAR1's VMM, not through the CPU's direct
+    # PCI BAR mapping.  Nouveau creates this mapping during BAR/FIFO oneinit.
+    # Use an identity VA->VRAM mapping so USERD BAR1 VAs equal the framebuffer
+    # offsets allocated by submit_launch().
+    if os.environ.get("KEPLER_INIT_BAR1_EARLY") == "1":
+      _gk104_init_bar1_identity(self, bus_base=dev.bus_base, map_vram=True)
     dev.mm = GK104MemoryManager(dev, sysmem_size, self.BOOT_SIZE, bus_base=dev.bus_base)
     # 4-12. FIFO channel / GPFIFO / USERD / GR context / launch: KEPLER-TODO.
     dev.is_booting = False
@@ -1203,6 +1516,20 @@ class NVDevice:
   def runtime(self, name, lib):
     return NVProgram(self, name, lib)
   def synchronize(self): pass
+
+  def close(self):
+    teardown = getattr(self, "_kepler_emergency_teardown", None)
+    try:
+      if teardown is not None:
+        teardown("device close")
+      if self.backend != "software":
+        # No endpoint RPC is safe after the successful command/output phase.
+        # The proven TinyGPU clients do not add a PCI config/reset shutdown
+        # protocol; their transport simply closes its socket.
+        print("[kepler] client-only close: no teardown MMIO/config/reset RPC",
+              flush=True)
+    finally:
+      self.iface.pci_dev.fini()
 
   # MMIO convenience helpers used by the host-driven hardware bring-up.
   def read32(self, off): return self.dev_impl.pci_dev.mmio_read32(0, off)
@@ -1461,6 +1788,11 @@ def compile_kepler_cubin_docker(tag="nvidia/cuda:11.0.3-devel-ubuntu20.04"):
 
 def get_kepler_cubin():
   path = os.environ.get("KEPLER_CUBIN")
+  # The repository carries the verified nvcc-built sm_30 image used by this
+  # example.  Prefer it so `python3 examples_kepler/add.py` is self-contained;
+  # Docker remains a fallback for source-only checkouts.
+  bundled = os.path.join(os.path.dirname(__file__), "add_kepler.cubin")
+  if not path and os.path.exists(bundled): path = bundled
   if not path or not os.path.exists(path): path = compile_kepler_cubin_docker()
   if not path or not os.path.exists(path):
     raise RuntimeError("live hardware requires a real sm_30 add cubin; set KEPLER_CUBIN or start Docker")
@@ -1776,6 +2108,18 @@ def nvkm_mask(dev, addr, mask, val):
   dev.write32(addr, r)
   return r
 
+
+def _set_native_thread_name(name):
+  """Expose the active teardown stage in a macOS panic process snapshot."""
+  if sys.platform != "darwin": return
+  try:
+    pthread_setname_np = ctypes.CDLL(None).pthread_setname_np
+    pthread_setname_np.argtypes = [ctypes.c_char_p]
+    pthread_setname_np.restype = ctypes.c_int
+    pthread_setname_np(name.encode("ascii", "replace")[:63])
+  except Exception:
+    pass
+
 def _pmu_magic_(dev, ctrl, size):
   """nouveau gk104.c magic_(): poke the PMU 0xc800 sequencer (War00C800_0).
   Fully instrumented: reports the command written, whether the ready bit was
@@ -1804,11 +2148,13 @@ def _pmu_magic(dev, ctrl):
   _pmu_magic_(dev, 0x8000a41f | ctrl, 6)
   _pmu_magic_(dev, 0x80000421 | ctrl, 1)
 
-def gk104_pmu_pgob(dev, war00c800=True):
-  """nouveau gk104_pmu_pgob(pmu, enable=false): release GPC/ROP/LTC power-gating
-  so the FECS firmware can read the GPC/ROP topology (0x409604) and the per-GPC
-  falcons (0x502000+, 0x41a000) become accessible.  Without this, 0x409604 = 0
-  and the GR ctxctl init never posts "ready".
+def gk104_pmu_pgob(dev, war00c800=True, settle_s=0.05):
+  """Mirror Nouveau's GK104 GR-init PGOB operation.
+
+  This releases GPC/ROP/LTC power-gating so FECS can read the topology during
+  bring-up.  Nouveau's GK104 GR code only calls the underlying operation with
+  false (during oneinit/init); it has no shutdown caller with true.  Do not
+  expose that unsupported reverse transition in this userspace API.
 
   The un-gate (0x020004 bit30) plus the 0x10a78c / 0x200 handshake require the
   PMU falcon to be alive (nouveau runs pgob after PMU subdev init).  The
@@ -1819,12 +2165,12 @@ def gk104_pmu_pgob(dev, war00c800=True):
   nvkm_mask(dev, 0x000200, 0x00001000, 0x00000000)   # clear GR reset (bit12)
   dev.read32(0x000200)                                # posted
   nvkm_mask(dev, 0x000200, 0x08000000, 0x08000000)   # set bit27
-  time.sleep(0.05)
+  time.sleep(settle_s)
   nvkm_mask(dev, 0x10a78c, 0x00000002, 0x00000002)
   nvkm_mask(dev, 0x10a78c, 0x00000001, 0x00000001)
   nvkm_mask(dev, 0x10a78c, 0x00000001, 0x00000000)
-  nvkm_mask(dev, 0x020004, 0xc0000000, 0x40000000)   # UN-GATE GR/GPC/ROP (bit30=1)
-  time.sleep(0.05)
+  nvkm_mask(dev, 0x020004, 0xc0000000, 0x40000000)
+  time.sleep(settle_s)
   nvkm_mask(dev, 0x10a78c, 0x00000002, 0x00000000)
   nvkm_mask(dev, 0x10a78c, 0x00000001, 0x00000001)
   nvkm_mask(dev, 0x10a78c, 0x00000001, 0x00000000)
@@ -1836,6 +2182,44 @@ def gk104_pmu_pgob(dev, war00c800=True):
     _pmu_magic(dev, 0x06000000)
     _pmu_magic(dev, 0x0c000000)
     _pmu_magic(dev, 0x0e000000)
+
+
+def _gk104_shutdown_leaf_irqs(dev):
+  """Mask and acknowledge GK104 interrupt producers before PCI teardown."""
+  # First prevent any leaf source below from reaching the PCIe interrupt.
+  dev.write32(0x000140, 0x00000000)  # PMC master interrupt mask
+  dev.write32(0x000640, 0x00000000)  # MSI mask
+
+  # PFIFO plus all three GK104 PBDMAs.
+  dev.write32(0x002140, 0x00000000)
+  for pbdma in range(3):
+    q = 0x040000 + pbdma * 0x2000
+    dev.write32(q + 0x10c, 0x00000000)
+    dev.write32(q + 0x14c, 0x00000000)
+    intr0, intr1 = dev.read32(q + 0x108), dev.read32(q + 0x148)
+    if intr0: dev.write32(q + 0x108, intr0)
+    if intr1: dev.write32(q + 0x148, intr1)
+
+  # Exact g84_therm_fini(): PTherm mask/ACK and its PBUS parent ACK.
+  dev.write32(0x020000, 0x00000000)
+  dev.write32(0x020100, 0xffffffff)
+  dev.write32(0x001100, 0x00010000)
+
+  # GK104 GPIO and AUX/I2C masks are separate from their W1C status words.
+  gpio0, gpio1 = dev.read32(0x00dc00), dev.read32(0x00dc80)
+  dev.write32(0x00dc08, 0x00000000)
+  dev.write32(0x00dc88, 0x00000000)
+  if gpio0: dev.write32(0x00dc00, gpio0)
+  if gpio1: dev.write32(0x00dc80, gpio1)
+  aux = dev.read32(0x00dc60)
+  dev.write32(0x00dc68, 0x00000000)
+  if aux: dev.write32(0x00dc60, aux)
+
+  # Exact gt215_pmu_fini mask, followed by ACK of any already-latched source.
+  dev.write32(0x10a014, 0x00000060)
+  pmu = dev.read32(0x10a004)
+  if pmu: dev.write32(0x10a004, pmu)
+  dev.read32(0x000140)  # flush posted writes
 
 
 def mask32(dev, reg, mask, value):
@@ -2087,17 +2471,29 @@ def gk104_semaphore(addr, value, operation):
               addr & 0xffffffff, value, operation)]
 
 def build_launch_words(timeline_addr, wait_value, done_value, launch_desc_addr,
-                       code_va=0, temp_va=0, temp_size=0x8000):
+                       code_va=0, temp_va=0, temp_size=0x40000):
   # Kepler compute launch (envytools gk104_compute.xml, plan §24.3): bind the
   # compute class via SET_OBJECT, set the shader PC via CODE_ADDRESS_LO/HI
   # (0x160c/0x1608), point at the CWD via LAUNCH_DESC_ADDRESS (0x02b4, VA>>8),
   # then LAUNCH (0x02bc, value=3) to trigger.  Semaphore + cache-invalidate wrap.
+  # Setup methods match Mesa's nve4_compute_setup_state() for Kepler.
+  # GTX 770 has eight MPs.  NVE4 exposes two identical per-MP TEMP size banks;
+  # Mesa programs both and rounds the low word down to a 32-KiB granule.
+  temp_per_mp = temp_size // 8
   return [
     *nvm(1, 0x0000, KEPLER_COMPUTE_A),            # SET_OBJECT: bind compute class
+    *nvm(1, 0x0790, temp_va >> 32, temp_va & 0xffffffff), # TEMP_ADDRESS HIGH/LOW
+    *nvm(1, 0x02e4, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), # MP_TEMP_SIZE[0]
+    *nvm(1, 0x02f0, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), # MP_TEMP_SIZE[1]
+    *nvm(1, 0x077c, 0xff << 24),                  # LOCAL_BASE
+    *nvm(1, 0x0214, 0xfe << 24),                  # SHARED_BASE
+    *nvm(1, 0x0310, 0x300),                       # SASS_VERSION (Kepler)
+    *nvm(1, 0x2608, 7),                           # TEX_CB_INDEX (Mesa NVE4 setup)
     *nvm(1, 0x1698, 0x00001011),                  # INVALIDATE_SHADER_CACHES
     *nvm(1, 0x1608, code_va >> 32, code_va & 0xffffffff), # CODE_ADDRESS HIGH/LOW
     *nvm(1, 0x02b4, launch_desc_addr >> 8),       # LAUNCH_DESC_ADDRESS (VA<<8 by HW)
     *nvm(1, 0x02bc, 0x3),                          # LAUNCH (trigger, value=3)
+    *nvm(1, 0x0110, 0),                            # NV50_GRAPH_SERIALIZE
     *gk104_semaphore(timeline_addr, done_value, 0x00000002), # RELEASE, WFI enabled
     *nvm(0, 0x0020, 0),
   ]
@@ -2129,35 +2525,81 @@ def build_cuda_param_cbuf(*ptrs):
   return cbuf
 
 def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=0x200, regs=4):
-  """Build a GK104 Compute Work Descriptor (0x100 bytes) per envytools
-  gk104_compute.xml GK104_COMPUTE_LAUNCH_DESC decode (plan §24.3):
-    0x20 PROG_START (offset from CODE_ADDRESS), 0x30 GRIDDIM_X, 0x34 GRIDDIM_YZ
-    (Y bits0-15, Z bits16-31), 0x44 SHARED_ALLOC (align 0x100),
-    0x48 BLOCKDIM_X (bits16-31!), 0x4c BLOCKDIM_YZ (Y lo, Z hi),
-    0x50 CB_VALID (c0), 0x74/0x78 CB_CONFIG (cbuf addr/size),
-    0xb8 GPR_ALLOC (register count, bits24-29)."""
+  """Build a GK104 Compute Work Descriptor (QMD) using the NVA0C0_QMDV00_06
+  field layout from NVIDIA's cla0c0qmd.h, matching Mesa's
+  nve4_compute_setup_launch_desc().
+
+  The QMD is 256 bytes (64 words).  Field bit positions use MW(X:Y) notation
+  where X/Y are absolute bit indices across the entire structure.  Key fields:
+    word 7  (0x1c): INVALIDATE_* caches (bits 250-255)
+    word 8  (0x20): PROGRAM_OFFSET (bits 287:256)
+    word 11 (0x2c): RELEASE_MEMBAR, CWD_MEMBAR, API_VISIBLE_CALL_LIMIT
+    word 12 (0x30): CTA_RASTER_WIDTH  (grid X, 32-bit)
+    word 13 (0x34): CTA_RASTER_HEIGHT (grid Y, bits 15:0) | CTA_RASTER_DEPTH (grid Z, bits 31:16)
+    word 17 (0x44): SHARED_MEMORY_SIZE
+    word 18 (0x48): CTA_THREAD_DIMENSION0 (block X, bits 31:16)
+    word 19 (0x4c): CTA_THREAD_DIMENSION1/2 (block Y bits 15:0, Z bits 31:16)
+    word 20 (0x50): CONSTANT_BUFFER_VALID (bits 0:7), L1_CONFIGURATION (bits 31:29)
+    word 29 (0x74): CONSTANT_BUFFER_ADDR_LOWER(0)
+    word 30 (0x78): CB_ADDR_UPPER(0) + CB_SIZE(0) (bits 31:15)
+    word 45 (0xb4): SHADER_LOCAL_MEMORY_LOW_SIZE (bits 23:0), BARRIER_COUNT (bits 31:27)
+    word 46 (0xb8): SHADER_LOCAL_MEMORY_HIGH_SIZE (bits 23:0), REGISTER_COUNT (bits 31:24)
+    word 47 (0xbc): SHADER_LOCAL_MEMORY_CRS_SIZE (bits 23:0), SASS_VERSION (bits 31:24)
+  """
   grid_x, grid_y, grid_z = grid
   block_x, block_y, block_z = block
-  desc = bytearray(0x100)
-  # NVA0C0_QMDV00_06 defaults used by Mesa's nve4_compute_setup_launch_desc.
-  # Invalidate texture header/sampler/data and shader data/constant caches.
-  struct.pack_into("<I", desc, 0x1c, 0xbc000000)
-  struct.pack_into("<I", desc, 0x20, code_addr & 0xffffffff)   # PROG_START (offset from CODE_ADDRESS)
-  # RELEASE_MEMBAR=FE_SYSMEMBAR, CWD_MEMBAR=L1_SYSMEMBAR,
-  # API_VISIBLE_CALL_LIMIT=NO_CHECK.
-  struct.pack_into("<I", desc, 0x2c, 0x04014000)
-  struct.pack_into("<I", desc, 0x30, grid_x)                   # GRIDDIM_X
-  struct.pack_into("<I", desc, 0x34, grid_y | (grid_z << 16))  # GRIDDIM_YZ
-  struct.pack_into("<I", desc, 0x44, shared)                   # SHARED_ALLOC
-  struct.pack_into("<I", desc, 0x48, block_x << 16)            # BLOCKDIM_X (bits 16-31)
-  struct.pack_into("<I", desc, 0x4c, block_y | (block_z << 16))  # BLOCKDIM_YZ
-  struct.pack_into("<I", desc, 0x50, 0x20000001)              # CB_VALID c0 + 16K shared/48K L1
-  struct.pack_into("<I", desc, 0x74, cbuf_addr & 0xffffffff)   # CB_CONFIG_0 (c0 addr lo)
-  struct.pack_into("<I", desc, 0x78, ((cbuf_addr >> 32) & 0xff) | (cbuf_size << 15))  # CB_CONFIG_1: SIZE[31:15]
-  struct.pack_into("<I", desc, 0xb8, (regs & 0x3f) << 24)      # GPR_ALLOC (bits 24-29)
-  # SHADER_LOCAL_MEMORY_CRS_SIZE=0x800 and SASS_VERSION=0x30.
-  struct.pack_into("<I", desc, 0xbc, 0x30000800)
-  return bytes(desc)
+  qmd = 0
+
+  def field(lo, hi, value):
+    """Insert one cla0c0qmd.h MW(hi:lo) field into the little-endian QMD."""
+    nonlocal qmd
+    width = hi - lo + 1
+    assert 0 <= value < (1 << width), (lo, hi, value)
+    qmd |= value << lo
+
+  # Word 7 (0x1c): invalidate texture/sampler/data/shader/constant caches.
+  # Bits 250-255 = INVALIDATE_{TEXTURE_HEADER,TEXTURE_SAMPLER,TEXTURE_DATA,
+  # SHADER_DATA,INSTRUCTION,SHADER_CONSTANT}_CACHE.  Mesa sets all except
+  # INSTRUCTION_CACHE.  0xbc = 1011_1100 → bits 255:250 = 101110.
+  field(250, 255, 0x2f)
+  # Word 8 (0x20): PROGRAM_OFFSET = code_addr (offset from CODE_ADDRESS method).
+  field(256, 287, code_addr & 0xffffffff)
+  # Word 11 (0x2c): RELEASE_MEMBAR=FE_SYSMEMBAR(bit14), CWD_MEMBAR=L1_SYSMEMBAR
+  # (bits17:16=01), API_VISIBLE_CALL_LIMIT=NO_CHECK(bit26).
+  field(366, 366, 1)
+  field(368, 369, 1)
+  field(378, 378, 1)
+  # Words 12-13 (0x30-0x34): CTA_RASTER_WIDTH (32-bit) and
+  # CTA_RASTER_HEIGHT (bits 15:0) | CTA_RASTER_DEPTH (bits 31:16) packed.
+  # Confirmed by Mesa's indirect launch: grid_z written to desc+0x36.
+  field(384, 415, grid_x)
+  field(416, 431, grid_y)
+  field(432, 447, grid_z)
+  # Word 17 (0x44): SHARED_MEMORY_SIZE (align 0x100).
+  field(544, 561, round_up(shared, 0x100))
+  # Word 18 (0x48): CTA_THREAD_DIMENSION0 in bits 31:16.
+  field(592, 607, block_x)
+  # Word 19 (0x4c): CTA_THREAD_DIMENSION1 (bits 15:0) / DIMENSION2 (bits 31:16).
+  field(608, 623, block_y)
+  field(624, 639, block_z)
+  # Word 20 (0x50): CB0 valid (bit 0) + L1_CONFIG=16KB (bits 31:29 = 001).
+  field(640, 640, 1)
+  field(669, 671, 1)
+  # Word 29 (0x74): CONSTANT_BUFFER_ADDR_LOWER(0).
+  field(928, 959, cbuf_addr & 0xffffffff)
+  # Word 30 (0x78): CB_ADDR_UPPER(0) bits 7:0 + CB_SIZE(0) bits 31:15.
+  field(960, 967, (cbuf_addr >> 32) & 0xff)
+  field(975, 991, cbuf_size)
+  # Word 45 (0xb4): SHADER_LOCAL_MEMORY_LOW_SIZE=0 (bits 23:0), BARRIER_COUNT=0.
+  field(1440, 1463, 0)
+  field(1467, 1471, 0)
+  # Word 46 (0xb8): SHADER_LOCAL_MEMORY_HIGH_SIZE=0 + REGISTER_COUNT (bits 31:24).
+  field(1472, 1495, 0)
+  field(1496, 1503, regs & 0xff)
+  # Word 47 (0xbc): SHADER_LOCAL_MEMORY_CRS_SIZE=0x800 + SASS_VERSION=0x30.
+  field(1504, 1527, 0x800)
+  field(1528, 1535, 0x30)
+  return qmd.to_bytes(0x100, "little")
 
 
 # NVProgram / NVAllocator / NVSignal are placeholders until the Kepler RM path
@@ -2181,7 +2623,7 @@ class NVAllocator:
 
 
 MIDDLE_CUBIN_BYTES = 2856
-MIDDLE_LAUNCH_WORDS = 18
+MIDDLE_LAUNCH_WORDS = 39
 
 def kepler_selftest():
   """Tier 1 offline gate (no eGPU required): cubin structure + GMMU helpers
@@ -2210,6 +2652,12 @@ def kepler_selftest():
   regs = cubin_register_count(cubin, "E_4")
   assert regs > 0
   cwd = build_cwd(0, (1, 1, 1), (256, 1, 1), cbuf_addr=0x123400, regs=regs)
+  # Verify QMD field offsets match NVA0C0_QMDV00_06 spec.
+  assert struct.unpack_from("<I", cwd, 0x18)[0] == 0, "reserved word 6 must remain zero"
+  assert struct.unpack_from("<I", cwd, 0x1c)[0] == 0xbc000000, "invalidate bits at wrong offset"
+  assert struct.unpack_from("<I", cwd, 0x20)[0] == 0, "PROGRAM_OFFSET should be 0"
+  assert struct.unpack_from("<I", cwd, 0x30)[0] == 1, "CTA_RASTER_WIDTH"
+  assert struct.unpack_from("<I", cwd, 0x34)[0] == 1 | (1 << 16), "CTA_RASTER_HEIGHT|DEPTH"
   assert struct.unpack_from("<I", cwd, 0x78)[0] == (0x200 << 15)
   assert struct.unpack_from("<I", cwd, 0xb8)[0] == (regs << 24)
 
@@ -2244,6 +2692,138 @@ def kepler_selftest():
   # leaf frame should resolve back to the mapped physical page
   assert spt.address(spt_idx) == 0x2000, "PTE frame must match paddr"
   assert mp.size == 0x3000 and mp.paddrs == [0x2000]
+
+  # TinyGPU transport and PCI shutdown sanity.  This uses a fake socket, so it
+  # proves the exact config-space wire layout and bus-master read-back without
+  # connecting to the eGPU or starting TinyGPU.app.
+  class _FakeSocket:
+    def __init__(self, values):
+      self.sent = []
+      self.rx = bytearray().join(struct.pack("<BQQ", 0, value, 0)
+                                 for value in values)
+    def sendall(self, data): self.sent.append(bytes(data))
+    def recv_into(self, dst):
+      count = min(len(dst), len(self.rx))
+      dst[:count] = self.rx[:count]
+      del self.rx[:count]
+      return count
+    def close(self): self.closed = True
+  fake_sock = _FakeSocket([0x0006, 0, 0x0402])
+  fake_hw = object.__new__(APLRemotePCIDevice)
+  fake_hw.dev_id, fake_hw._sock = 7, fake_sock
+  fake_hw._sock_lock = __import__('threading').Lock()
+  assert _disable_pci_bus_master(fake_hw) == 0x0402
+  frames = [struct.unpack("<BIIQQQ", frame) for frame in fake_sock.sent]
+  assert frames == [
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0402),
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+  ], f"unexpected TinyGPU PCI config frames: {frames}"
+  fake_hw.fini(reset_endpoint=False)
+
+  reset_sock = _FakeSocket([0x0402, 0, 0x0402, 0, 0x0003, 0, 0x0400])
+  reset_hw = object.__new__(APLRemotePCIDevice)
+  reset_hw.dev_id, reset_hw._sock = 7, reset_sock
+  reset_hw._sock_lock = __import__('threading').Lock()
+  assert _reset_pci_function_for_close(reset_hw, settle_s=0) == (0x0402, 0x0400)
+  reset_frames = [struct.unpack("<BIIQQQ", frame) for frame in reset_sock.sent]
+  assert reset_frames == [
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0402),
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+    (int(RemoteCmd.RESET), 7, 0, 0, 0, 0),
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0400),
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+  ], f"unexpected TinyGPU reset/close frames: {reset_frames}"
+  assert not reset_sock.rx, "TinyGPU reset self-test left an unread response"
+  reset_hw.fini(reset_endpoint=False)
+
+  # The actual Kepler close path must not send RESET or clear BAR decode.  Both
+  # remain available to other GPU implementations, but are unsafe assumptions
+  # for this GK104 path after a confirmed Apple PCIe Completion Abort.
+  close_sock = _FakeSocket([0x0007, 0, 0x0403])
+  close_hw = object.__new__(APLRemotePCIDevice)
+  close_hw.dev_id, close_hw._sock = 7, close_sock
+  close_hw._sock_lock = __import__('threading').Lock()
+  assert _shutdown_kepler_pci_for_close(close_hw) == 0x0403
+  close_frames = [struct.unpack("<BIIQQQ", frame) for frame in close_sock.sent]
+  assert close_frames == [
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0403),
+    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
+  ], f"unexpected Kepler no-FLR close frames: {close_frames}"
+  assert all(frame[0] != int(RemoteCmd.RESET) for frame in close_frames)
+  close_hw.fini(reset_endpoint=False)
+
+  # The actual Kepler close must send no config/MMIO/reset request at all.
+  # It follows the working examples/add.py client-only socket lifecycle.
+  one_shot_sock = _FakeSocket([])
+  one_shot_hw = object.__new__(APLRemotePCIDevice)
+  one_shot_hw._sock, one_shot_hw._server_proc = one_shot_sock, None
+  one_shot_hw._pci_config_available = True
+  one_shot_hw._close_shutdown_done = False
+  one_shot_hw._fini_done = False
+  one_shot_dev = object.__new__(NVDevice)
+  one_shot_dev.backend = "kepler"
+  one_shot_dev.iface = type("_FakeIface", (), {"pci_dev": one_shot_hw})()
+  one_shot_dev.close()
+  assert one_shot_sock.sent == [], "one-shot close repeated an endpoint RPC"
+  assert one_shot_sock.closed
+
+  # A failed first CFG_READ must close only its partial client socket.  The
+  # stable TinyGPU server is shared with the proven clients and must not be
+  # terminated/relaunched by this Kepler script.
+  class _FakeOwnedProcess:
+    def __init__(self): self.terminated = False; self.waits = 0
+    def wait(self, timeout=None):
+      self.waits += 1
+      if not self.terminated: raise subprocess.TimeoutExpired("TinyGPU", timeout)
+      return 0
+    def terminate(self): self.terminated = True
+  failed_sock = _FakeSocket([])
+  failed_proc = _FakeOwnedProcess()
+  failed_hw = object.__new__(APLRemotePCIDevice)
+  failed_hw._sock, failed_hw._server_proc = failed_sock, failed_proc
+  failed_hw._pci_config_available = False
+  failed_hw._fini_done = False
+  failed_hw.fini()
+  assert failed_sock.closed and not failed_proc.terminated
+  assert failed_proc.waits == 0
+  assert failed_sock.sent == [], "failed-init cleanup retried endpoint RPC"
+  assert _temp_sock() == temp("tinygpu.sock"), "Kepler must reuse TinyGPU socket"
+
+  # GK104 shutdown must silence leaf interrupts without inventing a reverse
+  # PGOB transition or turning off the active PLL.  Nouveau has neither
+  # operation in GK104 device fini.
+  class _FakeRegs:
+    def __init__(self):
+      self.regs = {
+        0x000200: 0xffffffff, 0x020004: 0x40000000,
+        0x137000: 0x00000005, 0x137100: 0x00000001,
+        0x00dc00: 0x12, 0x00dc80: 0x34, 0x00dc60: 0x56,
+        0x10a004: 0x80,
+      }
+      for pbdma in range(3):
+        q = 0x040000 + pbdma * 0x2000
+        self.regs[q + 0x108] = 1 << pbdma
+        self.regs[q + 0x148] = 0x10 << pbdma
+      self.writes = []
+    def read32(self, reg): return self.regs.get(reg, 0)
+    def write32(self, reg, value):
+      self.regs[reg] = value & 0xffffffff
+      self.writes.append((reg, value & 0xffffffff))
+  fake_regs = _FakeRegs()
+  _gk104_shutdown_leaf_irqs(fake_regs)
+  assert fake_regs.regs[0x020004] == 0x40000000
+  assert fake_regs.regs[0x137100] == 0x00000001
+  assert fake_regs.regs[0x137000] == 0x00000005
+  for reg in (0x000140, 0x000640, 0x002140, 0x020000,
+              0x00dc08, 0x00dc88, 0x00dc68):
+    assert fake_regs.regs[reg] == 0, f"shutdown mask {reg:#x} left enabled"
+  for pbdma in range(3):
+    q = 0x040000 + pbdma * 0x2000
+    assert fake_regs.regs[q + 0x10c] == fake_regs.regs[q + 0x14c] == 0
 
   print(f"kepler_selftest=ok cubin_sha={sha} launch_words={len(words)} sections={eh['shnum']}")
   return sha
@@ -2315,12 +2895,362 @@ def run_software_demo(dev):
 CHAN_SUBMIT_REG = 0x800000
 CHAN_START_REG  = 0x800004
 PFIFO_RUNLIST_SUBMIT = 0x2274
+# GR engine runlist ID, decoded from TOP scan (0x22700) exactly as Nouveau's
+# gk104_top_oneinit():
+#   TOP[00] ENUM 0x8006183e: engine=0, runlist=(data & 0x01e00000)>>21 = 0
+#   TOP[01] ENGINE_TYPE 0x00000003: type=0 -> NVKM_ENGINE_GR
+GR_RUNLIST_ID = 0
 USERD_GP_GET = 0x88
 USERD_GP_PUT = 0x8c
 
 def gk104_mp_trap_addrs(gpc, tpc):
   base = 0x504000 + gpc * 0x8000 + tpc * 0x800
   return base + 0x648, base + 0x650
+
+# ----------------------------------------------------------------------------
+# Phase 1: Register-accurate trap snapshot (per the GK104 A0C0 debug plan).
+# Captures every trap/status register at four points: before runlist, after
+# GP_GET consumed, after first trap observed, and after W1C clear.
+# Returns a structured dict that can be printed or emitted as JSON.
+# ----------------------------------------------------------------------------
+#
+# Register map (from nouveau nvkm/engine/gr/gf100.c):
+#   0x400100  PGRAPH_INTR          (bit0=NOTIFY, bit4=ILLEGAL_MTHD,
+#                                   bit5=ILLEGAL_CLASS, bit20=DATA_ERROR,
+#                                   bit21=TRAP, bit19=CTXCTL)
+#   0x400108  PGRAPH_TRAP          (bit0=DISPATCH, bit1=M2MF, bit3=CCACHE,
+#                                   bit4=SHADER, bit6=UNK6, bit7=MACRO,
+#                                   bit8=SKED, bit24=GPC, bit25=ROP)
+#   0x400110  PGRAPH_DATA_ERROR_CODE
+#   0x400118  PGRAPH_GPC_TRAP      (bitmap of faulted GPCs)
+#   0x400120  PGRAPH_ROP_TRAP      (bitmap of faulted ROPs)
+#   0x400700  PGRAPH_STATUS        (engine idle/fifo status)
+#   0x400704  PGRAPH_TRAPPED_ADDR  (subc[18:16], mthd[13:2])
+#   0x400708  PGRAPH_TRAPPED_DATA
+#   0x404000  DISPATCH trap status
+#   0x404200+N GR_SUBCH_CLASS      (class bound to subchannel N)
+#   0x405840  SHADER trap status
+#   0x407020  SKED trap status
+#   0x408030  CCACHE trap status
+#   0x409b00  FECS CHAN_ADDR       (current channel instance addr)
+#   0x409b04  FECS CHAN_NEXT       (next channel instance addr)
+#
+# Per-GPC (GPC_UNIT(gpc, r) = 0x500000 + gpc*0x8000 + r):
+#   +0x2c90   GPC trap summary     (bit0=ROP, bit1=ZCULL, bit2=CCACHE,
+#                                   bit3=ESETUP, bit16+N=TPC_N)
+#   +0x0420   GPC/PROP trap status
+#   +0x0434   GPC/PROP trap x
+#   +0x0438   GPC/PROP trap y
+#   +0x043c   GPC/PROP trap format/storage
+#   +0x0900   GPC/ZCULL trap
+#   +0x1028   GPC/CCACHE trap
+#   +0x0824   GPC/ESETUP trap
+#
+# Per-TPC (TPC_UNIT(gpc, tpc, r) = 0x504000 + gpc*0x8000 + tpc*0x800 + r):
+#   +0x0508   TPC trap summary     (bit0=TEX, bit1=MP, bit2=POLY,
+#                                   bit3=L1C, bit4=MPC)
+#   +0x0224   TPC/TEX trap
+#   +0x0084   TPC/POLY trap
+#   +0x048c   TPC/L1C trap
+#   +0x0430   TPC/MPC trap
+#   +0x0648   MP warp error
+#   +0x0650   MP global error
+#
+# Per-ROP (ROP_UNIT(rop, r) = 0x410000 + rop*0x400 + r):
+#   +0x070    ROP trap status z
+#   +0x144    ROP trap status c
+
+# Nouveau error decoding tables (for human-readable snapshot output).
+_GK104_DISPATCH_ERRORS = {
+  0x1: "INJECTED_BUNDLE_ERROR", 0x2: "CLASS_SUBCH_MISMATCH",
+  0x4: "SUBCHSW_DURING_NOTIFY",
+}
+_GK104_CCACHE_ERRORS = {0x1: "INTR", 0x2: "LDCONST_OOB"}
+_GK104_SKED_ERRORS = {
+  0x40: "CTA_RESUME", 0x80: "CONSTANT_BUFFER_SIZE",
+  0x200: "LOCAL_MEMORY_SIZE_POS", 0x400: "LOCAL_MEMORY_SIZE_NEG",
+  0x800: "WARP_CSTACK_SIZE", 0x1000: "TOTAL_TEMP_SIZE",
+  0x2000: "REGISTER_COUNT", 0x40000: "TOTAL_THREADS",
+  0x100000: "PROGRAM_OFFSET", 0x200000: "SHARED_MEMORY_SIZE",
+  0x800000: "CTA_THREAD_DIMENSION_ZERO", 0x1000000: "MEMORY_WINDOW_OVERLAP",
+  0x2000000: "SHARED_CONFIG_TOO_SMALL", 0x4000000: "TOTAL_REGISTER_COUNT",
+}
+_GK104_MP_WARP_ERRORS = {
+  0x01: "STACK_ERROR", 0x02: "API_STACK_ERROR", 0x03: "RET_EMPTY_STACK_ERROR",
+  0x04: "PC_WRAP", 0x05: "MISALIGNED_PC", 0x06: "PC_OVERFLOW",
+  0x07: "MISALIGNED_IMMC_ADDR", 0x08: "MISALIGNED_REG",
+  0x09: "ILLEGAL_INSTR_ENCODING", 0x0a: "ILLEGAL_SPH_INSTR_COMBO",
+  0x0b: "ILLEGAL_INSTR_PARAM", 0x0c: "INVALID_CONST_ADDR",
+  0x0d: "OOR_REG", 0x0e: "OOR_ADDR", 0x0f: "MISALIGNED_ADDR",
+  0x10: "INVALID_ADDR_SPACE", 0x11: "ILLEGAL_INSTR_PARAM2",
+  0x12: "INVALID_CONST_ADDR_LDC", 0x13: "GEOMETRY_SM_ERROR",
+  0x14: "DIVERGENT", 0x15: "WARP_EXIT",
+}
+_GK104_MP_GLOBAL_ERRORS = {
+  0x1: "SM_TO_SM_FAULT", 0x2: "L1_ERROR", 0x4: "MULTIPLE_WARP_ERRORS",
+  0x8: "PHYSICAL_STACK_OVERFLOW", 0x10: "BPT_INT", 0x20: "BPT_PAUSE",
+  0x40: "SINGLE_STEP_COMPLETE", 0x20000000: "ECC_SEC_ERROR",
+  0x40000000: "ECC_DED_ERROR", 0x80000000: "TIMEOUT",
+}
+_GK104_PGRAPH_INTR_BITS = {
+  0x1: "NOTIFY", 0x10: "ILLEGAL_MTHD", 0x20: "ILLEGAL_CLASS",
+  0x80000: "CTXCTL", 0x100000: "DATA_ERROR", 0x200000: "TRAP",
+}
+_GK104_PGRAPH_TRAP_BITS = {
+  0x1: "DISPATCH", 0x2: "M2MF", 0x8: "CCACHE", 0x10: "SHADER",
+  0x40: "UNK6", 0x80: "MACRO", 0x100: "SKED",
+  0x1000000: "GPC", 0x2000000: "ROP",
+}
+
+def _decode_bits(value, table):
+  return [name for bit, name in table.items() if value & bit]
+
+def _decode_enum(value, table):
+  return table.get(value, "")
+
+def snapshot_fecs_gpccs(dev):
+  """Capture FECS and GPCCS falcon state."""
+  fecs = {
+    "cpuctl": dev.read32(0x409100),
+    "cpustat": dev.read32(0x409128),
+    "intr": dev.read32(0x409008),
+    "iren": dev.read32(0x409010),
+    "scratch0": dev.read32(0x409800),
+    "scratch1": dev.read32(0x409804),
+    "scratch5_err": dev.read32(0x409814),
+    "chan_addr": dev.read32(0x409b00),
+    "chan_next": dev.read32(0x409b04),
+    "fifo_cmd": dev.read32(0x409504),
+    "fifo_data": dev.read32(0x409500),
+    "mem_cmd": dev.read32(0x409a1c),
+    "mem_target": dev.read32(0x409acc),
+    "mem_base": dev.read32(0x409a20),
+    "pc": dev.read32(0x409ff0),
+  }
+  gpccs = {
+    "cpuctl": dev.read32(0x41a100),
+    "cpustat": dev.read32(0x41a128),
+    "scratch0": dev.read32(0x41a800),
+    "pc": dev.read32(0x41aff0),
+  }
+  return {"fecs": fecs, "gpccs": gpccs}
+
+def snapshot_gr_traps(dev, label, *, emit_json=False):
+  """Capture a register-accurate PGRAPH/FECS/GPCCS/GPC/TPC trap snapshot.
+
+  Returns a structured dict.  When emit_json is True, also prints a JSON
+  blob tagged with ``label`` so the output can be parsed by tooling.
+  """
+  _ka = lambda: dev.read32(0x409100)  # FECS keep-alive (read to prevent clock-gating)
+  _ka()
+  gpc_nr = dev.read32(0x409604) & 0x1f
+  tpc_nr = [dev.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f
+            for g in range(gpc_nr)]
+  rop_nr = 0  # GK104 ROP count — read from topology if available
+  try:
+    rop_nr = (dev.read32(0x409604) >> 16) & 0x1f
+  except Exception:
+    pass
+
+  # Top-level PGRAPH registers.
+  _ka()
+  pgraph_intr = dev.read32(0x400100)
+  pgraph_trap = dev.read32(0x400108)
+  pgraph_data_error = dev.read32(0x400110)
+  pgraph_gpc_trap = dev.read32(0x400118)
+  pgraph_rop_trap = dev.read32(0x400120)
+  pgraph_status = dev.read32(0x400700)
+  pgraph_trapped_addr = dev.read32(0x400704)
+  pgraph_trapped_data = dev.read32(0x400708)
+  pgraph_status_main = dev.read32(0x400000)
+  pgraph_ctrl = dev.read32(0x400500)
+  fe_pwr = dev.read32(0x404170)
+
+  trapped_subc = (pgraph_trapped_addr >> 16) & 0x7
+  trapped_mthd = pgraph_trapped_addr & 0x3ffc
+
+  # Sub-unit trap status registers.
+  _ka()
+  dispatch_stat = dev.read32(0x404000)
+  ccache_stat = dev.read32(0x408030)
+  shader_stat = dev.read32(0x405840)
+  sked_stat = dev.read32(0x407020) & 0x3fffffff
+  m2mf_stat = dev.read32(0x404600)
+  unk6_stat = dev.read32(0x40601c)
+  macro_stat = dev.read32(0x404490)
+  macro_pc = dev.read32(0x404494)
+  macro_op = dev.read32(0x40449c)
+
+  # Bound classes for subchannels 0..7 (0x404200 + subc*4).
+  subch_classes = {}
+  for s in range(8):
+    subch_classes[s] = dev.read32(0x404200 + s * 4)
+
+  # HUB fault units (0x409c00 + unit*0x20, 16 units).
+  hub_faults = []
+  _ka()
+  for u in range(16):
+    stat = dev.read32(0x409c00 + u * 0x20)
+    if stat & 0x80000000:
+      hub_faults.append({
+        "unit": u, "stat": stat,
+        "addr": dev.read32(0x409c04 + u * 0x20),
+      })
+
+  # Per-GPC trap state.
+  gpcs = []
+  _ka()
+  for g in range(gpc_nr):
+    gb = 0x500000 + g * 0x8000
+    gpc_summary = dev.read32(gb + 0x2c90)
+    gpc_rop_stat = dev.read32(gb + 0x0420) & 0x3fffffff
+    gpc_rop_x = dev.read32(gb + 0x0434)
+    gpc_rop_y = dev.read32(gb + 0x0438)
+    gpc_rop_fmt = dev.read32(gb + 0x043c)
+    gpc_zcull = dev.read32(gb + 0x0900)
+    gpc_ccache = dev.read32(gb + 0x1028)
+    gpc_esetup = dev.read32(gb + 0x0824)
+    tpcs = []
+    _ka()
+    for t in range(tpc_nr[g]):
+      tb = 0x504000 + g * 0x8000 + t * 0x800
+      tpc_summary = dev.read32(tb + 0x0508)
+      tex = dev.read32(tb + 0x0224)
+      poly = dev.read32(tb + 0x0084)
+      l1c = dev.read32(tb + 0x048c)
+      mpc = dev.read32(tb + 0x0430)
+      mp_warp = dev.read32(tb + 0x0648)
+      mp_global = dev.read32(tb + 0x0650)
+      tpcs.append({
+        "tpc": t,
+        "summary": tpc_summary,
+        "tex": tex, "poly": poly, "l1c": l1c, "mpc": mpc,
+        "mp_warp": mp_warp, "mp_global": mp_global,
+        "mp_warp_name": _decode_enum(mp_warp & 0xffff, _GK104_MP_WARP_ERRORS),
+        "mp_global_names": _decode_bits(mp_global, _GK104_MP_GLOBAL_ERRORS),
+      })
+    gpcs.append({
+      "gpc": g, "summary": gpc_summary,
+      "rop_stat": gpc_rop_stat, "rop_x": gpc_rop_x, "rop_y": gpc_rop_y,
+      "rop_fmt": gpc_rop_fmt,
+      "zcull": gpc_zcull, "ccache": gpc_ccache, "esetup": gpc_esetup,
+      "tpcs": tpcs,
+    })
+
+  # Per-ROP trap state.
+  rops = []
+  _ka()
+  for r in range(max(rop_nr, 1)):
+    rb = 0x410000 + r * 0x400
+    rops.append({
+      "rop": r,
+      "stat_z": dev.read32(rb + 0x070),
+      "stat_c": dev.read32(rb + 0x144),
+    })
+
+  fecs_gpccs = snapshot_fecs_gpccs(dev)
+
+  snap = {
+    "label": label,
+    "pgraph": {
+      "intr": pgraph_intr,
+      "intr_names": _decode_bits(pgraph_intr, _GK104_PGRAPH_INTR_BITS),
+      "trap": pgraph_trap,
+      "trap_names": _decode_bits(pgraph_trap, _GK104_PGRAPH_TRAP_BITS),
+      "data_error": pgraph_data_error,
+      "gpc_trap": pgraph_gpc_trap,
+      "rop_trap": pgraph_rop_trap,
+      "status": pgraph_status,
+      "status_main": pgraph_status_main,
+      "ctrl": pgraph_ctrl,
+      "fe_pwr": fe_pwr,
+      "trapped_addr": pgraph_trapped_addr,
+      "trapped_subc": trapped_subc,
+      "trapped_mthd": trapped_mthd,
+      "trapped_data": pgraph_trapped_data,
+      "dispatch_stat": dispatch_stat,
+      "dispatch_names": _decode_bits(dispatch_stat & 0x3fffffff,
+                                     _GK104_DISPATCH_ERRORS),
+      "ccache_stat": ccache_stat,
+      "ccache_names": _decode_bits(ccache_stat & 0x3fffffff,
+                                   _GK104_CCACHE_ERRORS),
+      "shader_stat": shader_stat,
+      "sked_stat": sked_stat,
+      "sked_names": _decode_bits(sked_stat, _GK104_SKED_ERRORS),
+      "m2mf_stat": m2mf_stat,
+      "unk6_stat": unk6_stat,
+      "macro_stat": macro_stat, "macro_pc": macro_pc, "macro_op": macro_op,
+      "subch_classes": subch_classes,
+    },
+    "hub_faults": hub_faults,
+    "gpcs": gpcs,
+    "rops": rops,
+    "fecs": fecs_gpccs["fecs"],
+    "gpccs": fecs_gpccs["gpccs"],
+    "topology": {"gpc_nr": gpc_nr, "tpc_nr": tpc_nr, "rop_nr": rop_nr},
+  }
+
+  # Human-readable summary (always printed).
+  _print_trap_snapshot(snap)
+
+  # Optional JSON output for tooling.
+  if emit_json or os.environ.get("KEPLER_TRAP_JSON") == "1":
+    print(f"[kepler-trap-json] {json.dumps(snap, default=str)}", flush=True)
+
+  return snap
+
+def _print_trap_snapshot(snap):
+  """Print a concise human-readable summary of a trap snapshot."""
+  p = snap["pgraph"]
+  print(f"[kepler-trap] {snap['label']}: "
+        f"INTR={p['intr']:#x}[{','.join(p['intr_names']) or '-'}] "
+        f"TRAP={p['trap']:#x}[{','.join(p['trap_names']) or '-'}] "
+        f"GPC={p['gpc_trap']:#x} ROP={p['rop_trap']:#x} "
+        f"ADDR={p['trapped_addr']:#x}(subc={p['trapped_subc']},"
+        f"mthd={p['trapped_mthd']:#x}) DATA={p['trapped_data']:#x} "
+        f"STATUS={p['status_main']:#x} FE_PWR={p['fe_pwr']:#x}", flush=True)
+  if p["trap"] & 0x1:
+    print(f"[kepler-trap]   DISPATCH={p['dispatch_stat']:#x}"
+          f"[{','.join(p['dispatch_names']) or '-'}]", flush=True)
+  if p["trap"] & 0x8:
+    print(f"[kepler-trap]   CCACHE={p['ccache_stat']:#x}"
+          f"[{','.join(p['ccache_names']) or '-'}]", flush=True)
+  if p["trap"] & 0x10:
+    print(f"[kepler-trap]   SHADER={p['shader_stat']:#x} "
+          f"sph={p['shader_stat'] & 0xffffff:#x} "
+          f"stage={(p['shader_stat'] >> 24) & 0x3f:#x}", flush=True)
+  if p["trap"] & 0x100:
+    print(f"[kepler-trap]   SKED={p['sked_stat']:#x}"
+          f"[{','.join(p['sked_names']) or '-'}]", flush=True)
+  for s, cls in p["subch_classes"].items():
+    if cls:
+      print(f"[kepler-trap]   subch{s}={cls:#x}", flush=True)
+  for hf in snap["hub_faults"]:
+    print(f"[kepler-trap]   HUB fault unit={hf['unit']} "
+          f"stat={hf['stat']:#x} addr={hf['addr']:#x}", flush=True)
+  for g in snap["gpcs"]:
+    if g["summary"] or any(t["summary"] for t in g["tpcs"]):
+      print(f"[kepler-trap]   GPC{g['gpc']}: summary={g['summary']:#x} "
+            f"zcull={g['zcull']:#x} ccache={g['ccache']:#x} "
+            f"esetup={g['esetup']:#x}", flush=True)
+      for t in g["tpcs"]:
+        if t["summary"]:
+          print(f"[kepler-trap]     TPC{t['tpc']}: summary={t['summary']:#x} "
+                f"tex={t['tex']:#x} poly={t['poly']:#x} l1c={t['l1c']:#x} "
+                f"mpc={t['mpc']:#x} mp_warp={t['mp_warp']:#x}"
+                f"[{t['mp_warp_name'] or '-'}] "
+                f"mp_global={t['mp_global']:#x}"
+                f"[{','.join(t['mp_global_names']) or '-'}]", flush=True)
+  f = snap["fecs"]
+  g = snap["gpccs"]
+  print(f"[kepler-trap]   FECS: CPUCTL={f['cpuctl']:#x} "
+        f"PC={f['pc']:#x} SCRATCH0={f['scratch0']:#x} "
+        f"SCRATCH1={f['scratch1']:#x} SCRATCH5={f['scratch5_err']:#x} "
+        f"CHAN_ADDR={f['chan_addr']:#x} CHAN_NEXT={f['chan_next']:#x} "
+        f"MEM_CMD={f['mem_cmd']:#x} MEM_TGT={f['mem_target']:#x} "
+        f"MEM_BASE={f['mem_base']:#x}", flush=True)
+  print(f"[kepler-trap]   GPCCS: CPUCTL={g['cpuctl']:#x} "
+        f"PC={g['pc']:#x} SCRATCH0={g['scratch0']:#x}", flush=True)
 
 # GK104 GPFIFO entries are 8 bytes: a push-buffer address followed by a
 # length/flags word. GP_PUT/GP_GET are ring-entry indices, not byte addresses.
@@ -2528,6 +3458,10 @@ def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
   # 5. Attrib CB address (gf100_grctx_generate_attrib_cb)
   dev.write32(0x418810, 0x80000000 | (attrib_cb_pa >> 12))
   dev.write32(0x419848, 0x10000000 | (attrib_cb_pa >> 12))
+  print(f"[kepler] grctx buffer regs: pagepool={dev.read32(0x40800c):#x}/"
+        f"{dev.read32(0x419004):#x} expected={pagepool_pa >> 8:#x} "
+        f"bundle={dev.read32(0x408004):#x}/{dev.read32(0x418808):#x} "
+        f"expected={bundle_pa >> 8:#x}", flush=True)
   # 6. Attrib configuration (gf117_grctx_generate_attrib)
   alpha = C["alpha_nr"]
   beta = C["attrib_nr"]
@@ -2626,6 +3560,17 @@ def _gk104_pramin_read32(dev, pa):
   dev.write32(0x001700, base >> 16)
   return dev.read32(0x700000 + (pa & 0xfffff))
 
+def _gk104_pramin_write_literal(dev, pa, data):
+  """Write raw dwords without the TinyGPU readback/XOR compensation."""
+  data = memoryview(data).cast("B")
+  if len(data) & 3:
+    raise ValueError("literal PRAMIN write must be 4-byte aligned")
+  for off in range(0, len(data), 4):
+    addr = pa + off
+    dev.write32(0x001700, (addr & 0xffffff00000) >> 16)
+    dev.write32(0x700000 + (addr & 0xfffff),
+                struct.unpack_from("<I", data, off)[0])
+
 def _gk104_bar_flush(dev):
   """Flush pending framebuffer/BAR writes (g84_bar_flush)."""
   for _ in range(2):  # gf100_bar_bar1_wait() deliberately flushes twice.
@@ -2677,7 +3622,8 @@ def _gk104_fb_init_page(dev):
   """
   nvkm_mask(dev, 0x100c80, 0x00000001, 0x00000000)
 
-def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0):
+def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
+                              map_vram=True, userd_alias_pa=None):
   """Bootstrap an identity BAR1 mapping for GK104 VRAM.
 
   Maps the low ``mapped_size`` bytes of the sysmem-backed "VRAM" 1:1 through
@@ -2686,9 +3632,9 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0):
   BAR1 aperture on the GTX 770 eGPU, including all channel VMM page tables
   and FIFO buffers allocated from the 0x400000+ heap.
 
-  ``bus_base`` is the GPU-visible sysmem bus address of the backing memory
-  (dev.bus_base).  PTEs are encoded with the HOST aperture (aper=2) and VOL
-  bit, matching gf100_vmm_valid() for NVKM_MEM_TARGET_HOST:
+  By default this maps BAR1 virtual addresses to the same VRAM offsets.  That
+  is the mapping PFIFO's GK104 USERD polling path requires.  ``map_vram=False``
+  retains the older diagnostic mapping to GPU-visible host sysmem.
 
       pte = (pa >> 8) | BIT(0) | BIT(32) | (2ULL << 33)
 
@@ -2715,15 +3661,23 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0):
   _gk104_pramin_write(dev, pgd_pa,
                       struct.pack("<Q", (1 << 32) | (spt_pa << 24)))
 
-  # PTEs: map each 4 KiB page to the corresponding sysmem bus address with
-  # the HOST aperture bits.  gf100_vmm_pgt_pte() + gf100_vmm_valid():
+  # PTEs: map each 4 KiB BAR1 VA to the corresponding VRAM page, or to host
+  # sysmem for the legacy diagnostic mode.  gf100_vmm_valid() encodes VRAM as
+  # aperture 0 without VOL, and HOST as aperture 2 with VOL.
   #   data = (addr >> 8) | map->type
   #   map->type = BIT(0) | (vol << 32) | (aper << 33)
   #   vol=1, aper=2 for NVKM_MEM_TARGET_HOST.
   pte_data = bytearray(spt_bytes)
   for page in range(pages):
-    pa = bus_base + page * 0x1000
-    pte = (pa >> 8) | 0x1 | (0x1 << 32) | (0x2 << 33)
+    if map_vram:
+      # Nouveau allocates a BAR1 VMA for the global USERD object.  Alias its
+      # first pages at VA 0 while retaining identity mapping elsewhere.
+      pa = ((userd_alias_pa + page * 0x1000)
+            if userd_alias_pa is not None and page < 2 else page * 0x1000)
+      pte = (pa >> 8) | 0x1
+    else:
+      pa = bus_base + page * 0x1000
+      pte = (pa >> 8) | 0x1 | (0x1 << 32) | (0x2 << 33)
     struct.pack_into("<Q", pte_data, page * 8, pte)
   # Write PTEs in 4 KiB pages to stay within the PRAMIN window.
   for off in range(0, spt_bytes, 0x1000):
@@ -2732,6 +3686,35 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0):
   _gk104_bar_flush(dev)
   if not _gk104_ltc_invalidate(dev):
     raise TimeoutError("GK104 LTC flush before BAR1 enable did not complete")
+  # TinyGPU's framebuffer stores can read back correctly immediately and
+  # settle to their XOR-inverted value a few milliseconds later.  Stabilise
+  # the translation root and the two USERD alias leaves before HUB clients
+  # are allowed to use them.
+  critical = [
+      (inst_pa + 0x200, pgd_pa),
+      (pgd_pa, (1 << 32) | (spt_pa << 24)),
+  ]
+  for page in range(2):
+    pa = ((userd_alias_pa + page * 0x1000)
+          if userd_alias_pa is not None else page * 0x1000)
+    critical.append((spt_pa + page * 8, (pa >> 8) | 0x1))
+    if userd_alias_pa is not None:
+      userd_page = userd_alias_pa // 0x1000 + page
+      critical.append((spt_pa + userd_page * 8, (pa >> 8) | 0x1))
+  for attempt in range(4):
+    for addr, wanted in critical:
+      _gk104_pramin_write(dev, addr, struct.pack("<Q", wanted))
+    _gk104_bar_flush(dev)
+    if not _gk104_ltc_invalidate(dev):
+      raise TimeoutError("GK104 LTC invalidate for BAR1 roots did not complete")
+    time.sleep(0.005)
+    actual = [(_gk104_pramin_read32(dev, addr) |
+               (_gk104_pramin_read32(dev, addr + 4) << 32))
+              for addr, _ in critical]
+    if actual == [wanted for _, wanted in critical]:
+      break
+  else:
+    raise RuntimeError(f"GK104 BAR1 roots did not stabilise: {actual}")
   _gk104_vmm_flush_pdb(dev, pgd_pa, target=0, hub_only=True)
   if DEBUG:
     print(f"[kepler] BAR1 bootstrap PRAMIN pdb="
@@ -2745,7 +3728,10 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0):
   _gk104_bar_flush(dev)
   if DEBUG:
     print(f"[kepler] BAR1 identity enabled inst={inst_pa:#x} pgd={pgd_pa:#x} "
-          f"spt={spt_pa:#x} size={mapped_size:#x} bus_base={bus_base:#x}",
+          f"spt={spt_pa:#x} size={mapped_size:#x} "
+          f"target={'VRAM' if map_vram else 'HOST'} "
+          f"userd_alias={userd_alias_pa if userd_alias_pa is not None else 0:#x} "
+          f"bus_base={bus_base:#x}",
           flush=True)
 
 def _gk104_ltc_invalidate(dev):
@@ -2837,6 +3823,94 @@ def _gk104_vmm_flush_pdb(dev, pdb, target=0, hub_only=False):
     time.sleep(0.001)
   return False
 
+def _reload_fecs_after_pgob(dev):
+  """Reload FECS firmware after pgob has reset the GR engine.
+  FECS power-gates when idle (hardware auto power-gate that can't be disabled
+  without a PMU).  The pgob un-gates the GR engine but destroys FECS (PC=0).
+  This function reloads FECS IMEM + DMEM + csdata and restarts it, so it can
+  process channel context switches.  The golden context is already in memory
+  and referenced by the channel's instance pointer, so no golden save is needed.
+  Returns True if FECS became ready, False otherwise."""
+  fecs_code = dev._fecs_code
+  fecs_data = dev._fecs_data
+  fecs_packs = dev._fecs_packs
+  # Disable ctxctl clock-gate for FECS DMEM/IMEM access.
+  dev.write32(0x000260, 0x00000000)
+  # Set FE_PWR FORCE_ON before falcon work.
+  dev.write32(0x404170, 0x00000012)
+  for _ in range(2000):
+    if not (dev.read32(0x404170) & 0x00000010): break
+    time.sleep(0.001)
+  # Load FECS IMEM.
+  falcon_write_imem(dev, FECS_FALCON_BASE, fecs_code)
+  dev.write32(FECS_FALCON_BASE + FALCON_UC_ENTRY, 0)
+  # Load FECS DMEM + csdata.
+  fecs_data_words = struct.unpack_from(f"<{len(fecs_data)//4}I", fecs_data)
+  dev.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX, FALCON_IDX_WRITE)
+  for w in fecs_data_words:
+    dev.write32(FECS_FALCON_BASE + FALCON_DATA, w)
+  fecs_star = 0x304
+  for starstar, words in fecs_packs:
+    dev.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX, FALCON_IDX_WRITE | fecs_star)
+    for w in words:
+      dev.write32(FECS_FALCON_BASE + FALCON_DATA, w)
+      fecs_star += 4
+    dev.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX, 0x01000000 | (starstar + 4))
+    dev.write32(FECS_FALCON_BASE + FALCON_DATA, fecs_star)
+  # Re-enable ctxctl clock-gate, then start FECS.
+  dev.write32(0x000260, 0x00000001)
+  # Keep FE_PWR at FORCE_ON (not AUTO).
+  dev.write32(0x404170, 0x00000012)
+  # Disable FECS idle filter to prevent auto clock-gating.
+  dev.write32(0x020288, 0x00000000)
+  dev.write32(0x02028c, 0x00000000)
+  # Clear RED_SWITCH ENABLE bits to disable power-gating.
+  _red_switch = dev.read32(0x409614)
+  dev.write32(0x409614, _red_switch & ~0x700)
+  # Ensure PWR_GATE has bit30=1 (un-gate), bit31=0 (disable gating).
+  nvkm_mask(dev, 0x020004, 0xc0000000, 0x40000000)
+  # Clear FECS mailbox and start FECS.
+  dev.write32(0x409800, 0x00000000)
+  # Read and clear the halt/reset register before starting.
+  _halt_reg = dev.read32(FECS_FALCON_BASE + 0x10c)
+  dev.write32(FECS_FALCON_BASE + 0x10c, 0x00000000)
+  # Clear CPUCTL completely first, then start.
+  _pre_start = dev.read32(0x409100)
+  dev.write32(FECS_FALCON_BASE + FALCON_UC_CTRL, 0x00000000)  # clear all
+  time.sleep(0.001)
+  _mid_start = dev.read32(0x409100)
+  dev.write32(FECS_FALCON_BASE + FALCON_UC_CTRL, FALCON_UC_CTRL_START)
+  time.sleep(0.01)
+  _post_start = dev.read32(0x409100)
+  print(f"[kepler] FECS reload: halt_reg={_halt_reg:#x} "
+        f"pre={_pre_start:#x} mid={_mid_start:#x} post={_post_start:#x} "
+        f"PC={dev.read32(0x409ff0):#x}", flush=True)
+  # Verify IMEM was loaded
+  dev.write32(FECS_FALCON_BASE + FALCON_CODE_INDEX, 0)
+  _imem_check = dev.read32(FECS_FALCON_BASE + FALCON_CODE)
+  print(f"[kepler] FECS reload IMEM verify: IMEM[0]={_imem_check:#x} "
+        f"(expect 0x039b0ef5)", flush=True)
+  print(f"[kepler] FECS reloaded after pgob, waiting for ready...", flush=True)
+  try:
+    wait_cond(lambda: falcon_ready(dev, FECS_FALCON_BASE),
+              timeout_ms=2000, msg="FECS ready after reload")
+  except TimeoutError:
+    print(f"[kepler] FECS NOT ready after reload: CPUCTL={dev.read32(0x409100):#x} "
+          f"SCRATCH0={dev.read32(0x409800):#x} PC={dev.read32(0x409ff0):#x}",
+          flush=True)
+    return False
+  # Set FE_PWR FORCE_ON and disable idle filter after FECS is ready.
+  dev.write32(0x404170, 0x00000012)
+  dev.write32(0x020288, 0x00000000)
+  dev.write32(0x02028c, 0x00000000)
+  _red_switch = dev.read32(0x409614)
+  dev.write32(0x409614, _red_switch & ~0x700)
+  nvkm_mask(dev, 0x020004, 0xc0000000, 0x40000000)
+  print(f"[kepler] FECS reloaded and ready: CPUCTL={dev.read32(0x409100):#x} "
+        f"SCRATCH0={dev.read32(0x409800):#x} FE_PWR={dev.read32(0x404170):#x}",
+        flush=True)
+  return True
+
 def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   """Set up a GK104 compute channel (RAMIN + USERD + GPFIFO), push `words` into
   the GPFIFO ring, kick the channel, and poll the host semaphore until it
@@ -2844,7 +3918,19 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   (`dev.vram`); `signal_pa` is the mmap offset of the semaphore page.  The GR
   context-buffer content (RAMIN 0x0210) and the exact GPFIFO ring base wiring
   are KEPLER-TODO pending a nouveau GK104 channel trace on silicon."""
+  # Reassert the polling-only interrupt policy after VBIOS/engine init and
+  # before any operation that can raise a PFIFO or PGRAPH source.
+  dev.write32(0x000140, 0x00000000)
+  dev.write32(0x000640, 0x00000000)
+  dev.read32(0x000140)
   vram, base, mm = dev.dev_impl.vram, dev.dev_impl.bus_base, dev.dev_impl.mm
+  signal_initial = struct.unpack_from("<I", vram, signal_pa)[0]
+  # The old bring-up path fell back to undocumented/manual dispatch when the
+  # normal scheduler did not become resident.  On macOS that turned a
+  # diagnosable MMU fault into GPU DMA through an invalid context and could
+  # panic the host.  Keep those experiments available only as an explicit
+  # developer opt-in; the normal add demo must fail closed.
+  unsafe_experiments = os.environ.get("KEPLER_UNSAFE_EXPERIMENTS") == "1"
   alloc = NVAllocator(dev)
   ramin = alloc.alloc(0x1000)
   userd = alloc.alloc(0x200)
@@ -2867,10 +3953,17 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   chan_id = int(os.environ.get("KEPLER_CHAN_ID", "1"))
   userd_base_off = chan_id * 0x200
   use_vram_inst = (os.environ.get("KEPLER_VRAM_INST") != "0" and dev.dev_impl.hw is not None)
-  use_vram_runlist = os.environ.get("KEPLER_VRAM_RUNLIST") == "1" and dev.dev_impl.hw is not None
-  use_vram_gpfifo = os.environ.get("KEPLER_VRAM_GPFIFO") == "1" and use_vram_inst
-  use_vram_push = os.environ.get("KEPLER_VRAM_PUSH") == "1" and use_vram_inst
-  use_vram_signal = os.environ.get("KEPLER_VRAM_SEMAPHORE") == "1" and use_vram_inst
+  # nv50_runl_alloc() uses NVKM_MEM_TARGET_INST; on discrete GK104 that is
+  # framebuffer memory and gk104_runl_commit() emits TARGET=VRAM.  Host NCOH
+  # is accepted by the descriptor format but is not Nouveau's normal path.
+  use_vram_runlist = (os.environ.get("KEPLER_VRAM_RUNLIST", "1") != "0" and
+                      dev.dev_impl.hw is not None)
+  use_vram_gpfifo = (os.environ.get("KEPLER_VRAM_GPFIFO", "1") != "0" and
+                      use_vram_inst)
+  use_vram_push = (os.environ.get("KEPLER_VRAM_PUSH", "1") != "0" and
+                    use_vram_inst)
+  use_vram_signal = (os.environ.get("KEPLER_VRAM_SEMAPHORE", "1") != "0" and
+                      use_vram_inst)
   from grctx_gk104 import GK104_GRCTX_CONSTS as _GC
   _tpc_nr = [dev.read32(0x500000 + gpc * 0x8000 + 0x2608) & 0x1f
              for gpc in range(dev.read32(0x409604) & 0x1f)]
@@ -2893,6 +3986,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     (0x405830, (_beta << 16) | _alpha),
     (0x4064c4, ((_alpha // 4) << 16) | 0xffff),
   ]
+  print(f"[kepler] GR buffer VAs: pagepool={pagepool.va_addr:#x}+{pagepool.size:#x} "
+        f"bundle={bundle_cb.va_addr:#x}+{bundle_cb.size:#x} "
+        f"attrib={attrib_cb.va_addr:#x}+{attrib_cb.size:#x} "
+        f"mmio={mmio_list.va_addr:#x}+{mmio_list.size:#x}", flush=True)
   _bo, _ao = 0, _GC["attrib_nr_max"] * sum(_tpc_nr)
   for _gpc, _mask in enumerate(_ppc_masks):
     _count = _mask.bit_count()
@@ -2908,7 +4005,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                        for reg, value in runtime_mmio_entries)
   vram[mmio_list.meta["pa"]:mmio_list.meta["pa"] + len(mmio_blob)] = mmio_blob
   mmio_list.meta["priv"] = True
-  dev._kepler_vram_mirrors = list(getattr(dev, "_kepler_vram_mirrors", ())) + [mmio_list]
+  if os.environ.get("KEPLER_MMIO_LIST_VRAM") == "1":
+    dev._kepler_vram_mirrors = list(
+        getattr(dev, "_kepler_vram_mirrors", ())) + [mmio_list]
   if DEBUG and dev.dev_impl.hw is not None:
     bar1_ctl = dev.read32(0x1704)
     bar1_inst_pa = (bar1_ctl & 0x3fffffff) << 12
@@ -2964,6 +4063,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     data = memoryview(data).cast("B")
     for off in range(0, len(data), 0x1000):
       dev.dev_impl.hw.mmio_write(1, pa + off, data[off:off + 0x1000].tobytes())
+  ctx_alias_ptes = []
   if use_vram_inst:
     # Match gf100_fb_init_page() for GK104's default 128-KiB big-page mode.
     # The bit also selects the PGD/SPT split used for 4-KiB mappings.
@@ -2980,6 +4080,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     pagepool_vram_pa = bar1_alloc(0x8000)
     bundle_vram_pa = bar1_alloc(0x3000)
     attrib_vram_pa = bar1_alloc(0x100000)
+    mmio_list_vram_pa = bar1_alloc(0x1000)
     gpfifo_vram_pa = bar1_alloc(0x2000, align=0x2000) if use_vram_gpfifo else None
     if gpfifo_vram_pa is not None and os.environ.get("KEPLER_GPFIFO_IN_USERD") == "1":
       # Diagnostic: USERD page 0 offset 0 is unused by CHID 1 (its USERD is at
@@ -3003,18 +4104,16 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # TinyGPU BAR1 bulk stores can leave inverted/stale dwords, so repair the
     # golden-context allocation before it becomes the source for every channel.
     def repair_zero(label, pa, size):
-      dirty = []
-      for off in range(0, size, 0x1000):
-        page = dev.dev_impl.hw.mmio_read(1, pa + off, min(0x1000, size - off))
-        for word in range(0, len(page), 4):
-          if page[word:word + 4] != b"\0\0\0\0":
-            dirty.append((off + word, page[word:word + 4]))
-      print(f"[kepler] {label} zero verify: dirty={len(dirty)} "
-            f"sample={[(hex(o), v.hex()) for o, v in dirty[:8]]}", flush=True)
-      for off, _value in dirty:
-        _gk104_pramin_write(dev, pa + off, b"\0\0\0\0")
-      if dirty:
-        _gk104_bar_flush(dev)
+      # The compensated writer cannot be used for zero here: its transformed
+      # immediate readback makes a raw 0xffffffff operand look like zero while
+      # the GPU still observes all ones.  Store literal zero dwords instead.
+      _gk104_pramin_write_literal(dev, pa, bytes(size))
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError(f"GK104 LTC invalidate while zeroing {label} failed")
+      time.sleep(0.005)
+      sample = dev.dev_impl.hw.mmio_read(1, pa, min(size, 0x20)).hex()
+      print(f"[kepler] {label} raw-zero store complete sample={sample}", flush=True)
     repair_zero("GR ctx", grctx_vram_pa, 0x100000)
     repair_zero("pagepool", pagepool_vram_pa, 0x8000)
     repair_zero("bundle", bundle_vram_pa, 0x3000)
@@ -3035,10 +4134,29 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     gr_ctx = HCQBuffer(0x08000000, 0x100000, meta={"pa": grctx_vram_pa})
     dev.dev_impl.mm.map_range(gr_ctx.va_addr, gr_ctx.size,
                               [(grctx_vram_pa, gr_ctx.size)], AddrSpace.PHYS)
+    # Map the MMIO list and other GR buffers in the channel's VMM so the
+    # FECS firmware can read them via MEM_TARGET=VM (xdld).  Without these
+    # mappings, the FECS hangs at xdld in ctx_mmio_loop because the MMIO
+    # list VA has no page table entry.
+    dev.dev_impl.mm.map_range(mmio_list.va_addr, 0x1000,
+                              [(mmio_list_vram_pa, 0x1000)], AddrSpace.PHYS)
+    dev.dev_impl.mm.map_range(pagepool.va_addr, 0x8000,
+                              [(pagepool_vram_pa, 0x8000)], AddrSpace.PHYS)
+    dev.dev_impl.mm.map_range(bundle_cb.va_addr, 0x3000,
+                              [(bundle_vram_pa, 0x3000)], AddrSpace.PHYS)
+    dev.dev_impl.mm.map_range(attrib_cb.va_addr, 0x100000,
+                              [(attrib_vram_pa, 0x100000)], AddrSpace.PHYS)
+    print(f"[kepler] VMM map: mmio_list va={mmio_list.va_addr:#x} "
+          f"pa={mmio_list_vram_pa:#x}", flush=True)
+    # Write the MMIO list data to VRAM so the FECS can read it via VMM.
+    bar1_write(mmio_list_vram_pa, mmio_blob)
+    _gk104_pramin_write(dev, mmio_list_vram_pa, mmio_blob)
+    _gk104_bar_flush(dev)
   else:
     ramin_vram_pa = None
     userd_vram_pa = None
     pagepool_vram_pa = bundle_vram_pa = attrib_vram_pa = None
+    mmio_list_vram_pa = None
     gpfifo_vram_pa = None
     push_vram_pa = None
     signal_vram_pa = None
@@ -3097,6 +4215,34 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # Allow the caller to mirror selected buffers into framebuffer memory and
     # replace only their leaf PTEs in the channel's cloned VMM.
     cloned_by_pgd = {idx: dst for idx, _src, dst in cloned_spts}
+    _alias_pgd_idx = 0x1fff
+    _alias_spt_pa = bar1_alloc(0x40000)
+    _alias_mem_pa = bar1_alloc(0x10000)
+    bar1_write(_alias_spt_pa, bytes(0x40000))
+    bar1_write(_alias_mem_pa, bytes(0x10000))
+    cloned_by_pgd[_alias_pgd_idx] = _alias_spt_pa
+    cloned_spts.append((_alias_pgd_idx, -1, _alias_spt_pa))
+    _alias_cursor = _alias_mem_pa
+    for _bad_base, _bad_size in (
+        ((((~(bundle_cb.va_addr >> 8)) & 0xffffffff) << 8) & ((1 << 40) - 1),
+         bundle_cb.size),
+        ((((~(pagepool.va_addr >> 8)) & 0xffffffff) << 8) & ((1 << 40) - 1),
+         pagepool.size)):
+      _first = _bad_base & ~0xfff
+      _pages = round_up((_bad_base & 0xfff) + _bad_size, 0x1000) // 0x1000
+      for _page in range(_pages):
+        _va = _first + _page * 0x1000
+        _spti = (_va >> 12) & 0x7fff
+        ctx_alias_ptes.append(
+            (_alias_spt_pa + _spti * 8,
+             ((_alias_cursor + _page * 0x1000) >> 8) | 1))
+      _alias_cursor += _pages * 0x1000
+    # The cold BAR path leaves unused SPT dwords as all ones.  SCC context
+    # load touches this otherwise-unallocated scratch VA; give it a dedicated
+    # writable guard page instead of accepting the stale RO PTE.
+    ctx_alias_ptes.append(
+        (cloned_by_pgd[0] + 0x67 * 8, (_alias_cursor >> 8) | 1))
+    _alias_cursor += 0x1000
     for mirror in getattr(dev, "_kepler_vram_mirrors", ()):
       mirror_pa = bar1_alloc(round_up(mirror.size, 0x1000))
       src_pa = mirror.meta["pa"]
@@ -3224,6 +4370,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   struct.pack_into("<II", ring, 0, push_addr & 0xffffffff,
                    (push_addr >> 32) | ((1 << 9) if gpfifo_external else 0) |
                    (len(words) << 10) | ((1 << 31) if gpfifo_no_prefetch else 0))
+  ring_store = bytearray(ring)
+  if os.environ.get("KEPLER_GPU_XOR_RING") == "1":
+    struct.pack_into("<I", ring_store, 0,
+                     (~struct.unpack_from("<I", ring, 0)[0]) & 0xffffffff)
   vram[gpfifo_pa:gpfifo_pa + len(ring)] = ring
   if gpfifo_vram_pa is not None:
     ring_page = bytearray(0x1000)
@@ -3249,12 +4399,15 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   struct.pack_into("<I", inst, 0x10, 0x0000face)
   struct.pack_into("<I", inst, 0x30, 0xfffff902)
   struct.pack_into("<I", inst, 0x84, 0x20400000)
-  # nouveau_channel_new(): args.devm = BIT(0) for the GR runlist.  Supplying
-  # 0xfff advertises engines that are not attached to this channel/runlist and
-  # leaves PBDMA with a valid-but-undispatchable RAMFC.
+  # gk104_chan_ramfc's 0xfff is the class capability default; channel
+  # creation passes the selected engine mask to ramfc_write().  This channel
+  # belongs to GR only, so advertise BIT(GR engine id 0).  Advertising absent
+  # video/copy engines raises PBDMA DEVICE on this topology.
   struct.pack_into("<I", inst, 0x94, 0x30000001)
   struct.pack_into("<I", inst, 0x9c, 0x00000100)
   struct.pack_into("<I", inst, 0xac, 0x0000001f)
+  # gk104_chan_ramfc.priv advertises support for the constructor's `priv`
+  # argument; an ordinary userspace channel passes false.
   struct.pack_into("<I", inst, 0xe4, 0x00000000)
   struct.pack_into("<I", inst, 0xe8, chan_id)
   struct.pack_into("<I", inst, 0xb8, 0xf8000000)
@@ -3266,38 +4419,22 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   else:
     vram[ramin_pa:ramin_pa + len(inst)] = bytes(inst)
   if DEBUG and use_vram_inst:
-    inst_read = dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + 0x48, 8)
-    print(f"[kepler] ramfc48_final={inst_read.hex()} ring_words="
-          f"{struct.unpack_from('<II', vram, gpfifo_pa)} userd_ramfc="
-          f"{dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + 0x08, 8).hex()}")
-    def bar1_read_u32(pa):
+    # Read the instance block PDB and channel PDE through individual byte BAR1
+    # reads for diagnostics only.  Never use untrusted BAR readback to drive
+    # the live path; PRAMIN is authoritative for page-table validation.
+    def _bar1_read_u32(pa):
       return int.from_bytes(b"".join(dev.dev_impl.hw.mmio_read(1, pa + i, 1)
                                      for i in range(4)), "little")
-    def bar1_read_u64(pa):
-      return bar1_read_u32(pa) | (bar1_read_u32(pa + 4) << 32)
-    pdb_read = bar1_read_u64(ramin_vram_pa + 0x200)
-    ctx_va = gr_ctx.va_addr + 0x80000
-    ctx_pgd_idx = (ctx_va >> 27) & 0x1fff
-    ctx_spt_idx = (ctx_va >> 12) & 0x7fff
-    pde_read = bar1_read_u64(vmm_pgd_pa + ctx_pgd_idx * 8)
-    ctx_spt_pa = (pde_read >> 24) & ~0xfff
-    pte_read = bar1_read_u64(ctx_spt_pa + ctx_spt_idx * 8)
-    ctx_pa_read = (pte_read & 0xfffffff0) << 8
-    ctx_head = ([bar1_read_u32(ctx_pa_read + off) for off in range(0, 16, 4)]
-                if ctx_pa_read + 16 <= dev.dev_impl.bar1_size else "outside-BAR1")
-    print(f"[kepler] FECS VMM walk: inst_pdb={pdb_read:#x} "
-          f"pgd[{ctx_pgd_idx}]={pde_read:#x} spt={ctx_spt_pa:#x} "
-          f"pte[{ctx_spt_idx:#x}]={pte_read:#x} ctx_pa={ctx_pa_read:#x} "
-          f"ctx_head={ctx_head} mmu={dev.read32(0x100c80):#x}", flush=True)
-    dst_spt_by_pgd = {idx: dst for idx, _src, dst in cloned_spts}
-    for label, va in (("gpfifo", gpfifo.va_addr), ("push", push.va_addr)):
-      pgdi, spti = (va >> 27) & 0x1fff, (va >> 12) & 0x7fff
-      src_spt = mm.root_page_table.address(pgdi)
-      src_pte = struct.unpack_from("<Q", vram, src_spt + spti * 8)[0]
-      dst = dst_spt_by_pgd[pgdi] + spti * 8
-      dst_pte = _gk104_pramin_read32(dev, dst) | (_gk104_pramin_read32(dev, dst + 4) << 32)
-      print(f"[kepler] {label} VMM: va={va:#x} host_pte={src_pte:#x} "
-            f"vram_pte={dst_pte:#x}", flush=True)
+    # Read PDB from instance block
+    _pdb_lo = _bar1_read_u32(ramin_vram_pa + 0x200)
+    _pdb_hi = _bar1_read_u32(ramin_vram_pa + 0x204)
+    # Read PDE for signal VA (pgd_idx=0) from cloned page directory
+    _pde_lo = _bar1_read_u32(vmm_pgd_pa + 0)
+    _pde_hi = _bar1_read_u32(vmm_pgd_pa + 4)
+    # Read PTE for signal VA (spt_idx=4) from SPT
+    _spt_pa = ((_pde_lo | (_pde_hi << 32)) >> 24) & ~0xfff
+    _pte_lo = _bar1_read_u32(_spt_pa + 4 * 8)
+    _pte_hi = _bar1_read_u32(_spt_pa + 4 * 8 + 4)
 
   # gk104_mc_reset[] maps NVKM_ENGINE_FIFO to PMC_ENABLE bit 0x100.  A
   # previous TinyGPU process can leave the PBDMA context cache alive even
@@ -3344,17 +4481,16 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     inst_phys = ramin_vram_pa if use_vram_inst else (base + ramin_pa)
     inst_tag = 0x80000000 | (inst_phys >> 12)
     print(f"[kepler] FECS golden ctx: inst_tag={inst_tag:#x} inst_phys={inst_phys:#x} "
-          f"ramin_pa={ramin_pa:#x} ramin_vram_pa={ramin_vram_pa:#x} base={base:#x}", flush=True)
+          f"ramin_pa={ramin_pa:#x} ramin_vram_pa={ramin_vram_pa if ramin_vram_pa is not None else 0:#x} base={base:#x}", flush=True)
     # gf100_grctx_generate() ordering is significant: hold FE power on while
-    # releasing the FECS domains, restore automatic power control, then init
-    # SCC RAM before making the temporary golden-context channel current.
+    # releasing the FECS domains, then init SCC RAM before making the
+    # temporary golden-context channel current.  Keep FE_PWR at FORCE_ON
+    # (not AUTO) to prevent PGRAPH sub-domains from power-gating.
     dev.write32(0x404170, 0x00000012)  # NV_PGRAPH_FE_PWR_MODE_FORCE_ON
     wait_cond(lambda: not bool(dev.read32(0x404170) & 0x00000010),
               timeout_ms=2000, msg="FE power FORCE_ON")
     _gk104_gr_fecs_reset(dev)
-    dev.write32(0x404170, 0x00000010)  # NV_PGRAPH_FE_PWR_MODE_AUTO
-    wait_cond(lambda: not bool(dev.read32(0x404170) & 0x00000010),
-              timeout_ms=2000, msg="FE power AUTO")
+    # Do NOT restore AUTO — keep FORCE_ON to prevent PGRAPH sub-domain gating.
     dev.write32(0x40802c, 0x00000001)  # initialise SCC RAM
     print(f"[kepler] grctx reset: RED_SWITCH={dev.read32(0x409614):#x} "
           f"FE_PWR={dev.read32(0x404170):#x} SCC={dev.read32(0x40802c):#x}", flush=True)
@@ -3455,6 +4591,24 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
       raise
     print(f"[kepler] FECS ctx_chan done: CC_SCRATCH0={dev.read32(0x409800):#x} "
           f"CHAN_ADDR={dev.read32(0x409b00):#x} CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
+    # Start a keep-alive thread to prevent FE domain power-gating during
+    # grctx_main and the golden context save.  The FECS sleeps after ctx_chan
+    # and the FE domain power-gates without FORCE_ON.
+    import threading as _th2
+    _ka_stop2 = _th2.Event()
+    def _ka2():
+      while not _ka_stop2.is_set():
+        try:
+          _pwr = dev.read32(0x404170)
+          if _pwr & 0x10:
+            dev.write32(0x404170, (_pwr & ~0x10) | 0x02)
+          elif _pwr != 0x02:
+            dev.write32(0x404170, 0x00000002)
+        except Exception:
+          pass
+        time.sleep(0.0002)
+    _ka_thread2 = _th2.Thread(target=_ka2, daemon=True)
+    _ka_thread2.start()
     # 3. Populate GR context via grctx->main() (gf100_grctx_generate_main).
     #    This writes the GR register init lists, pagepool/bundle/attrib_cb
     #    addresses, icmd and mthd bundles.  The channel is current so GR
@@ -3493,8 +4647,21 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     #    schedules the channel; bypassing CHSW leaves GR without engine state.
     nvkm_mask(dev, 0x409b04, 0x80000000, 0x00000000)
     dev.write32(0x409000, 0x00000100)
-    wait_cond(lambda: not bool(dev.read32(0x409b00) & 0x80000000),
-              timeout_ms=2000, msg="FECS golden context unload")
+    try:
+      wait_cond(lambda: not bool(dev.read32(0x409b00) & 0x80000000),
+                timeout_ms=2000, msg="FECS golden context unload")
+    except TimeoutError:
+      print(f"[kepler] FECS golden unload TIMEOUT: "
+            f"CPUCTL={dev.read32(0x409100):#x} "
+            f"PC={dev.read32(0x409ff0):#x} "
+            f"SCRATCH0={dev.read32(0x409800):#x} "
+            f"CHAN_ADDR={dev.read32(0x409b00):#x} "
+            f"CHAN_NEXT={dev.read32(0x409b04):#x} "
+            f"IREN={dev.read32(0x409010):#x} "
+            f"INTR={dev.read32(0x409008):#x} "
+            f"FE_PWR={dev.read32(0x404170):#x}",
+            flush=True)
+      raise
     # The saved image begins at CB_RESERVED and its leading words are FECS
     # context metadata.  Do not clear them: Nouveau copies gr->size bytes from
     # this offset verbatim into each runtime engine context.
@@ -3506,6 +4673,73 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     print(f"[kepler] FECS golden save done: CHAN_ADDR={dev.read32(0x409b00):#x} "
           f"CHAN_NEXT={dev.read32(0x409b04):#x} "
           f"IREN={dev.read32(0x409010):#x} head={[hex(x) for x in saved_head]}", flush=True)
+    # Stop the golden-save keep-alive thread.
+    _ka_stop2.set()
+    # Verify RAMFC is intact after golden context save
+    if use_vram_inst:
+      _ramfc_94 = _gk104_pramin_read32(dev, ramin_vram_pa + 0x94)
+      _ramfc_84 = _gk104_pramin_read32(dev, ramin_vram_pa + 0x84)
+      _ramfc_9c = _gk104_pramin_read32(dev, ramin_vram_pa + 0x9c)
+      _ramfc_ac = _gk104_pramin_read32(dev, ramin_vram_pa + 0xac)
+      _ramfc_e8 = _gk104_pramin_read32(dev, ramin_vram_pa + 0xe8)
+    else:
+      _ramfc_94 = struct.unpack_from('<I', vram, ramin_pa + 0x94)[0]
+      _ramfc_84 = struct.unpack_from('<I', vram, ramin_pa + 0x84)[0]
+      _ramfc_9c = struct.unpack_from('<I', vram, ramin_pa + 0x9c)[0]
+      _ramfc_ac = struct.unpack_from('<I', vram, ramin_pa + 0xac)[0]
+      _ramfc_e8 = struct.unpack_from('<I', vram, ramin_pa + 0xe8)[0]
+    print(f"[kepler] RAMFC after golden save: 0x84={_ramfc_84:#x} "
+          f"0x94={_ramfc_94:#x} 0x9c={_ramfc_9c:#x} 0xac={_ramfc_ac:#x} "
+          f"0xe8={_ramfc_e8:#x}", flush=True)
+    print(f"[kepler] FECS ready after golden save: SCRATCH0={dev.read32(0x409800):#x} "
+          f"CPUCTL={dev.read32(0x409100):#x}", flush=True)
+    # FE_PWR FORCE_ON: keep the FE domain powered through the runtime context
+    # setup, bind, runlist submission, and launch.  In AUTO mode, FE power-gates
+    # during the multi-second runtime context copy/repair, and once gated,
+    # FECS registers read 0xbadf1000 and the channel can never dispatch to GR.
+    # The FORCE_ON write must happen while FE is still awake (right after the
+    # golden save, which is the last FE activity).
+    dev.write32(0x404170, 0x00000012)  # NV_PGRAPH_FE_PWR_MODE_FORCE_ON
+    wait_cond(lambda: not bool(dev.read32(0x404170) & 0x00000010),
+              timeout_ms=2000, msg="FE power FORCE_ON after golden save")
+    # Also disable the ctxctl clock-gate (0x000260=0, nouveau nvkm_mc_unk260(0))
+    # to keep FECS clocked.  FE_PWR=FORCE_ON controls the FE (front-end) domain
+    # but does NOT prevent the FECS falcon itself from clock-gating.  The
+    # ctxctl clock-gate at 0x000260 was re-enabled at the end of firmware load
+    # (line ~1045), allowing FECS to auto-gate when idle.  During the multi-
+    # second runtime context setup, FECS gates and cannot be woken by the
+    # channel bind.  Disabling the clock-gate keeps FECS always clocked.
+    dev.write32(0x000260, 0x00000000)
+    # Disable FECS idle filter to prevent therm-managed auto clock-gating.
+    dev.write32(0x020288, 0x00000000)
+    dev.write32(0x02028c, 0x00000000)
+    # Clear RED_SWITCH ENABLE bits to disable power-gating for ROP/GPC/MAIN.
+    # The FECS firmware sets ENABLE_ROP|ENABLE_GPC|ENABLE_MAIN (0x700) during
+    # ctx_redswitch.  Clearing these bits prevents the domains from
+    # power-gating when idle.  Keep POWER bits (0x70) to keep domains powered.
+    _red_switch = dev.read32(0x409614)
+    dev.write32(0x409614, _red_switch & ~0x700)  # clear ENABLE bits
+    # Ensure 0x020004 has bit30=1 (un-gate) and bit31=0 (disable gating).
+    nvkm_mask(dev, 0x020004, 0xc0000000, 0x40000000)
+    print(f"[kepler] FE_PWR+ctxctl after golden save: "
+          f"FE_PWR={dev.read32(0x404170):#x} "
+          f"ctxctl={dev.read32(0x000260):#x} "
+          f"FECS_CTRL={dev.read32(0x409100):#x} "
+          f"RED_SWITCH={dev.read32(0x409614):#x} "
+          f"PWR_GATE={dev.read32(0x020004):#x} "
+          f"idle_filter={dev.read32(0x020288):#x}",
+          flush=True)
+    # Tight poll: sample FECS CPUCTL every 1ms to find exact gate time.
+    _gate_samples = []
+    for _ in range(50):
+      _v = dev.read32(0x409100)
+      _gate_samples.append((_v, _))
+      if _v == 0xbadf1000 or (_v & 0xfffff000) == 0xbadf0000:
+        break
+      time.sleep(0.001)
+    print(f"[kepler] FECS gate poll after golden save: "
+          f"{[(i, hex(v)) for v, i in _gate_samples[:10]]}",
+          flush=True)
     # Nouveau keeps the CB_RESERVED allocation only while generating the
     # global golden image.  A real channel owns a gr->size context beginning at
     # offset zero, populated by copying data[CB_RESERVED:CB_RESERVED+size].
@@ -3513,59 +4747,98 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     if not 0 < ctx_size <= 0x80000:
       raise RuntimeError(f"invalid GK104 context size {ctx_size:#x}")
     if use_vram_inst:
+      _copy_start = time.time()
       for off in range(0, ctx_size, 0x1000):
+        # Keep FECS alive by reading CPUCTL during the copy.
+        # FECS power-gates after ~10ms of idle; the copy can take longer.
+        dev.read32(0x409100)
         chunk = dev.dev_impl.hw.mmio_read(
           1, grctx_vram_pa + 0x80000 + off, min(0x1000, ctx_size - off))
         bar1_write(grctx_vram_pa + off, chunk)
+      _copy_elapsed = time.time() - _copy_start
+      _fecs_after_copy = dev.read32(0x409100)
+      print(f"[kepler] ctx copy: {_copy_elapsed:.3f}s FECS={_fecs_after_copy:#x}",
+            flush=True)
+      # Track FECS state through each subsequent step
+      _fecs_check_points = []
       _gk104_bar_flush(dev)
+      _fecs_check_points.append(("after_bar_flush", dev.read32(0x409100),
+                                 dev.read32(0x400000), dev.read32(0x020004)))
       ctx_mismatches = []
       for off in range(0, ctx_size, 0x1000):
+        dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
         size = min(0x1000, ctx_size - off)
         src = dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + 0x80000 + off, size)
         dst = dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + off, size)
         for word in range(0, size, 4):
           if src[word:word + 4] != dst[word:word + 4]:
             ctx_mismatches.append((off + word, src[word:word + 4], dst[word:word + 4]))
+      _fecs_check_points.append(("after_verify", dev.read32(0x409100),
+                                 dev.read32(0x400000), dev.read32(0x020004)))
       print(f"[kepler] runtime GR ctx verify: mismatches={len(ctx_mismatches)} "
             f"sample={[(hex(o), s.hex(), d.hex()) for o, s, d in ctx_mismatches[:8]]}",
             flush=True)
-      for off, wanted, _actual in ctx_mismatches:
-        _gk104_pramin_write(dev, grctx_vram_pa + off, wanted)
-      if ctx_mismatches:
+      remaining = len(ctx_mismatches)
+      for repair_pass in range(4):
+        if not ctx_mismatches:
+          break
+        for off, wanted, _actual in ctx_mismatches:
+          dev.read32(0x409100)
+          _gk104_pramin_write(dev, grctx_vram_pa + off, wanted)
         _gk104_bar_flush(dev)
-        remaining = 0
+        ctx_mismatches = []
         for off in range(0, ctx_size, 0x1000):
+          dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
           size = min(0x1000, ctx_size - off)
           src = dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + 0x80000 + off, size)
           dst = dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + off, size)
-          remaining += sum(src[word:word + 4] != dst[word:word + 4]
-                           for word in range(0, size, 4))
-        print(f"[kepler] runtime GR ctx repaired: remaining={remaining}", flush=True)
-        if remaining:
-          raise RuntimeError(f"runtime GR context copy remains corrupt ({remaining} dwords)")
+          for word in range(0, size, 4):
+            if src[word:word + 4] != dst[word:word + 4]:
+              ctx_mismatches.append((off + word, src[word:word + 4],
+                                     dst[word:word + 4]))
+        remaining = len(ctx_mismatches)
+        print(f"[kepler] runtime GR ctx repair pass={repair_pass + 1} "
+              f"remaining={remaining}", flush=True)
+      if remaining:
+        raise RuntimeError(f"runtime GR context copy remains corrupt ({remaining} dwords)")
       # gf100_gr_chan_bind(): number of address/value pairs and MMIO-list VA/256.
-      _gk104_pramin_write(dev, grctx_vram_pa,
+      dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
+      _gk104_pramin_write(dev, grctx_vram_pa + 0x80000,
                           struct.pack("<II", len(runtime_mmio_entries),
                                       mmio_list.va_addr >> 8))
       _gk104_bar_flush(dev)
-      runtime_ctx_va = gr_ctx.va_addr | 4
+      _fecs_check_points.append(("after_mmio_list_write", dev.read32(0x409100),
+                                 dev.read32(0x400000), dev.read32(0x020004)))
+      dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
+      runtime_ctx_va = (gr_ctx.va_addr + 0x80000) | 4
       _gk104_pramin_write(dev, ramin_vram_pa + 0x210,
                           struct.pack("<Q", runtime_ctx_va))
       _gk104_bar_flush(dev)
-      runtime_head = [_gk104_pramin_read32(dev, grctx_vram_pa + i)
+      _fecs_check_points.append(("after_ramin_ctx_write", dev.read32(0x409100),
+                                 dev.read32(0x400000), dev.read32(0x020004)))
+      dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
+      runtime_head = [_gk104_pramin_read32(dev, grctx_vram_pa + 0x80000 + i)
                       for i in range(0, 16, 4)]
+      _fecs_check_points.append(("after_head_read", dev.read32(0x409100),
+                                 dev.read32(0x400000), dev.read32(0x020004)))
+      print(f"[kepler] FECS check points: "
+            f"{[(n, hex(v), hex(p), hex(g)) for n, v, p, g in _fecs_check_points]}",
+            flush=True)
     else:
       vram[grctx_pa:grctx_pa + ctx_size] = \
         vram[grctx_pa + 0x80000:grctx_pa + 0x80000 + ctx_size]
-      runtime_ctx_va = gr_ctx.va_addr | 4
+      runtime_ctx_va = (gr_ctx.va_addr + 0x80000) | 4
       struct.pack_into("<Q", vram, ramin_pa + 0x210, runtime_ctx_va)
       runtime_head = list(struct.unpack_from("<4I", vram, grctx_pa))
     print(f"[kepler] runtime GR ctx: size={ctx_size:#x} va={runtime_ctx_va:#x} "
           f"head={[hex(x) for x in runtime_head]}", flush=True)
+    dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
+    _fecs_check_points2 = [("after_runtime_ctx_print", dev.read32(0x409100))]
 
   # Final GR accessibility diagnostic before committing the runlist.
   if dev.dev_impl.hw is not None:
     stale_trap = dev.read32(0x400108)
+    _fecs_check_points2.append(("after_stale_trap_read", dev.read32(0x409100)))
     stale_gpcs = dev.read32(0x400118)
     for gpc in range(len(_tpc_nr)):
       if not (stale_gpcs & (1 << gpc)):
@@ -3580,23 +4853,61 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
           dev.write32(0x500000 + gpc * 0x8000 + 0x2c90,
                       0x00010000 << tpc)
       dev.write32(0x400118, 1 << gpc)
+    _fecs_check_points2.append(("after_gpc_clear", dev.read32(0x409100)))
     if stale_trap:
       dev.write32(0x400108, stale_trap)
     stale_intr = dev.read32(0x400100)
     if stale_intr:
       dev.write32(0x400100, stale_intr)
     dev.write32(0x400500, 0x00010001)
+    _fecs_check_points2.append(("after_pgraph_ctrl", dev.read32(0x409100)))
     print(f"[kepler] cleared stale GR traps: trap={stale_trap:#x} "
           f"gpcs={stale_gpcs:#x} intr={stale_intr:#x} -> "
           f"{dev.read32(0x400108):#x}/{dev.read32(0x400118):#x}/"
           f"{dev.read32(0x400100):#x}", flush=True)
+    dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
     _gr_final = dev.read32(0x400000)
     _gpc_topo = dev.read32(0x409604)
+    dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
     _fecs_ctrl_pre = dev.read32(0x409100)
+    _fecs_check_points2.append(("after_pre_runlist_read", dev.read32(0x409100)))
     print(f"[kepler] pre-runlist GR: PGRAPH_STATUS={_gr_final:#x} "
           f"GPC_TOPOLOGY={_gpc_topo:#x} "
           f"PGRAPH_CTRL={dev.read32(0x400500):#x} "
           f"FECS_CTRL={_fecs_ctrl_pre:#x}", flush=True)
+    # Start a background FECS keep-alive thread before snapshot.
+    # Continuously re-assert FE_PWR FORCE_ON to prevent the FE domain
+    # from power-gating during/after the context switch.
+    import threading
+    _fecs_keepalive_stop = threading.Event()
+    def _fecs_keepalive():
+      while not _fecs_keepalive_stop.is_set():
+        try:
+          # Simulate the PMU's response to the ctx_4170s/ctx_4170w handshake.
+          # The FECS firmware sets bit 4 (0x10) of 0x404170 to request a power
+          # state change, then spins in ctx_4170w waiting for bit 4 to clear.
+          # Without a PMU, bit 4 never clears and the FE domain power-gates.
+          # We clear bit 4 and keep FORCE_ON (bit 1) set.
+          _pwr = dev.read32(0x404170)
+          if _pwr & 0x10:
+            # FECS requested a power state change — acknowledge it.
+            dev.write32(0x404170, (_pwr & ~0x10) | 0x02)
+          elif _pwr != 0x02:
+            dev.write32(0x404170, 0x00000002)  # FE_PWR FORCE_ON only
+        except Exception:
+          pass
+        time.sleep(0.0001)  # 0.1ms — fast enough to catch the handshake
+    _ka_thread = threading.Thread(target=_fecs_keepalive, daemon=True)
+    _ka_thread.start()
+    print("[kepler] FECS keep-alive thread started (FE_PWR FORCE_ON)", flush=True)
+    # Phase 1 capture point 1: before runlist submission.
+    # Skip snapshot_gr_traps for now — it reads GPC/TPC registers which
+    # may trigger FECS power-gating.  Test if FECS stays alive without it.
+    # snapshot_gr_traps(dev, "before_runlist")
+    dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
+    _fecs_check_points2.append(("after_snapshot", dev.read32(0x409100)))
+    print(f"[kepler] FECS check points2: "
+          f"{[(n, hex(v)) for n, v in _fecs_check_points2]}", flush=True)
 
   # gk104_fifo_init(): USERD is a BAR1-backed aperture on this generation.
   # TinyGPU exposes the coherent allocation at the same GPU-visible base, so
@@ -3610,13 +4921,19 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   dev.write32(0x2254, 0x10000000 | (userd_bar1_base >> 12))
   # gk104_fifo_init_pbdmas(): enable the three GK104 PBDMAs and release the
   # scheduler's error-disable latch before committing a runlist.
-  dev.write32(0x204, 0x7)
+  # On GK104, only 0x000204 (SUBFIFO_ENABLE) is written - the 0x002204 and
+  # 0x002208-0x00221c registers are GF100-only and return 0xbad0011f on GK104.
+  # Engine assignment on GK104 is done via the TOP device list and runq mapping.
+  dev.write32(0x000204, 0x7)
   nvkm_mask(dev, 0x2a04, 0xbfffffff, 0xbfffffff)
   # gf100_runq_init()/gk104_runq_init() for PBDMAs 0..2.  The 0x2390 values
   # are hardware-provided runlist masks (gk104_runq_runm() only reads them),
   # so do not overwrite them here.
   for pbdma in range(3):
+    dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
     q = 0x40000 + pbdma * 0x2000
+    # gf100_runq_init: write CACHE register (offset 0xc0) with 0x80600008
+    dev.write32(q + 0xc0, 0x80600008)
     dev.write32(q + 0x13c, dev.read32(q + 0x13c) & ~0x10000100)
     dev.write32(q + 0x108, 0xffffffff)
     dev.write32(q + 0x10c, 0xfffffeff)
@@ -3626,17 +4943,296 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   dev.write32(0x2140, 0x7fffffff)
   dev.write32(0x259c, 0xffffffff)
   dev.write32(0x2a00, 0xffffffff)
+  # 0x2200 programming belongs to the older GF100 path, not gk104_fifo_init().
+  # Retain it solely for explicit register experiments.
+  _pfifo_ctrl = dev.read32(0x2200)
+  if DEBUG:
+    print(f"[kepler] PFIFO_CTRL before enable: 0x{_pfifo_ctrl:08x}", flush=True)
+  if unsafe_experiments:
+    nvkm_mask(dev, 0x2200, 0x00000001, 0x00000001)
+    nvkm_mask(dev, 0x2200, 0x00000100, 0x00000100)
+  if DEBUG:
+    print(f"[kepler] PFIFO_CTRL after enable: 0x{dev.read32(0x2200):08x}", flush=True)
+  # Verify USERD data is readable through PRAMIN (the PBDMA's access path)
+  if dev.dev_impl.hw is not None and use_vram_inst:
+    _userd_gp_get = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_vram_pa + userd_base_off + USERD_GP_GET, 4))[0]
+    _userd_gp_put = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_vram_pa + userd_base_off + USERD_GP_PUT, 4))[0]
+    if DEBUG:
+      print(f"[kepler] USERD[{chan_id}] at pa=0x{userd_vram_pa + userd_base_off:x}: "
+            f"GP_GET={_userd_gp_get} GP_PUT={_userd_gp_put}", flush=True)
 
   # Bind + start the channel (nouveau gk104_chan_bind_inst / gk104_chan_start).
-  ramin_bind_addr = ramin_vram_pa if use_vram_inst else (base + ramin_pa)
+  # FE_PWR was set to FORCE_ON after the golden save and should still be on.
+  # Verify it here; if FE gated during setup, report it.
+  if dev.dev_impl.hw is not None:
+    _fe_pwr_pre_bind = dev.read32(0x404170)
+    if _fe_pwr_pre_bind & 0x2 == 0:
+      # Re-assert FORCE_ON if it was lost (e.g. by a power-gating transition).
+      dev.write32(0x404170, 0x00000012)
+      wait_cond(lambda: not bool(dev.read32(0x404170) & 0x00000010),
+                timeout_ms=2000, msg="FE power FORCE_ON re-assert before bind")
+      _fe_pwr_pre_bind = dev.read32(0x404170)
+    # Tight diagnostic: sample FECS CPUCTL every 1ms for 20ms to see exactly
+    # when it gates.  This helps identify which operation triggers the gate.
+    dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
+    _fecs_samples = []
+    for _ in range(20):
+      _v = dev.read32(0x409100)
+      if not _fecs_samples or _fecs_samples[-1][1] != _v:
+        _fecs_samples.append((_, _v))
+      dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
+      time.sleep(0.001)
+    if any(v == 0xbadf1000 for _, v in _fecs_samples):
+      print(f"[kepler] FECS gate trace: {[(t, hex(v)) for t, v in _fecs_samples]}",
+            flush=True)
+    # Check if clkgate settings survived
+    _clkgate = dev.read32(0x20200)
+    _pwr_gate = dev.read32(0x020004)
+    print(f"[kepler] pre-bind power: 0x20200={_clkgate:#010x} "
+          f"0x020004={_pwr_gate:#010x} "
+          f"FE_PWR={dev.read32(0x404170):#x} "
+          f"ctxctl={dev.read32(0x000260):#x}", flush=True)
+    # Disable GPC/TPC power-gating: nouveau gk104_pmu_pgob(enable=false)
+    # sets 0x020004 bits[31:30] = 01 (bit30=1 un-gate, bit31=0 disable gating).
+    # Previously tried 0x00000000 (both bits clear) but that didn't prevent
+    # GPC power-gating during kernel execution.
+    nvkm_mask(dev, 0x020004, 0xc0000000, 0x40000000)
+    _pwr_gate2 = dev.read32(0x020004)
+    print(f"[kepler] PWR_GATE cleared: 0x020004={_pwr_gate2:#010x}", flush=True)
+    # FECS is power-gated (0xbadf1000).  In nouveau, the PMU manages FECS
+    # power state.  Without a PMU, FECS power-gates when idle and can't be
+    # woken by simple register writes.  The pgob un-gates the GR engine but
+    # destroys FECS (PC=0).  Solution: run pgob to un-gate, then reload FECS
+    # firmware so it can process channel context switches.
+    _fecs_ctrl = dev.read32(0x409100)
+    print(f"[kepler] FECS before bind: CPUCTL={_fecs_ctrl:#x} "
+          f"(gated={'yes' if _fecs_ctrl == 0xbadf1000 else 'no'})", flush=True)
+    if _fecs_ctrl == 0xbadf1000 or (_fecs_ctrl & 0xfffff000) == 0xbadf0000:
+      print("[kepler] FECS power-gated, running pgob + FECS reload...", flush=True)
+      gk104_pmu_pgob(dev, war00c800=False)
+      dev.write32(0x400500, 0x00010001)  # PGRAPH master enable
+      _reload_fecs_after_pgob(dev)
+      _fecs_ctrl = dev.read32(0x409100)
+    print(f"[kepler] after un-gate attempt: FECS_CTRL={_fecs_ctrl:#x} "
+          f"PGRAPH_STATUS={dev.read32(0x400000):#x} "
+          f"PGRAPH_CTRL={dev.read32(0x400500):#x} "
+          f"FE_PWR={dev.read32(0x404170):#x} "
+          f"PWR_GATE={dev.read32(0x020004):#x}", flush=True)
+    # Check PGRAPH sub-domains after pgob re-un-gate
+    _subdom_pgob = []
+    for _addr in (0x400700, 0x404000, 0x404200):
+      _v = dev.read32(_addr)
+      _ok = (_v & 0xfffff000) != 0xbadf0000
+      _subdom_pgob.append(f"0x{_addr:x}={_v:#x}{'(OK)' if _ok else '(GATED)'}")
+    print(f"[kepler] PGRAPH sub-domains after pgob: {' '.join(_subdom_pgob)}",
+          flush=True)
+    # Try to wake FECS up by writing to SCRATCH0 and polling CPUCTL.
+    # If FECS is power-gated, writing to a FECS register should request
+    # a power-up.  Poll for up to 100ms.
+    _fecs_ctrl = dev.read32(0x409100)
+    if _fecs_ctrl == 0xbadf1000:
+      print("[kepler] FECS still gated after pgob!", flush=True)
+    print(f"[kepler] FE_PWR before bind: {dev.read32(0x404170):#x} "
+          f"PGRAPH_STATUS={dev.read32(0x400000):#x} "
+          f"PGRAPH_CTRL={dev.read32(0x400500):#x} "
+          f"FECS_CTRL={dev.read32(0x409100):#x}", flush=True)
+  # gk104_chan_bind_inst() is exactly VALID | (inst_addr >> 12).  Unlike the
+  # runlist descriptor, this register has no TARGET field on GK104.  BAR1 is
+  # merely the CPU mapping used to populate the VRAM instance object; it does
+  # not turn the PFIFO instance pointer into a HUB-MMU virtual address.
+  if use_vram_inst:
+    _live_pdes = [(vmm_pgd_pa + _idx * 8,
+                   (1 << 32) | (_dst_spt << 24))
+                  for _idx, _src_spt, _dst_spt in cloned_spts]
+    _live_pte_map = {}
+    # Preserve and stabilise every populated source mapping (inputs, output,
+    # code, constants, CWD, and allocator metadata).  Bulk cloning alone is
+    # insufficient on TinyGPU because individual PTE dwords can settle to an
+    # all-ones entry without producing an immediate MMU fault.
+    for _pgdi, _src_spt, _dst_spt in cloned_spts:
+      if _src_spt < 0:
+        continue
+      for _spti in range(0x8000):
+        _pte = struct.unpack_from("<Q", vram, _src_spt + _spti * 8)[0]
+        if _pte:
+          _live_pte_map[_dst_spt + _spti * 8] = _pte
+    for _buf, _buf_pa, _priv in ((pagepool, pagepool_vram_pa, True),
+                                 (bundle_cb, bundle_vram_pa, True),
+                                 (attrib_cb, attrib_vram_pa, False)):
+      for _page in range(round_up(_buf.size, 0x1000) // 0x1000):
+        _va = _buf.va_addr + _page * 0x1000
+        _pgdi, _spti = (_va >> 27) & 0x1fff, (_va >> 12) & 0x7fff
+        _pte = ((_buf_pa + _page * 0x1000) >> 8) | 1 | (2 if _priv else 0)
+        _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = _pte
+    for _page in range(gr_ctx.size // 0x1000):
+      _va = gr_ctx.va_addr + _page * 0x1000
+      _pgdi, _spti = (_va >> 27) & 0x1fff, (_va >> 12) & 0x7fff
+      _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = \
+          ((grctx_vram_pa + _page * 0x1000) >> 8) | 3
+    for _mirror in getattr(dev, "_kepler_vram_mirrors", ()):
+      _mirror_pa = _mirror.meta.get("vram_pa")
+      if _mirror_pa is None:
+        continue
+      for _page in range(round_up(_mirror.size, 0x1000) // 0x1000):
+        _va = _mirror.va_addr + _page * 0x1000
+        _pgdi, _spti = (_va >> 27) & 0x1fff, (_va >> 12) & 0x7fff
+        _pte = ((_mirror_pa + _page * 0x1000) >> 8) | 1
+        if _mirror.meta.get("priv"):
+          _pte |= 2
+        _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = _pte
+    if mmio_list.meta.get("vram_pa") is None:
+      _va = mmio_list.va_addr
+      _pgdi, _spti = (_va >> 27) & 0x1fff, (_va >> 12) & 0x7fff
+      _src_spt = mm.root_page_table.address(_pgdi)
+      _src_pte = struct.unpack_from("<Q", vram, _src_spt + _spti * 8)[0]
+      _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = _src_pte
+    for _pte_addr, _pte in ctx_alias_ptes:
+      _live_pte_map[_pte_addr] = _pte
+    _signal_buf = HCQBuffer(signal_va, 0x1000, meta={"pa": signal_vram_pa})
+    for _buf, _buf_pa in ((gpfifo, gpfifo_vram_pa),
+                          (push, push_vram_pa),
+                          (_signal_buf, signal_vram_pa)):
+      if _buf_pa is None:
+        continue
+      for _page in range(_buf.size // 0x1000):
+        _va = _buf.va_addr + _page * 0x1000
+        _pgdi, _spti = (_va >> 27) & 0x1fff, (_va >> 12) & 0x7fff
+        _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = \
+            ((_buf_pa + _page * 0x1000) >> 8) | 1
+    _live_ptes = list(_live_pte_map.items())
+    for _attempt in range(4):
+      for _entry_addr, _entry_wanted in (*_live_pdes, *_live_ptes):
+        _gk104_pramin_write(dev, _entry_addr, struct.pack("<Q", _entry_wanted))
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate for channel PTEs did not complete")
+      time.sleep(0.005)
+      _live_entries = [*_live_pdes, *_live_ptes]
+      _pte_actual = [(_gk104_pramin_read32(dev, addr) |
+                      (_gk104_pramin_read32(dev, addr + 4) << 32))
+                     for addr, _ in _live_entries]
+      if _pte_actual == [wanted for _, wanted in _live_entries]:
+        break
+    else:
+      raise RuntimeError(f"GK104 channel PTEs did not stabilise: {_pte_actual}")
+    if _live_ptes and not _gk104_vmm_flush_pdb(dev, vmm_pgd_pa, target=0):
+      raise TimeoutError("GK104 channel VMM flush did not complete")
+    if signal_vram_pa is not None:
+      _signal_wanted = struct.pack("<I", signal_initial)
+      for _attempt in range(4):
+        bar1_write(signal_vram_pa, _signal_wanted)
+        _gk104_pramin_write(dev, signal_vram_pa, _signal_wanted)
+        _gk104_bar_flush(dev)
+        if not _gk104_ltc_invalidate(dev):
+          raise TimeoutError("GK104 LTC invalidate for signal did not complete")
+        time.sleep(0.005)
+        _signal_bar = struct.unpack(
+            "<I", dev.dev_impl.hw.mmio_read(1, signal_vram_pa, 4))[0]
+        _signal_pramin = _gk104_pramin_read32(dev, signal_vram_pa)
+        if _signal_bar == _signal_pramin == signal_initial:
+          break
+      else:
+        raise RuntimeError(
+            f"GK104 signal did not stabilise: bar={_signal_bar:#x} "
+            f"pramin={_signal_pramin:#x}")
+    for _mirror in getattr(dev, "_kepler_vram_mirrors", ()):
+      _mirror_pa = _mirror.meta.get("vram_pa")
+      if _mirror_pa is None:
+        continue
+      _mirror_wanted = bytes(vram[_mirror.meta["pa"]:
+                                  _mirror.meta["pa"] + _mirror.size])
+      if _mirror is mmio_list:
+        _mmio_encoded = b"".join(
+            struct.pack("<I", (~struct.unpack_from("<I", _mirror_wanted, off)[0]) &
+                        0xffffffff)
+            for off in range(0, len(_mirror_wanted), 4))
+        _gk104_pramin_write_literal(dev, _mirror_pa, _mmio_encoded)
+        _gk104_bar_flush(dev)
+        if not _gk104_ltc_invalidate(dev):
+          raise TimeoutError("GK104 LTC invalidate for MMIO list failed")
+        continue
+      for _attempt in range(4):
+        bar1_write(_mirror_pa, _mirror_wanted)
+        _gk104_pramin_write(dev, _mirror_pa, _mirror_wanted)
+        _gk104_bar_flush(dev)
+        if not _gk104_ltc_invalidate(dev):
+          raise TimeoutError("GK104 LTC invalidate for VRAM mirror failed")
+        time.sleep(0.005)
+        _mirror_bar = dev.dev_impl.hw.mmio_read(
+            1, _mirror_pa, len(_mirror_wanted))
+        _mirror_pramin = b"".join(
+            struct.pack("<I", _gk104_pramin_read32(dev, _mirror_pa + off))
+            for off in range(0, len(_mirror_wanted), 4))
+        if _mirror_bar == _mirror_pramin == _mirror_wanted:
+          break
+      else:
+        raise RuntimeError(
+            f"GK104 VRAM mirror did not stabilise: va={_mirror.va_addr:#x}")
+    _ramin_expected = bytearray(inst[:0x220])
+    struct.pack_into("<Q", _ramin_expected, 0x210, runtime_ctx_va)
+    for _attempt in range(4):
+      _gk104_pramin_write(dev, ramin_vram_pa, _ramin_expected)
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate for RAMFC did not complete")
+      time.sleep(0.005)
+      _ramin_actual = b"".join(
+          struct.pack("<I", _gk104_pramin_read32(dev, ramin_vram_pa + off))
+          for off in range(0, len(_ramin_expected), 4))
+      if _ramin_actual == bytes(_ramin_expected):
+        break
+    else:
+      _bad = [off for off in range(0, len(_ramin_expected), 4)
+              if _ramin_actual[off:off + 4] != _ramin_expected[off:off + 4]]
+      raise RuntimeError(f"GK104 RAMFC did not stabilise: offsets={_bad[:16]}")
+    ramin_bind_addr = ramin_vram_pa
+  else:
+    raise RuntimeError("GK104 live channels require a VRAM instance block")
+  _chan_ctrl_reg = CHAN_START_REG + chan_id * 8
+  _chan_inst_reg = CHAN_SUBMIT_REG + chan_id * 8
+  runlist_addr = runlist_pa if use_vram_runlist else (base + runlist_pa)
+  runlist_target = 0 if use_vram_runlist else 3
+
+  def _empty_gr_runlist():
+    """Remove every channel from GR runlist 0 and wait for scheduler DMA."""
+    dev.write32(0x000140, 0x00000000)
+    dev.write32(0x000640, 0x00000000)
+    dev.read32(0x000140)
+    pending_reg = 0x2284 + GR_RUNLIST_ID * 8
+    # Prevent a stale entry from being selected while the replacement list is
+    # being committed.  A zero count is Nouveau's normal empty-runlist form.
+    nvkm_mask(dev, 0x2630, 1 << GR_RUNLIST_ID, 1 << GR_RUNLIST_ID)
+    deadline = time.time() + 0.1
+    while dev.read32(pending_reg) & 0x00100000 and time.time() < deadline:
+      time.sleep(0.001)
+    dev.write32(0x2270, (runlist_target << 28) | (runlist_addr >> 12))
+    dev.write32(PFIFO_RUNLIST_SUBMIT, GR_RUNLIST_ID << 20)
+    deadline = time.time() + 0.2
+    while dev.read32(pending_reg) & 0x00100000:
+      if time.time() >= deadline:
+        raise TimeoutError("GK104 empty-runlist update did not complete")
+      time.sleep(0.001)
+    intr = dev.read32(0x2a00)
+    if intr:
+      dev.write32(0x2a00, intr)
+
+  # A previous process can disappear after the command semaphore but before
+  # PFIFO drops its playlist.  Remove that persistent hardware reference
+  # before reusing the CHID or any BAR1 allocation.
+  _empty_gr_runlist()
   # Tear down a channel left halted by an earlier diagnostic run before
-  # reusing CHID 0 and its BAR1 USERD state.
-  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x800, 0x800)
-  # gk104_chan_bind() also selects the runlist in bits 16..19 of the channel
-  # control word.  Do this explicitly for runlist 0; leaving the old value in
-  # place can bind the channel to a different scheduler than 0x2274 commits.
-  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x000f0000, 0)
-  dev.write32(CHAN_SUBMIT_REG + chan_id * 8, 0)
+  # reusing CHID 0 and its BAR1 USERD state.  Clear the inst pointer FIRST,
+  # then set the runlist ID, then write the new inst pointer.  Writing the
+  # inst pointer processes the bind and locks the runlist ID, so it must be
+  # set after any inst clear and before the final inst write.
+  nvkm_mask(dev, _chan_ctrl_reg, 0x800, 0x800)  # stop
+  dev.write32(_chan_inst_reg, 0)                 # unbind old inst
+  if DEBUG:
+    print(f"[kepler] chan bind step1 stop+unbind: ctrl=0x{dev.read32(_chan_ctrl_reg):08x}", flush=True)
+  # Set runlist ID (bits 16..19) for the GR engine runlist.
+  nvkm_mask(dev, _chan_ctrl_reg, 0x000f0000, GR_RUNLIST_ID << 16)
+  if DEBUG:
+    print(f"[kepler] chan bind step2 runlist={GR_RUNLIST_ID}: ctrl=0x{dev.read32(_chan_ctrl_reg):08x}", flush=True)
   # gf100_chan_userd_clear(): a reused BAR1 USERD must start with matching
   # GET/PUT and empty top-level pointers, otherwise PBDMA reports GPPTR.
   userd_mmio_base = ((userd_vram_pa + userd_base_off) if use_vram_inst else
@@ -3646,44 +5242,373 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     dev.dev_impl.hw.mmio_write(1, userd_mmio_base + userd_off, struct.pack("<I", 0))
     if use_vram_inst:
       _gk104_pramin_write(dev, userd_mmio_base + userd_off, struct.pack("<I", 0))
-  dev.write32(CHAN_SUBMIT_REG + chan_id * 8, 0x80000000 | (ramin_bind_addr >> 12))
-  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x400, 0x400)
+  # Write the instance pointer exactly as Nouveau's gk104_chan_bind_inst().
+  dev.write32(_chan_inst_reg, 0x80000000 | (ramin_bind_addr >> 12))
   if DEBUG:
-    print(f"[kepler] channel bind={dev.read32(CHAN_SUBMIT_REG + chan_id * 8):#x} "
-          f"ctrl={dev.read32(CHAN_START_REG + chan_id * 8):#x} "
+    print(f"[kepler] chan bind step3 inst: ctrl=0x{dev.read32(_chan_ctrl_reg):08x} "
+          f"inst=0x{dev.read32(_chan_inst_reg):08x}", flush=True)
+  # Start the channel BEFORE the runlist commit.  Nouveau's sequence is:
+  # gk104_chan_bind → gk104_chan_start (nvkm_chan_allow) → nvkm_chan_insert
+  # (runlist commit).  The ENABLE_TRIGGER must be set before the scheduler
+  # processes the runlist entry, otherwise the channel is skipped.
+  _teardown_done = False
+  def _quiesce_channel(reason="teardown"):
+    """Stop the host helper thread without touching the endpoint."""
+    nonlocal _teardown_done
+    if _teardown_done:
+      return
+    errors = []
+    def _attempt(label, op):
+      _set_native_thread_name(f"kgpu:{label}")
+      try:
+        return op()
+      except Exception as exc:
+        errors.append(f"{label}: {type(exc).__name__}: {exc}")
+        return None
+
+    _fecs_keepalive_stop.set()
+    # Do not let the helper retain the socket while the client is closing.
+    _ka_thread.join(timeout=2.5)
+    if _ka_thread.is_alive():
+      errors.append("FECS keepalive did not stop before client close")
+    # Do not issue BAR, config-space, FLR, or server-lifecycle operations here.
+    # The working examples/add.py transport has no such close protocol.  The
+    # latest panic caught this thread in recv_into only after keepalive joined,
+    # leaving the former PCI_COMMAND read/write/read as the live rejected RPC.
+    _teardown_done = True
+    _set_native_thread_name("kgpu:teardown done")
+    print(f"[kepler] host helper stopped ({reason}): zero endpoint teardown RPC",
+          flush=True)
+    for error in errors:
+      print(f"[kepler] WARNING: teardown step failed ({reason}): {error}",
+            file=sys.stderr, flush=True)
+
+  dev._kepler_emergency_teardown = _quiesce_channel
+  atexit.register(_quiesce_channel, "atexit")
+  nvkm_mask(dev, _chan_ctrl_reg, 0x400, 0x400)  # start (ENABLE_TRIGGER)
+  if DEBUG:
+    print(f"[kepler] chan bind step4 start: ctrl=0x{dev.read32(_chan_ctrl_reg):08x}", flush=True)
+    print(f"[kepler] channel bind={dev.read32(_chan_inst_reg):#x} "
+          f"ctrl={dev.read32(_chan_ctrl_reg):#x} "
           f"PGRAPH_STATUS={dev.read32(0x400000):#x} "
           f"PGRAPH_CTRL={dev.read32(0x400500):#x}", flush=True)
   # FECS state after channel bind
   _fecs_ctrl_post_bind = dev.read32(0x409100)
+  _subch_post_bind = dev.read32(0x404200)
+  # Check for SCHED_ERROR right after channel bind (before runlist commit)
+  _post_bind_intr = dev.read32(0x2100)
+  if _post_bind_intr & 0x100:
+    _post_bind_sched = dev.read32(0x254c)
+    print(f"[kepler] SCHED_ERROR after bind (before runlist): "
+          f"INTR=0x{_post_bind_intr:08x} SCHED=0x{_post_bind_sched:08x}", flush=True)
+    # Clear it before runlist commit
+    dev.write32(0x2100, 0x100)
   print(f"[kepler] post-bind FECS: CPUCTL={_fecs_ctrl_post_bind:#x} "
         f"SCRATCH0={dev.read32(0x409800):#x} "
         f"CHAN_ADDR={dev.read32(0x409b00):#x} "
-        f"CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
+        f"CHAN_NEXT={dev.read32(0x409b04):#x} "
+        f"subch4={_subch_post_bind:#x}", flush=True)
+  # Pre-set RED_SWITCH to all-enabled state before the CHSW.
+  # After the golden save, RED_SWITCH=0x70 (powered but not enabled).
+  # The FECS ctx_redswitch() expects domains to be in a safe state;
+  # without ENABLE bits set, the toggle can crash the FECS.
+  if dev.dev_impl.hw is not None:
+    _rs = dev.read32(0x409614)
+    if _rs != 0x770:
+      dev.write32(0x409614, 0x770)
+      print(f"[kepler] RED_SWITCH pre-set: 0x{_rs:x} -> 0x770", flush=True)
+  # Note: we no longer pre-load the channel context via FIFO cmd 1 here.
+  # With context switching enabled (cmd 0x39 sent after golden save), the
+  # hardware will perform a proper context switch when PBDMA forwards the
+  # first methods to GR.  Pre-loading via cmd 1 was preventing the proper
+  # CHSW from firing, leaving PGRAPH without a loaded context and causing
+  # PBDMA LBACK_TIMEOUT errors.
   # Make the channel visible to its runq before advancing USERD GP_PUT.
-  runlist_addr = runlist_pa if use_vram_runlist else (base + runlist_pa)
-  runlist_target = 0 if use_vram_runlist else 3
+  # Diagnostic: read TOP device list (0x22700+) to verify GR engine is
+  # enumerated and associated with the correct runlist.  GK104's PBDMA
+  # needs the TOP device list to know which engine to dispatch methods to.
+  _top_regs = []
+  for _ti in range(64):
+    _tv = dev.read32(0x22700 + _ti * 4)
+    if _tv:
+      _top_regs.append((_ti, _tv))
+  print(f"[kepler] TOP device list: {len(_top_regs)} non-zero entries", flush=True)
+  for _ti, _tv in _top_regs:
+    _kind = _tv & 3
+    _kind_name = {0: "NOT_VALID", 1: "DATA", 2: "ENUM", 3: "ENGINE_TYPE"}.get(_kind, "?")
+    print(f"  TOP[{_ti:02x}]: 0x{_tv:08x} ({_kind_name})", flush=True)
+  # Also read PBDMA engine assignment registers
+  _pbdma_eng = [dev.read32(0x400a4 + _i * 0x40) for _i in range(3)]
+  print(f"[kepler] PBDMA_ENGINES pre-runlist: "
+        f"{[hex(_e) for _e in _pbdma_eng]}", flush=True)
+  # Check PBDMA enable and engine assignment registers
+  _pbdma_enable_lo = dev.read32(0x000204)
+  _pbdma_enable_hi = dev.read32(0x002204)
+  _eng_assign = [dev.read32(0x002208 + _i * 4) for _i in range(6)]
+  print(f"[kepler] PBDMA enable: lo=0x{_pbdma_enable_lo:08x} hi=0x{_pbdma_enable_hi:08x} "
+        f"eng_assign={[hex(_e) for _e in _eng_assign]}", flush=True)
+  # Check PBDMA interrupts and status
+  for _pi in range(3):
+    _pbdma_intr_0_stat = dev.read32(0x40108 + _pi * 0x2000)
+    _pbdma_intr_0_mask = dev.read32(0x4010c + _pi * 0x2000)
+    _pbdma_intr_1_stat = dev.read32(0x40148 + _pi * 0x2000)
+    _pbdma_ctrl = dev.read32(0x4013c + _pi * 0x2000)
+    _pbdma_chid = dev.read32(0x40120 + _pi * 0x2000)
+    print(f"[kepler] PBDMA{_pi}: INTR0=0x{_pbdma_intr_0_stat:08x} INTR0_MASK=0x{_pbdma_intr_0_mask:08x} "
+          f"INTR1=0x{_pbdma_intr_1_stat:08x} CTRL=0x{_pbdma_ctrl:08x} CHID=0x{_pbdma_chid:08x}", flush=True)
+  # Check USERD BAR1 address register
+  _userd_bar1 = dev.read32(0x2254)
+  print(f"[kepler] USERD BAR1 reg 0x2254=0x{_userd_bar1:08x}", flush=True)
+  # Check CHAN_TABLE for channel 0 (at PFIFO offset 0x1000, stride 8)
+  _chan_table_chan = dev.read32(0x3000 + chan_id * 8)
+  _chan_table_state = dev.read32(0x3004 + chan_id * 8)
+  print(f"[kepler] CHAN_TABLE[{chan_id}]: CHAN=0x{_chan_table_chan:08x} "
+        f"STATE=0x{_chan_table_state:08x} "
+        f"(RUNNABLE={bool(_chan_table_state & 1)} LOADED={bool(_chan_table_state & 0x1000)})", flush=True)
+  # Check runlist allow/block register
+  _runl_block = dev.read32(0x2630)
+  print(f"[kepler] runlist block/allow 0x2630=0x{_runl_block:08x}", flush=True)
+  # Verify GR ctx pointer in instance block is still valid before runlist commit
+  if dev.dev_impl.hw is not None and use_vram_inst:
+    _inst_gr_lo = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + 0x210, 4))[0]
+    _inst_gr_hi = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + 0x214, 4))[0]
+    _inst_gr_val = (_inst_gr_hi << 32) | _inst_gr_lo
+    print(f"[kepler] inst GR ctx ptr: 0x{_inst_gr_val:010x} valid={bool(_inst_gr_val & 4)} "
+          f"va=0x{(_inst_gr_val & ~4):x}", flush=True)
+    # Also check other engine ctx ptrs for conflicts
+    for _eng_name, _eng_off in [("SEC", 0x220), ("MSPDEC", 0x250), ("MSPPP", 0x260),
+                                 ("MSVLD", 0x270), ("VIC", 0x280), ("MSENC", 0x290)]:
+      _e_lo = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, ramin_vram_pa + _eng_off, 4))[0]
+      if _e_lo:
+        print(f"[kepler] inst {_eng_name} ctx ptr at 0x{_eng_off:x}: lo=0x{_e_lo:08x} (CONFLICT!)", flush=True)
   if DEBUG and use_vram_runlist:
     print(f"[kepler] runlist_precommit="
           f"{struct.unpack('<II', dev.dev_impl.hw.mmio_read(1, runlist_pa, 8))}")
+  if DEBUG:
+    print(f"[kepler] runlist_addr={runlist_addr:#x} target={runlist_target} "
+          f"use_vram_runlist={use_vram_runlist} runlist_pa={runlist_pa:#x} "
+          f"base={base:#x}", flush=True)
+    if not use_vram_runlist:
+      _rl_off = runlist_pa
+      _rl_words = struct.unpack_from('<II', vram, _rl_off)
+      print(f"[kepler] runlist buffer @vram[{_rl_off:#x}]: "
+            f"words={_rl_words}", flush=True)
   # Match nvkm_runl_update_locked(): clear the pending runlist fault and
   # unblock scheduler processing before submitting the new list.
-  put_before_runlist = os.environ.get("KEPLER_PUT_BEFORE_RUNLIST") == "1"
+  # Nouveau inserts an idle channel first; userspace advances GP_PUT only
+  # after its ring and pushbuffer stores are complete.  Publishing PUT before
+  # the runlist races PBDMA against TinyGPU's delayed framebuffer writes.
+  # Late GP_PUT is the validated compute ordering: admit and load the channel
+  # context first, then expose the already-stabilised entry to PBDMA.  The old
+  # early-PUT ordering remains available only as an explicit diagnostic.
+  put_before_runlist = os.environ.get("KEPLER_PUT_BEFORE_RUNLIST", "0") != "0"
   if put_before_runlist:
-    dev.dev_impl.hw.mmio_write(1, userd_mmio_base + USERD_GP_PUT,
-                               struct.pack("<I", 1))
+    if use_vram_inst:
+      _gk104_pramin_write(dev, userd_mmio_base + USERD_GP_PUT,
+                          struct.pack("<I", 1))
+    else:
+      dev.dev_impl.hw.mmio_write(1, userd_mmio_base + USERD_GP_PUT,
+                                 struct.pack("<I", 1))
     _gk104_bar_flush(dev)
-  dev.write32(0x262c, 1)
-  nvkm_mask(dev, 0x2630, 1, 0)
+  dev.write32(0x262c, 1 << GR_RUNLIST_ID)
+  nvkm_mask(dev, 0x2630, 1 << GR_RUNLIST_ID, 0)
+  # Check engine state BEFORE runlist commit to see if engine is already faulted
+  _engn_stat_pre = dev.read32(0x2640 + 0 * 8)  # engn 0 = GR
+  _sched_stat_pre = dev.read32(0x263c)
+  _sched_err_pre = dev.read32(0x254c)
+  _userd_bar1_pre = dev.read32(0x2254)
+  if DEBUG:
+    print(f"[kepler] pre-runlist engn0=0x{_engn_stat_pre:08x} "
+          f"sched=0x{_sched_stat_pre:08x} sched_err=0x{_sched_err_pre:08x} "
+          f"userd_bar1=0x{_userd_bar1_pre:08x} "
+          f"BUSY={bool(_engn_stat_pre&0x80000000)} "
+          f"FAULTED={bool(_engn_stat_pre&0x40000000)}",
+          flush=True)
+  # If engine is faulted, try to clear it by writing to the fault clear register
+  # and also clearing any PGRAPH interrupts
+  if _engn_stat_pre & 0x40000000:
+    if DEBUG:
+      print("[kepler] engine faulted pre-runlist — attempting clear", flush=True)
+    # Clear all runlist faults
+    dev.write32(0x262c, 0xffffffff)
+    # Clear PGRAPH interrupts
+    _pgraph_intr = dev.read32(0x400100)
+    if _pgraph_intr:
+      dev.write32(0x400100, _pgraph_intr)
+    # Clear PFIFO interrupts
+    _pfifo_intr = dev.read32(0x2100)
+    if _pfifo_intr:
+      dev.write32(0x2100, _pfifo_intr)
+    time.sleep(0.001)
+    _engn_stat_post_clear = dev.read32(0x2640)
+    if DEBUG:
+      print(f"[kepler] after fault clear: engn0=0x{_engn_stat_post_clear:08x} "
+            f"FAULTED={bool(_engn_stat_post_clear&0x40000000)}",
+            flush=True)
+  # Unfreeze the scheduler (FREEZE at 0x2638).  On a properly VBIOS-initialized
+  # GPU this is already 0, but on a bare eGPU it may be in an undefined state.
+  if unsafe_experiments:
+    dev.write32(0x2638, 0)
+  if DEBUG:
+    _freeze_after = dev.read32(0x2638)
+    print(f"[kepler] FREEZE after write 0: 0x{_freeze_after:08x}", flush=True)
+  # Acknowledge stale MMU faults through VM_FAULT_SOURCE.  The 0x2800 records
+  # are payload registers, not W1C status registers (gf100_fifo_intr_mmu_fault).
+  _stale_fault_source = dev.read32(0x259c)
+  if _stale_fault_source:
+    dev.write32(0x259c, _stale_fault_source)
+  # Clear PFIFO interrupts
+  dev.write32(0x2100, 0xffffffff)
+  # All CPU BAR1 preparation is complete.  Enable the BAR1 VMM only now:
+  # TinyGPU's DriverKit BAR writes alias VRAM while the VMM is enabled, whereas
+  # PFIFO requires the VMM for USERD polling.  Subsequent stores use PRAMIN.
+  if use_vram_inst and os.environ.get("KEPLER_INIT_BAR1", "1") != "0":
+    _gk104_init_bar1_identity(dev, bus_base=base, map_vram=True,
+                              userd_alias_pa=userd_vram_pa)
+    # gk104_fifo_init() runs after BAR1 init in Nouveau.  Re-latch the USERD
+    # polling VMA now that 0x1704 points at the live BAR1 page directory.
+    dev.write32(0x2254, 0x10000000 | (userd_vram_pa >> 12))
+    _userd_alias_put = struct.unpack(
+        "<I", dev.dev_impl.hw.mmio_read(1, userd_mmio_base + USERD_GP_PUT, 4))[0]
+    _userd_phys_put = _gk104_pramin_read32(
+        dev, userd_vram_pa + userd_base_off + USERD_GP_PUT)
+    _expected_put = 1 if put_before_runlist else 0
+    if (_userd_alias_put != _userd_phys_put or
+        _userd_alias_put != _expected_put):
+      raise RuntimeError(
+          f"GK104 BAR1 USERD alias mismatch before runlist: "
+          f"alias={_userd_alias_put:#x} physical={_userd_phys_put:#x}")
+    if DEBUG:
+      print(f"[kepler] BAR1 USERD alias stable: GP_PUT={_userd_alias_put}",
+            flush=True)
+  if use_vram_runlist:
+    # PRAMIN stores can acknowledge with the desired immediate readback and
+    # settle to the XOR-inverted value later.  Stabilise the tiny runlist only
+    # after every other framebuffer write, and verify after flush/invalidate.
+    runlist_entry = struct.pack("<II", chan_id, 0)
+    for _attempt in range(4):
+      _gk104_pramin_write(dev, runlist_pa, runlist_entry)
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate for runlist did not complete")
+      time.sleep(0.005)
+      _runlist_actual = (_gk104_pramin_read32(dev, runlist_pa),
+                         _gk104_pramin_read32(dev, runlist_pa + 4))
+      if _runlist_actual == (chan_id, 0):
+        break
+    else:
+      raise RuntimeError(f"GK104 runlist store did not stabilise: {_runlist_actual}")
+  if use_vram_inst and os.environ.get("KEPLER_INIT_BAR1", "1") != "0":
+    # Recheck after the last PRAMIN transaction and a delayed settle.  Repair
+    # the live roots and invalidate HUB translations if the alias drifted.
+    for _attempt in range(4):
+      time.sleep(0.005)
+      _userd_alias_put = struct.unpack(
+          "<I", dev.dev_impl.hw.mmio_read(
+              1, userd_mmio_base + USERD_GP_PUT, 4))[0]
+      _userd_phys_put = _gk104_pramin_read32(
+          dev, userd_vram_pa + userd_base_off + USERD_GP_PUT)
+      _expected_put = 1 if put_before_runlist else 0
+      if _userd_alias_put == _userd_phys_put == _expected_put:
+        break
+      _gk104_pramin_write(dev, 0x00100000 + 0x200,
+                          struct.pack("<Q", 0x00110000))
+      _gk104_pramin_write(
+          dev, 0x00110000,
+          struct.pack("<Q", (1 << 32) | (0x00120000 << 24)))
+      for _page in range(2):
+        _pa = userd_vram_pa + _page * 0x1000
+        _gk104_pramin_write(
+            dev, 0x00120000 + _page * 8,
+            struct.pack("<Q", (_pa >> 8) | 1))
+        _userd_page = userd_vram_pa // 0x1000 + _page
+        _gk104_pramin_write(
+            dev, 0x00120000 + _userd_page * 8,
+            struct.pack("<Q", (_pa >> 8) | 1))
+      _gk104_pramin_write(
+          dev, userd_vram_pa + userd_base_off + USERD_GP_PUT,
+          struct.pack("<I", _expected_put))
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate for USERD alias did not complete")
+      _gk104_vmm_flush_pdb(dev, 0x00110000, target=0, hub_only=True)
+      dev.write32(0x001704, 0x80000000 | (0x00100000 >> 12))
+      dev.write32(0x2254, 0x10000000 | (userd_vram_pa >> 12))
+    else:
+      raise RuntimeError(
+          f"GK104 BAR1 USERD alias did not remain stable: "
+          f"alias={_userd_alias_put:#x} physical={_userd_phys_put:#x}")
+    print(f"[kepler] BAR1 USERD delayed check: GP_PUT={_userd_alias_put}",
+          flush=True)
+  if put_before_runlist and use_vram_inst:
+    # GP_PUT was published while the channel was still absent from the
+    # scheduler.  Repair and verify the GPU-visible command pages after that
+    # doorbell, then make the channel runnable with the runlist commit below.
+    _literal_ring = os.environ.get("KEPLER_GPU_LITERAL_RING") == "1"
+    for _attempt in range(4):
+      if gpfifo_vram_pa is not None:
+        if _literal_ring:
+          _gk104_pramin_write_literal(dev, gpfifo_vram_pa, ring)
+        else:
+          bar1_write(gpfifo_vram_pa, ring_store)
+          _gk104_pramin_write(dev, gpfifo_vram_pa, ring_store)
+      if push_vram_pa is not None:
+        bar1_write(push_vram_pa + push_phys_offset, push_bytes)
+        _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate for precommit commands failed")
+      time.sleep(0.005)
+      if _literal_ring:
+        # Raw literal stores intentionally bypass the transformed CPU
+        # readback; PBDMA is the authoritative consumer for this diagnostic.
+        break
+      _ring_actual = (dev.dev_impl.hw.mmio_read(1, gpfifo_vram_pa, len(ring_store))
+                      if gpfifo_vram_pa is not None else ring_store)
+      _push_actual = (dev.dev_impl.hw.mmio_read(
+          1, push_vram_pa + push_phys_offset, len(push_bytes))
+          if push_vram_pa is not None else bytes(push_bytes))
+      _ring_pramin = (b"".join(struct.pack("<I", _gk104_pramin_read32(
+          dev, gpfifo_vram_pa + off)) for off in range(0, len(ring_store), 4))
+          if gpfifo_vram_pa is not None else ring_store)
+      _push_pramin = (b"".join(struct.pack("<I", _gk104_pramin_read32(
+          dev, push_vram_pa + push_phys_offset + off))
+          for off in range(0, len(push_bytes), 4))
+          if push_vram_pa is not None else bytes(push_bytes))
+      if (_ring_actual == _ring_pramin == ring_store and
+          _push_actual == _push_pramin == bytes(push_bytes)):
+        break
+    else:
+      raise RuntimeError("GK104 precommit command buffers did not stabilise")
+  if DEBUG:
+    print(f"[kepler] stale MMU faults after clear: source={dev.read32(0x259c):#x}",
+          flush=True)
+  # Re-assert the runlist ID in the channel control register right before
+  # the runlist commit.  The hardware clears bits [19:16] when the inst
+  # pointer is written, but the scheduler needs the runlist ID to match
+  # the runlist being committed.
+  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x000f0000, GR_RUNLIST_ID << 16)
+  if DEBUG:
+    print(f"[kepler] pre-runlist chan_ctrl=0x{dev.read32(CHAN_START_REG + chan_id * 8):08x}", flush=True)
   dev.write32(0x2270, (runlist_target << 28) | (runlist_addr >> 12))
-  dev.write32(PFIFO_RUNLIST_SUBMIT, 1)
+  dev.write32(PFIFO_RUNLIST_SUBMIT, (GR_RUNLIST_ID << 20) | 1)
   if DEBUG and use_vram_runlist:
     print(f"[kepler] runlist_vram pa={runlist_pa:#x} words="
           f"{struct.unpack('<II', dev.dev_impl.hw.mmio_read(1, runlist_pa, 8))} "
           f"runq_masks={[hex(dev.read32(0x2390 + i * 4)) for i in range(3)]}")
-  # gk104_runl_pending() is the per-runlist bit at 0x2284; nv50_runl_wait()
-  # waits for it to clear before a channel kick can rely on the new list.
+  if DEBUG:
+    print(f"[kepler] runlist submit: id={GR_RUNLIST_ID} "
+          f"0x2270=0x{dev.read32(0x2270):08x} "
+          f"0x2274=0x{dev.read32(0x2274):08x}", flush=True)
+  # gk104_runl_pending() is the per-runlist bit at 0x2284 + runl_id * 8;
+  # nv50_runl_wait() waits for it to clear before a channel kick can rely
+  # on the new list.
+  _runl_pending_reg = 0x2284 + GR_RUNLIST_ID * 8
+  if DEBUG:
+    print(f"[kepler] runlist pending reg=0x{_runl_pending_reg:x} "
+          f"val=0x{dev.read32(_runl_pending_reg):08x}", flush=True)
   deadline = time.time() + 0.2
-  while dev.read32(0x2284) & 0x00100000:
+  while dev.read32(_runl_pending_reg) & 0x00100000:
     if time.time() >= deadline:
       raise TimeoutError("GK104 runlist update did not complete")
     time.sleep(0.001)
@@ -3692,18 +5617,336 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   # letting normal PFIFO dispatch continue.  Leaving it asserted keeps the
   # PFIFO master RUNLIST bit high even though 0x2284 says the DMA completed.
   runlist_intr = dev.read32(0x2a00)
+  if DEBUG:
+    print(f"[kepler] runlist intr 0x2a00=0x{runlist_intr:08x}", flush=True)
   if runlist_intr:
     dev.write32(0x2a00, runlist_intr)
-  # The original GK104 Nouveau channel init asserts START both before and
-  # after gk104_fifo_runlist_update().  The second edge wakes a channel whose
-  # first edge arrived while it was not yet present in the scheduler list.
-  nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x00000400, 0x00000400)
+  # The cold eGPU needs the channel's start trigger re-issued after the
+  # runlist DMA is visible.  This is the single masked SET used by the older
+  # working path (which reached IB_GET=1); clearing the trigger first is not
+  # part of gk104_chan_start() and can halt an already-enabled channel.
+  # Keep this independent of the unsafe manual scheduler/dispatch fallbacks.
+  if os.environ.get("KEPLER_POST_RUNLIST_START", "1") != "0":
+    nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x00000400, 0x00000400)
+  if DEBUG:
+    print(f"[kepler] post-runlist chan_ctrl=0x{dev.read32(CHAN_START_REG + chan_id * 8):08x}", flush=True)
+  # Give the scheduler time to process the runlist entries and populate
+  # the CHAN_TABLE.  The DMA completion (PLAYLIST_RD BUSY=0) doesn't mean
+  # the scheduler has finished processing the entries.
+  time.sleep(0.01)
+  if DEBUG:
+    _ct_chan = dev.read32(0x3000 + chan_id * 8)
+    _ct_state = dev.read32(0x3004 + chan_id * 8)
+    print(f"[kepler] CHAN_TABLE after delay: CHAN=0x{_ct_chan:08x} STATE=0x{_ct_state:08x}", flush=True)
+  # Kick the PBDMA to start processing the channel.  KICK_CHID (0x2634)
+  # tells the scheduler to immediately dispatch the specified channel.
+  if unsafe_experiments:
+    dev.write32(0x2634, chan_id)
+  time.sleep(0.01)
+  if DEBUG:
+    _ct_chan2 = dev.read32(0x3000 + chan_id * 8)
+    _ct_state2 = dev.read32(0x3004 + chan_id * 8)
+    print(f"[kepler] CHAN_TABLE after kick: CHAN=0x{_ct_chan2:08x} STATE=0x{_ct_state2:08x}", flush=True)
+  # On GK104, the hardware scheduler should populate CHAN_TABLE automatically
+  # from the runlist.  But if the scheduler is not functional (eGPU without
+  # VBIOS PFIFO init), manually write the CHAN_TABLE like GF100 does:
+  # gf100_chan_bind: 0x3000 + id*8 = 0xc0000000 | (inst_addr >> 12)
+  # gf100_chan_start: 0x3004 + id*8 = 0x001f0001
+  _chan_table_chan_reg = 0x3000 + chan_id * 8
+  _chan_table_state_reg = 0x3004 + chan_id * 8
+  if unsafe_experiments and dev.read32(_chan_table_chan_reg) == 0:
+    dev.write32(_chan_table_chan_reg, 0xc0000000 | (ramin_bind_addr >> 12))
+    dev.write32(_chan_table_state_reg, 0x001f0001)
+    if DEBUG:
+      print(f"[kepler] manual CHAN_TABLE write: "
+            f"CHAN=0x{dev.read32(_chan_table_chan_reg):08x} "
+            f"STATE=0x{dev.read32(_chan_table_state_reg):08x}", flush=True)
+  # Check PFIFO and PBDMA state after runlist commit
+  if dev.dev_impl.hw is not None:
+    _pfifo_intr = dev.read32(0x2100)
+    _chan_table_err = dev.read32(0x252c)
+    _sched_err = dev.read32(0x254c) if _pfifo_intr & 0x100 else 0
+    print(f"[kepler] CHAN_TABLE_ERROR=0x{_chan_table_err:08x}", flush=True)
+    _bind_err = dev.read32(0x252c) if _pfifo_intr & 0x1 else 0
+    # Also check SCHED_ERROR right after channel bind (before runlist commit)
+    _pre_runlist_intr = dev.read32(0x2100)
+    _pre_sched_err = dev.read32(0x254c) if _pre_runlist_intr & 0x100 else 0
+    _chsw_stat = dev.read32(0x2630)
+    _runq_masks = [dev.read32(0x2390 + i * 4) for i in range(3)]
+    _pbdma_ch = [dev.read32(0x40120 + i * 0x2000) for i in range(3)]
+    _pbdma_engines = [dev.read32(0x400a4 + i * 0x2000) for i in range(3)]
+    _engn_status = [dev.read32(0x2640 + i * 8) for i in range(8)]
+    _chan_ctrl = dev.read32(CHAN_START_REG + chan_id * 8)
+    _chan_inst = dev.read32(CHAN_SUBMIT_REG + chan_id * 8)
+    print(f"[kepler] PFIFO after runlist: INTR=0x{_pfifo_intr:08x} "
+          f"SCHED_ERR=0x{_sched_err:02x} BIND_ERR=0x{_bind_err:02x} "
+          f"CHSW=0x{_chsw_stat:08x} runq_masks={[hex(x) for x in _runq_masks]} "
+          f"pbdma_ch={[hex(x) for x in _pbdma_ch]} "
+          f"pbdma_engines={[hex(x) for x in _pbdma_engines]}", flush=True)
+    # Read SCHED_ERROR and SCHED_STATUS directly (not gated on INTR)
+    _sched_err_direct = dev.read32(0x254c)
+    _sched_status_direct = dev.read32(0x263c)
+    _engn0_direct = dev.read32(0x2640)
+    print(f"[kepler] SCHED direct: ERR=0x{_sched_err_direct:08x} "
+          f"STATUS=0x{_sched_status_direct:08x} ENGN0=0x{_engn0_direct:08x}",
+          flush=True)
+    print(f"[kepler] engn_status={[hex(x) for x in _engn_status if x]} "
+          f"chan_ctrl=0x{_chan_ctrl:08x} chan_inst=0x{_chan_inst:08x}", flush=True)
+    # Check CHAN_TABLE after runlist commit
+    _post_chan_table_chan = dev.read32(0x3000 + chan_id * 8)
+    _post_chan_table_state = dev.read32(0x3004 + chan_id * 8)
+    print(f"[kepler] CHAN_TABLE[{chan_id}] after runlist: CHAN=0x{_post_chan_table_chan:08x} "
+          f"STATE=0x{_post_chan_table_state:08x} "
+          f"(RUNNABLE={bool(_post_chan_table_state & 1)} LOADED={bool(_post_chan_table_state & 0x1000)})", flush=True)
+    # Check PFIFO_CHAN state (GK104 uses 0x800000, not the GF100 CHAN_TABLE at 0x3000)
+    _pfifo_chan = dev.read32(0x800000 + chan_id * 8)
+    _pfifo_chan_state = dev.read32(0x800004 + chan_id * 8)
+    print(f"[kepler] PFIFO_CHAN[{chan_id}]: CHAN=0x{_pfifo_chan:08x} "
+          f"STATE=0x{_pfifo_chan_state:08x} "
+          f"(ENABLED={bool(_pfifo_chan_state & 1)} "
+          f"ENABLE_TRIGGER={bool(_pfifo_chan_state & 0x400)} "
+          f"ENGINE={(_pfifo_chan_state >> 16) & 0xf} "
+          f"UNK24_RO={(_pfifo_chan_state >> 24) & 0x7} "
+          f"UNK28_RO={bool(_pfifo_chan_state & 0x10000000)})",
+          flush=True)
+    # Check MMU fault registers (0x2800 + unit * 0x10, 8 units on GK104)
+    _mmu_faults = []
+    _fault_source = dev.read32(0x259c)
+    for _unit in range(8):
+      if not (_fault_source & (1 << _unit)):
+        continue
+      _fault_inst = dev.read32(0x2800 + _unit * 0x10)
+      _fault_valo = dev.read32(0x2804 + _unit * 0x10)
+      _fault_vahi = dev.read32(0x2808 + _unit * 0x10)
+      _fault_type = dev.read32(0x280c + _unit * 0x10)
+      if _fault_inst or _fault_type:
+        _mmu_faults.append((_unit, _fault_inst, _fault_valo, _fault_vahi, _fault_type))
+    if _mmu_faults:
+      for _unit, _inst, _valo, _vahi, _type in _mmu_faults:
+        _fault_addr = (_vahi << 32) | _valo
+        print(f"[kepler] MMU_FAULT unit={_unit} inst=0x{_inst:08x} "
+              f"addr=0x{_fault_addr:010x} "
+              f"type=0x{_type:08x} reason={_type & 0xf} "
+              f"client={(_type >> 8) & 0x1f:#x} "
+              f"hub={bool(_type & 0x40)} write={bool(_type & 0x80)}",
+              flush=True)
+    else:
+      print("[kepler] MMU_FAULT: none", flush=True)
+    # Check USERD after runlist commit (through BAR1)
+    if dev.dev_impl.hw is not None and use_vram_inst:
+      _post_userd_gp_get = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_vram_pa + userd_base_off + USERD_GP_GET, 4))[0]
+      _post_userd_gp_put = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_vram_pa + userd_base_off + USERD_GP_PUT, 4))[0]
+      print(f"[kepler] USERD[{chan_id}] after runlist: GP_GET={_post_userd_gp_get} GP_PUT={_post_userd_gp_put}", flush=True)
+    # Check PLAYLIST_RD for the GR runlist.
+    _playlist_rd = dev.read32(0x2280 + GR_RUNLIST_ID * 8)
+    _playlist_rd_len = dev.read32(0x2284 + GR_RUNLIST_ID * 8)
+    print(f"[kepler] PLAYLIST_RD[{GR_RUNLIST_ID}]: addr=0x{_playlist_rd:08x} "
+          f"len=0x{_playlist_rd_len:08x} (LEN={_playlist_rd_len & 0xfff} "
+          f"BUSY={bool(_playlist_rd_len & 0x100000)})", flush=True)
+    # Check the PBDMA whose hardware runlist mask contains the GR runlist.
+    _gr_pbdma = next((i for i, mask in enumerate(_runq_masks)
+                      if mask & (1 << GR_RUNLIST_ID)), 0)
+    _p1_base = 0x40000 + _gr_pbdma * 0x2000
+    _p1_ib_put = dev.read32(_p1_base + 0x00)
+    _p1_ib_get = dev.read32(_p1_base + 0x14)
+    _p1_dma_get = dev.read32(_p1_base + 0x18)
+    _p1_ctrl = dev.read32(_p1_base + 0x40)
+    _p1_chid = dev.read32(_p1_base + 0x120)
+    _p1_eng = dev.read32(_p1_base + 0xa4)
+    print(f"[kepler] PBDMA{_gr_pbdma} detail: IB_PUT=0x{_p1_ib_put:08x} IB_GET=0x{_p1_ib_get:08x} "
+          f"DMA_GET=0x{_p1_dma_get:08x} CTRL=0x{_p1_ctrl:08x} CHID=0x{_p1_chid:08x} "
+          f"ENG=0x{_p1_eng:08x}", flush=True)
+    # Check ENGINE_CHANNEL_INST for engine 0 (PGRAPH) at 0x2680
+    _eng_chan_inst = [dev.read32(0x2680 + _i * 4) for _i in range(8)]
+    print(f"[kepler] ENGINE_CHANNEL_INST={[hex(x) for x in _eng_chan_inst]}", flush=True)
+    # Check PBDMA_STATUS at 0x26c0
+    _pbdma_status = dev.read32(0x26c0)
+    print(f"[kepler] PBDMA_STATUS=0x{_pbdma_status:08x}", flush=True)
+    # Check FREEZE at 0x2638
+    _freeze = dev.read32(0x2638)
+    print(f"[kepler] FREEZE=0x{_freeze:08x}", flush=True)
+    # Verify instance pointer and read USERD addr from instance block
+    _chan_inst_val = dev.read32(CHAN_SUBMIT_REG + chan_id * 8)
+    _inst_pa = (_chan_inst_val & 0x0fffffff) << 12
+    print(f"[kepler] chan_inst=0x{_chan_inst_val:08x} inst_pa=0x{_inst_pa:08x}", flush=True)
+    # Check PBDMA idle status (0x3080 + pbdma_id * 4, bits 13-15)
+    _pbdma_idle = [dev.read32(0x3080 + _i * 4) for _i in range(3)]
+    print(f"[kepler] PBDMA idle status: {[hex(x) for x in _pbdma_idle]} "
+          f"(idle={[not (x & 0xe000) for x in _pbdma_idle]})", flush=True)
+    # Check UNK1080 (PBDMA status) more carefully
+    for _pi in range(3):
+      _val = dev.read32(0x3080 + _pi * 4)
+      print(f"[kepler] PBDMA{_pi} status 0x{0x3080+_pi*4:x}=0x{_val:08x} "
+            f"bits13-15={( _val >> 13) & 7}", flush=True)
+    # Check SCHED_STATUS and ENG_STATE
+    _sched_status = dev.read32(0x263c)
+    print(f"[kepler] SCHED_STATUS=0x{_sched_status:08x}", flush=True)
+    # Check BYPASS registers
+    _bypass_config = dev.read32(0x26c4)
+    _bypass_status = dev.read32(0x5000)
+    print(f"[kepler] BYPASS_CONFIG=0x{_bypass_config:08x} "
+          f"BYPASS_STATUS=0x{_bypass_status:08x}", flush=True)
+    for _ei in range(7):
+      _es = dev.read32(0x2640 + _ei * 4)
+      if _es:
+        print(f"[kepler] ENG_STATE[{_ei}]=0x{_es:08x}", flush=True)
+    # Dump runlist entry
+    if use_vram_runlist:
+      _rl = struct.unpack('<II', dev.dev_impl.hw.mmio_read(1, runlist_pa, 8))
+    else:
+      _rl = struct.unpack_from('<II', vram, runlist_pa)
+    print(f"[kepler] runlist entry: chan_id={_rl[0]:#x} word1={_rl[1]:#x} "
+          f"(expected chan_id={chan_id:#x})", flush=True)
   # FECS state after runlist commit
   _fecs_ctrl_post_rl = dev.read32(0x409100)
+  _subch_post_rl = dev.read32(0x404200)
   print(f"[kepler] post-runlist FECS: CPUCTL={_fecs_ctrl_post_rl:#x} "
         f"SCRATCH0={dev.read32(0x409800):#x} "
         f"CHAN_ADDR={dev.read32(0x409b00):#x} "
-        f"CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
+        f"CHAN_NEXT={dev.read32(0x409b04):#x} "
+        f"subch4={_subch_post_rl:#x}", flush=True)
+  # Manually trigger a context switch to load the channel context.
+  # On GK104, the PBDMA should automatically generate a CHSW interrupt when
+  # it schedules a new channel, but on this eGPU without a PMU, the PBDMA
+  # forwards methods without waiting for the FECS to load the context.
+  # Manually set CHAN_NEXT with bit 31 (new channel to load) and trigger
+  # the CHSW interrupt (bit 8 of INTR_SET at 0x409000), exactly like the
+  # golden ctx unload does in reverse.
+  _chan_next_pre = dev.read32(0x409b04)
+  _chan_addr_pre = dev.read32(0x409b00)
+  print(f"[kepler] manual CHSW: CHAN_ADDR={_chan_addr_pre:#x} "
+        f"CHAN_NEXT={_chan_next_pre:#x} -> setting CHAN_NEXT bit31",
+        flush=True)
+  # Set CHAN_NEXT with bit 31 to indicate a new channel to load
+  if unsafe_experiments:
+    dev.write32(0x409b04, _chan_next_pre | 0x80000000)
+    # Trigger the CHSW interrupt (bit 8 of INTR_SET)
+    dev.write32(0x409000, 0x00000100)
+  # Wait for the FECS to process the context switch
+  _chsw_start = time.time()
+  _chsw_done = False
+  for _ in range(2000 if unsafe_experiments else 0):
+    _ca = dev.read32(0x409b00)
+    _cn = dev.read32(0x409b04)
+    _scratch0 = dev.read32(0x409800)
+    # Context switch is done when CHAN_ADDR gets bit 31 (context loaded)
+    # and CHAN_NEXT loses bit 31 (FECS consumed the switch request)
+    if _ca & 0x80000000:
+      _chsw_done = True
+      break
+    if (_ca & 0xffff0000) == 0xbadf0000:
+      print(f"[kepler] manual CHSW: FECS power-gated during switch!",
+            flush=True)
+      break
+    time.sleep(0.001)
+  _chsw_elapsed = time.time() - _chsw_start
+  print(f"[kepler] manual CHSW result: done={_chsw_done} "
+        f"elapsed={_chsw_elapsed:.3f}s "
+        f"CHAN_ADDR={dev.read32(0x409b00):#x} "
+        f"CHAN_NEXT={dev.read32(0x409b04):#x} "
+        f"SCRATCH0={dev.read32(0x409800):#x} "
+        f"PC={dev.read32(0x409ff0):#x}", flush=True)
+  # Read CTXCTL ENGINE_STATUS (0x409c00) to understand context switch state.
+  # Bits: 0=CHSW_PENDING, 1=CHAN_VALID, 3=CHSW_PULSE,
+  #        7=DAEMON2CTXCTL_REQ, 8=DAEMON2CTXCTL_ACK,
+  #        9=CTXCTL2DAEMON_REQ, 10=CTXCTL2DAEMON_ACK,
+  #        13=IDLE_BUSY, 15=PAUSE_BUSY
+  _ctxctl_eng_stat = dev.read32(0x409c00)
+  _ctxctl_eng_trig = dev.read32(0x409c08)
+  print(f"[kepler] CTXCTL ENGINE_STATUS=0x{_ctxctl_eng_stat:08x} "
+        f"TRIGGER=0x{_ctxctl_eng_trig:08x} "
+        f"CHSW_PEND={bool(_ctxctl_eng_stat&1)} CHAN_VALID={bool(_ctxctl_eng_stat&2)} "
+        f"D2C_REQ={bool(_ctxctl_eng_stat&0x80)} D2C_ACK={bool(_ctxctl_eng_stat&0x100)} "
+        f"C2D_REQ={bool(_ctxctl_eng_stat&0x200)} C2D_ACK={bool(_ctxctl_eng_stat&0x400)} "
+        f"IDLE_BUSY={bool(_ctxctl_eng_stat&0x2000)} PAUSE_BUSY={bool(_ctxctl_eng_stat&0x8000)}",
+        flush=True)
+  # Call gf100_gr_fecs_bind_pointer: send WRCMD_CMD=0x03 (BIND_POINTER) with
+  # the channel instance address.  This tells PGRAPH CTXCTL which context to
+  # use, setting CHAN_VALID.  Without this, PGRAPH CTXCTL has no valid channel
+  # and methods sit in the FIFO unprocessed.
+  # gf100_gr_fecs_bind_pointer(gr, 0x80000000 | addr) where addr = inst->addr >> 12
+  _bind_inst = 0x80000000 | ((ramin_bind_addr >> 12) & 0x0FFFFFFF)
+  # Check FECS interrupt/falcon state before sending WRCMD
+  _fecs_cpuctl = dev.read32(0x409100)
+  _fecs_intr = dev.read32(0x409008)
+  _fecs_intr_en = dev.read32(0x409018)
+  _fecs_iren = dev.read32(0x409010)
+  print(f"[kepler] FECS pre-bind: CPUCTL=0x{_fecs_cpuctl:08x} "
+        f"INTR=0x{_fecs_intr:08x} INTR_EN=0x{_fecs_intr_en:08x} "
+        f"IREN=0x{_fecs_iren:08x} "
+        f"SLEEPING={bool(_fecs_cpuctl&0x20)} HALT={bool(_fecs_cpuctl&0x2)}",
+        flush=True)
+  # If FECS is sleeping, ensure FIFO_DATA interrupt (bit 2) is enabled
+  # and trigger it to wake the falcon
+  if unsafe_experiments and _fecs_cpuctl & 0x20:  # SLEEPING
+    # Enable FIFO_DATA interrupt (bit 2) in INTR_EN_SET
+    dev.write32(0x409010, 0xffffffff)  # IREN: enable all external interrupts
+    dev.write32(0x409010 + 0x4, 0xff)  # INTR_EN_SET: enable all falcon interrupts
+    # Actually use INTR_EN_SET at 0x409010 + 4 = 0x409014
+    # Wait, the registers are: 0x010 = INTR_EN_SET, 0x014 = INTR_EN_CLR, 0x018 = INTR_EN
+    # Let me re-check: INTR_EN_SET is at offset 0x010
+    dev.write32(0x409010, 0xff)  # INTR_EN_SET: enable all interrupts
+    time.sleep(0.001)
+    _fecs_intr_en2 = dev.read32(0x409018)
+    print(f"[kepler] FECS wake: INTR_EN=0x{_fecs_intr_en2:08x}", flush=True)
+  if unsafe_experiments:
+    nvkm_mask(dev, 0x409800, 0x00000030, 0x00000000)
+    dev.write32(0x409500, _bind_inst)
+    dev.write32(0x409504, 0x00000003)  # BIND_POINTER
+  _bp_done = False
+  _bp_err = False
+  for _ in range(2000 if unsafe_experiments else 0):
+    _scratch0 = dev.read32(0x409800)
+    if _scratch0 & 0x00000020:  # error
+      _bp_err = True
+      break
+    if _scratch0 & 0x00000010:  # done
+      _bp_done = True
+      break
+    time.sleep(0.001)
+  _ctxctl_eng_stat2 = dev.read32(0x409c00)
+  print(f"[kepler] FECS bind_pointer: done={_bp_done} err={_bp_err} "
+        f"inst=0x{_bind_inst:08x} SCRATCH0=0x{dev.read32(0x409800):08x} "
+        f"CTXCTL_STATUS=0x{_ctxctl_eng_stat2:08x} "
+        f"CHAN_VALID={bool(_ctxctl_eng_stat2&2)}",
+        flush=True)
+  # If bind_pointer failed, try the non-firmware ctx_chan path
+  if unsafe_experiments and not _bp_done:
+    print("[kepler] bind_pointer failed — trying non-firmware ctx_chan path", flush=True)
+    # Clear SCRATCH0 bit 31 (init done) via CC_SCRATCH_CLEAR
+    dev.write32(0x409840, 0x80000000)
+    time.sleep(0.001)
+    # Send ctx_chan command (0x01) with instance address
+    dev.write32(0x409500, _bind_inst)
+    dev.write32(0x409504, 0x00000001)  # ctx_chan
+    for _ in range(2000):
+      _scratch0 = dev.read32(0x409800)
+      if _scratch0 & 0x80000000:
+        break
+      time.sleep(0.001)
+    _ctxctl_eng_stat3 = dev.read32(0x409c00)
+    print(f"[kepler] ctx_chan path: SCRATCH0=0x{dev.read32(0x409800):08x} "
+          f"CTXCTL_STATUS=0x{_ctxctl_eng_stat3:08x} "
+          f"CHAN_VALID={bool(_ctxctl_eng_stat3&2)}",
+          flush=True)
+  # Rapid poll of FECS state to catch the CHSW processing
+  if dev.dev_impl.hw is not None:
+    _poll_start = time.time()
+    _poll_data = []
+    for _i in range(100):
+      _ctrl = dev.read32(0x409100)
+      _pc = dev.read32(0x409ff0)
+      _ca = dev.read32(0x409b00)
+      _cn = dev.read32(0x409b04)
+      _poll_data.append((_ctrl, _pc, _ca, _cn))
+      if _ctrl == 0x0 or (_ctrl & 0xffff0000) == 0xbadf0000:
+        break
+      time.sleep(0.001)
+    _poll_elapsed = time.time() - _poll_start
+    print(f"[kepler] FECS CHSW poll ({_poll_elapsed:.3f}s, {_i+1} samples):", flush=True)
+    for _j, (_c, _p, _a, _n) in enumerate(_poll_data[:20]):
+      print(f"  [{_j:3d}] CPUCTL=0x{_c:08x} PC=0x{_p:08x} "
+            f"CHAN_ADDR=0x{_a:08x} CHAN_NEXT=0x{_n:08x}", flush=True)
   # Advance USERD GP_PUT past the written entry.
   if DEBUG and use_vram_inst:
     late_ring = (dev.dev_impl.hw.mmio_read(1, gpfifo_vram_pa, 8).hex()
@@ -3720,17 +5963,230 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   if use_vram_inst:
     # Re-store command data only after the channel is resident.  This avoids a
     # zero GP entry prefetched while the freshly-created RAMFC still had PUT=0.
-    if gpfifo_vram_pa is not None:
-      _gk104_pramin_write(dev, gpfifo_vram_pa, ring)
-    if push_vram_pa is not None:
-      _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
-    _gk104_bar_flush(dev)
-    if not _gk104_ltc_invalidate(dev):
-      raise TimeoutError("GK104 LTC invalidate did not complete")
+    for _attempt in range(4):
+      if gpfifo_vram_pa is not None:
+        bar1_write(gpfifo_vram_pa, ring_store)
+        _gk104_pramin_write(dev, gpfifo_vram_pa, ring_store)
+      if push_vram_pa is not None:
+        bar1_write(push_vram_pa + push_phys_offset, push_bytes)
+        _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate did not complete")
+      time.sleep(0.005)
+      _ring_actual = (dev.dev_impl.hw.mmio_read(
+          1, gpfifo_vram_pa, len(ring_store))
+          if gpfifo_vram_pa is not None else ring_store)
+      _push_actual = (dev.dev_impl.hw.mmio_read(
+          1, push_vram_pa + push_phys_offset, len(push_bytes))
+          if push_vram_pa is not None else bytes(push_bytes))
+      _ring_pramin = (b"".join(struct.pack("<I", _gk104_pramin_read32(
+          dev, gpfifo_vram_pa + off)) for off in range(0, len(ring_store), 4))
+          if gpfifo_vram_pa is not None else ring_store)
+      _push_pramin = (b"".join(struct.pack("<I", _gk104_pramin_read32(
+          dev, push_vram_pa + push_phys_offset + off))
+          for off in range(0, len(push_bytes), 4))
+          if push_vram_pa is not None else bytes(push_bytes))
+      if (_ring_actual == _ring_pramin == ring_store and
+          _push_actual == _push_pramin == bytes(push_bytes)):
+        break
+    else:
+      raise RuntimeError("GK104 command buffers did not stabilise before GP_PUT")
+  # Fail closed before making any command visible to the PBDMA.  A fresh MMU
+  # or HCE fault means the instance/VMM context is not safe for GPU DMA.
+  _prelaunch_faults = []
+  _prelaunch_fault_source = dev.read32(0x259c)
+  for _unit in range(8):
+    if not (_prelaunch_fault_source & (1 << _unit)):
+      continue
+    _inst = dev.read32(0x2800 + _unit * 0x10)
+    _type = dev.read32(0x280c + _unit * 0x10)
+    if _inst or _type:
+      _prelaunch_faults.append((_unit, _inst, _type))
+  _prelaunch_hce = []
+  for _pbdma in range(3):
+    _hce = dev.read32(0x40148 + _pbdma * 0x2000)
+    if _hce:
+      _prelaunch_hce.append((_pbdma, _hce))
+  if _prelaunch_faults or _prelaunch_hce:
+    _probe_va = 0x67000
+    _probe_pgdi, _probe_spti = (_probe_va >> 27) & 0x1fff, (_probe_va >> 12) & 0x7fff
+    _probe_pte_addr = cloned_by_pgd[_probe_pgdi] + _probe_spti * 8
+    _probe_pte = (_gk104_pramin_read32(dev, _probe_pte_addr) |
+                  (_gk104_pramin_read32(dev, _probe_pte_addr + 4) << 32))
+    print(f"[kepler] faulted GR buffer regs: "
+          f"bundle={dev.read32(0x408004):#x}/{dev.read32(0x418808):#x} "
+          f"pagepool={dev.read32(0x40800c):#x}/{dev.read32(0x419004):#x} "
+          f"pte[0x67000]={_probe_pte:#x}",
+          flush=True)
+    _quiesce_channel("prelaunch fault")
+    raise RuntimeError(
+      f"unsafe GK104 channel state before GP_PUT: "
+      f"mmu_faults={_prelaunch_faults} hce={_prelaunch_hce}")
   if not put_before_runlist:
-    dev.dev_impl.hw.mmio_write(1, userd_mmio_base + USERD_GP_PUT, struct.pack("<I", 1))
-    _gk104_bar_flush(dev)
+    # The cold eGPU's saved context restores complemented scratch-buffer
+    # bases.  With PUT still zero the channel is resident and idle here, so
+    # load it with the documented internal-FECS ctx_chan command, then replay
+    # Nouveau's per-channel GR patch list before exposing any methods.
+    dev.write32(0x409840, 0x80000000)
+    dev.write32(0x409500, 0x80000000 | (ramin_bind_addr >> 12))
+    dev.write32(0x409504, 0x00000001)
+    wait_cond(lambda: bool(dev.read32(0x409800) & 0x80000000),
+              timeout_ms=2000, msg="FECS runtime ctx_chan")
+    print(f"[kepler] runtime ctx_chan: CHAN_ADDR={dev.read32(0x409b00):#x} "
+          f"CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
+    for _reg, _value in runtime_mmio_entries:
+      dev.write32(_reg, _value & 0xffffffff)
+    _gk104_gr_wait_idle(dev)
+    print(f"[kepler] late GR patch: bundle={dev.read32(0x408004):#x}/"
+          f"{dev.read32(0x418808):#x} pagepool={dev.read32(0x40800c):#x}/"
+          f"{dev.read32(0x419004):#x}", flush=True)
+    if use_vram_inst:
+      # BAR1 readback is CPU-visible but, on this cold-attached card, does not
+      # prove that PFIFO observes the store.  Mirror the doorbell through
+      # PRAMIN and invalidate LTC before waiting for PBDMA.
+      for _attempt in range(4):
+        # This is the normal userspace notification path: USERD is mapped in
+        # BAR1 precisely so GP_PUT can be written through the CPU aperture.
+        dev.dev_impl.hw.mmio_write(
+            1, userd_mmio_base + USERD_GP_PUT, struct.pack("<I", 1))
+        _gk104_pramin_write(dev, userd_mmio_base + USERD_GP_PUT,
+                            struct.pack("<I", 1))
+        _gk104_bar_flush(dev)
+        if not _gk104_ltc_invalidate(dev):
+          raise TimeoutError("GK104 LTC invalidate after GP_PUT did not complete")
+        time.sleep(0.005)
+        _put_phys = _gk104_pramin_read32(
+            dev, userd_mmio_base + USERD_GP_PUT)
+        _put_bar = struct.unpack(
+            "<I", dev.dev_impl.hw.mmio_read(
+                1, userd_mmio_base + USERD_GP_PUT, 4))[0]
+        if _put_phys == _put_bar == 1:
+          break
+      else:
+        raise RuntimeError(
+            f"GK104 GP_PUT did not stabilise: physical={_put_phys:#x} "
+            f"bar1={_put_bar:#x}")
+      nvkm_mask(dev, _chan_ctrl_reg, 0x00000400, 0x00000400)
+    else:
+      dev.dev_impl.hw.mmio_write(1, userd_mmio_base + USERD_GP_PUT,
+                                 struct.pack("<I", 1))
+      _gk104_bar_flush(dev)
   userd_put_readback = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_mmio_base + USERD_GP_PUT, 4))[0]
+  # If the PBDMA scheduler is not functional (CHAN_TABLE empty, PBDMA idle),
+  # use the PFIFO BYPASS mechanism to submit methods directly to PGRAPH.
+  # This bypasses the PBDMA/scheduler entirely and feeds methods one-by-one
+  # through the BYPASS registers at 0x5000.
+  _ct_check = dev.read32(0x3000 + chan_id * 8)
+  if unsafe_experiments and _ct_check == 0 and dev.dev_impl.hw is not None:
+    if DEBUG:
+      print("[kepler] CHAN_TABLE empty — using BYPASS path", flush=True)
+    # Enable BYPASS for PGRAPH (engine 0).
+    # The FECS context switch has already been done (manual CHSW above),
+    # so the GR context and page table are already loaded.  Set the channel
+    # instance pointer in BYPASS_CHANNEL_SWITCH for the bypass context.
+    dev.write32(0x26c4, 0x00000100)  # ENGINE=0, ENABLE=1 (bit 8)
+    # Do NOT write BYPASS_CHANNEL_SWITCH — the manual CHSW already loaded
+    # the GR context.  Writing CHSW triggers a FECS context switch that
+    # gets stuck (CTXCTL busy forever).  Instead, just enable BYPASS and
+    # PGRAPH FIFO PULL to submit methods directly.
+    time.sleep(0.01)
+    _bypass_status = dev.read32(0x5000)
+    if DEBUG:
+      _fifo_ctrl = dev.read32(0x400500)
+      _fifo_stat = dev.read32(0x400504)
+      print(f"[kepler] BYPASS: CONFIG=0x{dev.read32(0x26c4):08x} "
+            f"STATUS=0x{_bypass_status:08x} "
+            f"FIFO_CTRL=0x{_fifo_ctrl:08x} FIFO_STAT=0x{_fifo_stat:08x}", flush=True)
+    # Enable PGRAPH FIFO PULL bit (0x400500 bit 0) to process incoming methods
+    _fifo_ctrl = dev.read32(0x400500)
+    if not (_fifo_ctrl & 0x1):
+      dev.write32(0x400500, _fifo_ctrl | 0x1)
+      if DEBUG:
+        print(f"[kepler] PGRAPH FIFO PULL enabled: 0x{dev.read32(0x400500):08x}", flush=True)
+    # Read CTX_SWITCH and DISPATCH state
+    if DEBUG:
+      _ctx_sw = dev.read32(0x404010)
+      _disp_cmd_addr = dev.read32(0x404004)
+      _disp_subch = dev.read32(0x404024)
+      print(f"[kepler] DISPATCH: CTX_SWITCH=0x{_ctx_sw:08x} "
+            f"CMD_ADDR=0x{_disp_cmd_addr:08x} SUBCH=0x{_disp_subch:08x}", flush=True)
+    # Try to clear stuck CTXCTL by clearing the CTX_SWITCH register
+    dev.write32(0x404010, 0x00000000)
+    time.sleep(0.001)
+    # Submit methods via BYPASS.  The words list is flat: header, arg0, arg1, ...
+    # BYPASS_ADDR (0x5004): bits 2-13 = MTHD>>2, bits 16-18 = SUBCH
+    # BYPASS_DATA (0x5008): poke to submit one word
+    _wi = 0
+    while _wi < len(words):
+      _hdr = words[_wi]
+      _size = (_hdr >> 16) & 0xfff
+      _subc = (_hdr >> 13) & 0x7
+      _mthd = (words[_wi] & 0x1fff) << 2  # method address
+      _args = words[_wi + 1:_wi + 1 + _size]
+      # Write ADDR with method and subchannel.
+      # BYPASS_ADDR: bits 2-13 = MTHD (method address, already 4-byte aligned),
+      # bits 16-18 = SUBCH.  The field value is method_addr >> 2, placed at
+      # bit 2 in the register, so we write (mthd & 0x3ffc) | (subch << 16).
+      dev.write32(0x5004, (_subc << 16) | (_mthd & 0x3ffc))
+      if DEBUG and _wi < 40:
+        _addr_rb = dev.read32(0x5004)
+        _st = dev.read32(0x5000)
+        print(f"[kepler] BYPASS submit: subc={_subc} mthd=0x{_mthd:x} "
+              f"args={[hex(_a) for _a in _args]} "
+              f"ADDR_rb=0x{_addr_rb:08x} STATUS=0x{_st:08x}", flush=True)
+      for _arg in _args:
+        dev.write32(0x5008, _arg)
+        # Check for errors after each data write
+        _st = dev.read32(0x5000)
+        if _st & 0x1e00:  # error bits 8-12
+          if DEBUG:
+            print(f"[kepler] BYPASS error after data: STATUS=0x{_st:08x}", flush=True)
+          break
+      _wi += 1 + _size
+    if DEBUG:
+      _fifo_stat_post = dev.read32(0x400504)
+      _fifo_ctrl_post = dev.read32(0x400500)
+      _disp_trap = dev.read32(0x404000)
+      _pgraph_stat = dev.read32(0x400700)
+      _subch1_post = dev.read32(0x404200 + 4)
+      print(f"[kepler] BYPASS done, STATUS=0x{dev.read32(0x5000):08x} "
+            f"FIFO_CTRL=0x{_fifo_ctrl_post:08x} FIFO_STAT=0x{_fifo_stat_post:08x} "
+            f"DISP_TRAP=0x{_disp_trap:08x} PGRAPH_STAT=0x{_pgraph_stat:08x} "
+            f"subch1=0x{_subch1_post:08x}", flush=True)
+    # If SET_OBJECT didn't bind (subch1 still 0), try direct DISPATCH injection.
+    # The DISPATCH.CMD_ADDR (0x404004) and CMD_DATA_LOW (0x404008) can accept
+    # methods directly, bypassing the FIFO.
+    _subch1_check = dev.read32(0x404200 + 4)
+    if _subch1_check == 0:
+      if DEBUG:
+        print("[kepler] SET_OBJECT not bound — trying direct DISPATCH injection", flush=True)
+      # Clear the FIFO to remove stuck entries
+      dev.write32(0x400500, 0x00000000)  # Disable PULL
+      time.sleep(0.001)
+      dev.write32(0x400500, 0x00010001)  # Re-enable PULL with UNK16
+      time.sleep(0.001)
+      # Directly inject methods via DISPATCH CMD_ADDR/CMD_DATA
+      _wi2 = 0
+      while _wi2 < len(words):
+        _hdr2 = words[_wi2]
+        _size2 = (_hdr2 >> 16) & 0xfff
+        _subc2 = (_hdr2 >> 13) & 0x7
+        _mthd2 = (words[_wi2] & 0x1fff) << 2
+        _args2 = words[_wi2 + 1:_wi2 + 1 + _size2]
+        # Write CMD_ADDR: MTHD at bits 2-12, SUBCH at bits 16-18, VALID at bit 31
+        _addr_val = (1 << 31) | (_subc2 << 16) | ((_mthd2 >> 2) << 2)
+        for _ai2, _arg2 in enumerate(_args2):
+          dev.write32(0x404004, _addr_val)
+          dev.write32(0x404008, _arg2)
+          if _ai2 + 1 < len(_args2):
+            # Auto-increment: just advance MTHD by 4 for next write
+            _addr_val += 4
+        if DEBUG and _wi2 < 40:
+          _sc = dev.read32(0x404200 + 4)
+          print(f"[kepler] DISPATCH inject: subc={_subc2} mthd=0x{_mthd2:x} "
+                f"args={[hex(_a) for _a in _args2]} subch1=0x{_sc:08x}", flush=True)
+        _wi2 += 1 + _size2
   if DEBUG:
     print(f"[kepler] BAR1 USERD GP_PUT write=1 readback={userd_put_readback:#x} "
           f"userd_pa={userd_addr:#x} bar1_off={userd_mmio_base:#x} "
@@ -3744,31 +6200,136 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         trace.append(snap)
     print(f"[kepler] pbdma0 submit trace={[[hex(x) for x in row] for row in trace]}",
           flush=True)
-  # Commit runlist 0.  Target 3 is non-coherent system memory in Nouveau's
-  # gf100_runl_commit(), and the count is separate from the channel ID.
-  # Poll the host-visible semaphore page.
+  # Commit the GR runlist (ID=3 from TOP scan).  Target 3 is non-coherent
+  # system memory in Nouveau's gf100_runl_commit(), and the count is separate
+  # from the channel ID.  Poll the host-visible semaphore page.
+  if DEBUG and dev.dev_impl.hw is not None:
+    # Rapid PGRAPH busy poll: check if the engine actually starts processing
+    # the LAUNCH method.  0x40060c bit0 = gr_busy, 0x400700 = status.
+    _busy_samples = []
+    for _bi in range(20):
+      _all_eng = [dev.read32(0x400a4 + _p * 0x2000) for _p in range(3)]
+      _busy_samples.append((
+        dev.read32(0x40060c),  # GR_BUSY
+        dev.read32(0x400700),  # PGRAPH_STATUS
+        dev.read32(0x400704),  # TRAPPED_ADDR
+        _all_eng,
+        dev.read32(0x404170),  # FE_PWR
+        dev.read32(0x409100),  # FECS_CTRL
+        dev.read32(0x404200 + 4),  # subch1
+      ))
+      time.sleep(0.001)
+    print(f"[kepler] PGRAPH busy poll after kick:", flush=True)
+    for _bj, (_b, _s, _a, _engs, _fp, _fc, _sc1) in enumerate(_busy_samples[:10]):
+      print(f"  [{_bj:2d}] GR_BUSY=0x{_b:08x} STATUS=0x{_s:08x} "
+            f"ADDR=0x{_a:08x} ENGINES={[hex(_e) for _e in _engs]} "
+            f"FE_PWR=0x{_fp:08x} FECS=0x{_fc:08x} subch1=0x{_sc1:08x}", flush=True)
+    # PBDMA error check: scan all PBDMAs to find the one serving our channel.
+    for _pbdma_idx in range(3):
+      _q = 0x40000 + _pbdma_idx * 0x2000
+      _pbdma_intr = dev.read32(_q + 0x108)
+      _pbdma_intr_mask = dev.read32(_q + 0x10c)
+      _pbdma_hce_intr = dev.read32(_q + 0x148)
+      _pbdma_hce_mask = dev.read32(_q + 0x14c)
+      _pbdma_trap_addr = dev.read32(_q + 0xc0)
+      _pbdma_trap_data = dev.read32(_q + 0xc4)
+      _pbdma_chid = dev.read32(_q + 0x120)
+      _pbdma_state0 = dev.read32(_q + 0x84)
+      _pbdma_state1 = dev.read32(_q + 0x88)
+      _pbdma_ib_get = dev.read32(_q + 0x14)
+      _pbdma_ib_put = dev.read32(_q + 0x00)
+      _pbdma_engines = dev.read32(_q + 0xa4)
+      if _pbdma_chid or _pbdma_intr or _pbdma_engines:
+        print(f"[kepler] PBDMA{_pbdma_idx}: INTR=0x{_pbdma_intr:08x} MASK=0x{_pbdma_intr_mask:08x} "
+              f"HCE_INTR=0x{_pbdma_hce_intr:08x} HCE_MASK=0x{_pbdma_hce_mask:08x} "
+              f"TRAP_ADDR=0x{_pbdma_trap_addr:08x} TRAP_DATA=0x{_pbdma_trap_data:08x} "
+              f"CHID=0x{_pbdma_chid:08x} ENGINES=0x{_pbdma_engines:08x} "
+              f"STATE0=0x{_pbdma_state0:08x} STATE1=0x{_pbdma_state1:08x} "
+              f"IB_GET=0x{_pbdma_ib_get:08x} IB_PUT=0x{_pbdma_ib_put:08x}", flush=True)
+    # Check PGRAPH subch registers and FECS FIFO
+    _subch0 = dev.read32(0x400740)
+    _subch1 = dev.read32(0x400744)
+    _fecs_fifo_cmd = dev.read32(0x409504)
+    _fecs_fifo_data = dev.read32(0x409500)
+    _fecs_iren = dev.read32(0x409010)
+    print(f"[kepler] PGRAPH subch: 0=0x{_subch0:08x} 1=0x{_subch1:08x} "
+          f"FECS_FIFO_CMD=0x{_fecs_fifo_cmd:08x} "
+          f"FECS_FIFO_DATA=0x{_fecs_fifo_data:08x} "
+          f"IREN=0x{_fecs_iren:08x}", flush=True)
   _fecs_poll_count = 0
+  _gp_get_snapshot_taken = False
   for _ in range(2000):
+    # FECS keep-alive: re-assert FE_PWR FORCE_ON (bit 1 only, NOT bit 4).
+    # The FECS firmware uses bit 4 as a ctx_4170s/ctx_4170w handshake.
+    dev.write32(0x404170, 0x00000002)  # FE_PWR FORCE_ON only
     if signal_vram_pa is not None:
       val = _gk104_pramin_read32(dev, signal_vram_pa)
     else:
       val = struct.unpack_from("<I", vram, signal_pa)[0]
     if val == done_value:
+      # The caller still needs BAR0 diagnostics and (for compute) BAR1 output.
+      # Quiescing here used to disable PCI DMA and stop keepalive before those
+      # reads, which made the first post-launch RPC receive Completion Abort.
+      # NVDevice.close() owns the sole quiesce point after all output access.
       return
+    # Phase 1 capture point 2: after GP_GET shows entry consumed (one-shot).
+    # Skip snapshot_gr_traps — it reads GPC/TPC registers which triggers FECS
+    # power-gating.  Just record minimal info inline.
+    if not _gp_get_snapshot_taken and dev.dev_impl.hw is not None:
+      try:
+        _gp_get_now = struct.unpack("<I", dev.dev_impl.hw.mmio_read(
+            1, userd_mmio_base + USERD_GP_GET, 4))[0]
+        if _gp_get_now:
+          _fecs_ctrl_snap = dev.read32(0x409100)
+          _pgraph_status_snap = dev.read32(0x400700)
+          _trapped_addr = dev.read32(0x400704)
+          _trapped_data = dev.read32(0x400708)
+          _intr = dev.read32(0x400100)
+          _trap = dev.read32(0x400108)
+          print(f"[kepler-trap] after_gp_get_consumed: INTR={_intr:#x} "
+                f"TRAP={_trap:#x} ADDR={_trapped_addr:#x} "
+                f"DATA={_trapped_data:#x} STATUS={_pgraph_status_snap:#x} "
+                f"FE_PWR={dev.read32(0x404170):#x} FECS={_fecs_ctrl_snap:#x}",
+                flush=True)
+          _gp_get_snapshot_taken = True
+      except Exception:
+        pass
     # Poll FECS state every 10ms to catch when it stops
     _fecs_poll_count += 1
     if _fecs_poll_count % 10 == 0:
       _fecs_ctrl_poll = dev.read32(0x409100)
       _fecs_chan_next_poll = dev.read32(0x409b04)
       _fe_pwr_poll = dev.read32(0x404170)
-      _pgraph_status_poll = dev.read32(0x400000)
+      _pgraph_status_poll = dev.read32(0x400700)
       _pwr_gate_poll = dev.read32(0x020004)
       if _fecs_ctrl_poll != 0x20 or _fe_pwr_poll != 0x2:
+        _fecs_pc_poll = dev.read32(0x409ff0)
+        _fecs_scr0_poll = dev.read32(0x409800)
+        _fecs_scr5_poll = dev.read32(0x409814)  # CC_SCRATCH(5) = error code
+        _fecs_cpustat_poll = dev.read32(0x409128)
+        _fecs_intr_poll = dev.read32(0x409008)
+        _fecs_ca_poll = dev.read32(0x409b00)
         print(f"[kepler] poll {_fecs_poll_count}ms: FECS_CTRL={_fecs_ctrl_poll:#x} "
-              f"CHAN_NEXT={_fecs_chan_next_poll:#x} FE_PWR={_fe_pwr_poll:#x} "
+              f"PC={_fecs_pc_poll:#x} SCRATCH0={_fecs_scr0_poll:#x} "
+              f"SCRATCH5={_fecs_scr5_poll:#x} "
+              f"CPUSTAT={_fecs_cpustat_poll:#x} "
+              f"INTR={_fecs_intr_poll:#x} "
+              f"CHAN_ADDR={_fecs_ca_poll:#x} CHAN_NEXT={_fecs_chan_next_poll:#x} "
+              f"FE_PWR={_fe_pwr_poll:#x} "
               f"PGRAPH_STATUS={_pgraph_status_poll:#x} "
               f"PWR_GATE={_pwr_gate_poll:#x} sem={val}", flush=True)
     time.sleep(0.001)
+  # Do not quiesce and then continue issuing diagnostic BAR reads.  The caller's
+  # finally block owns teardown, and a timeout path must fail without hundreds
+  # of extra endpoint transactions against a potentially wedged channel.
+  raise TimeoutError(f"semaphore did not reach {done_value} (last={val})")
+
+  # Legacy deep diagnostics below are intentionally unreachable on the safe
+  # live path.  Retained temporarily as register documentation for offline
+  # analysis; they must never run after quiesce.
+  # Phase 1 capture point 3: after timeout / first trap observed.
+  if dev.dev_impl.hw is not None:
+    snapshot_gr_traps(dev, "after_timeout_trap")
   diag = {r: dev.read32(r) for r in (0x2254, 0x800000, 0x800004, 0x800008, 0x2270, 0x2274,
                                      0x2100, 0x252c, 0x256c, 0x259c,
                                      0x400000, 0x400004, 0x400014, 0x400048,
@@ -3786,7 +6347,11 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                                                             0x100, 0x104, 0x110, 0x114,
                                                             0x118, 0x700, 0x704, 0x708,
                                                             0x70c, 0x740, 0x744, 0x748,
-                                                            0x74c, 0x780, 0x784, 0x790)})
+                                                            0x74c, 0x780, 0x784, 0x790,
+                                                            0x044, 0x084, 0x088, 0x09c,
+                                                            0x0a4, 0x0ac, 0x0e0, 0x0e4,
+                                                            0x0e8, 0x038, 0x03c, 0x040,
+                                                            0x028, 0x074, 0x098)})
   if DEBUG:
     q0 = 0x40000
     print("[kepler] pbdma0 pointers " + " ".join(
@@ -3919,6 +6484,7 @@ def run_hardware_demo(dev, cubin=None):
   and on-silicon FIFO validation."""
   import random
   N = 256
+  sem_only = os.environ.get("KEPLER_TEST_SEM_ONLY") == "1"
   if cubin is None: cubin = get_kepler_cubin()
   prog = dev.runtime("E_4", cubin)
   allocator = NVAllocator(dev)
@@ -3930,7 +6496,9 @@ def run_hardware_demo(dev, cubin=None):
   b_dev = allocator.alloc(N * 4)
   out_dev = allocator.alloc(N * 4)
   signal = allocator.alloc(16)
-  temp_dev = allocator.alloc(0x8000)
+  # Mesa programs TEMP size per MP in 32-KiB units.  GK104/GTX 770 has eight
+  # MPs, so the smallest non-zero legal backing allocation is 8 * 0x8000.
+  temp_dev = allocator.alloc(0x40000)
   # Code + constant (param) buffers for the launch descriptor.
   sass = elf_section_bytes(cubin, ".text.E_4")
   code_dev = allocator.alloc(round_up(len(sass), 0x100))
@@ -3945,12 +6513,19 @@ def run_hardware_demo(dev, cubin=None):
                   regs=cubin_register_count(cubin, "E_4"))
   cwd_dev = allocator.alloc(len(cwd))
   allocator._copyin(cwd_dev, cwd)
-  dev._kepler_vram_mirrors = [cwd_dev]
+  # GPC instruction/data clients on this unclaimed eGPU do not reliably see
+  # the SYS aperture even though HUB/PBDMA semaphore traffic does.  Put the
+  # complete compute working set behind the already-validated VRAM VMM.  The
+  # output mirror is read back after WFI; no host arithmetic is involved.
+  dev._kepler_vram_mirrors = ([] if sem_only else
+      [a_dev, b_dev, out_dev, temp_dev, code_dev, cbuf_dev, cwd_dev])
   allocator._copyin(a_dev, a_host.tobytes())
   allocator._copyin(b_dev, b_host.tobytes())
+  # A GPU result must overwrite every lane; untouched VRAM stays non-finite.
+  allocator._copyin(out_dev, struct.pack("<I", 0x7fc00001) * N)
 
   words = build_launch_words(signal.va_addr, 1, 2, cwd_dev.va_addr,
-                             code_dev.va_addr, temp_dev.va_addr, 0x8000)
+                             code_dev.va_addr, temp_dev.va_addr, 0x40000)
   if os.environ.get("KEPLER_TEST_SET_OBJECT") == "1":
     words = [*nvm(1, 0x0000, KEPLER_COMPUTE_A),
              *gk104_semaphore(signal.va_addr, 2, 0x00000002),
@@ -3972,21 +6547,15 @@ def run_hardware_demo(dev, cubin=None):
         _pte = 0
       print(f"[kepler] VMM map: {_name} va={_va:#x} pa={_buf.meta['pa']:#x} "
             f"pgd[{_pgd_idx}]={_pgd_entry:#x} pte={_pte:#x}", flush=True)
-  # Force FE power ON before kernel launch (nouveau gf100_grctx_generate).
-  # The PGRAPH FE (method parser) must be powered for the engine to process
-  # methods from the push buffer.  Without this, the semaphore never releases.
+  # FE_PWR was already set to FORCE_ON before the channel bind above.
+  # Just verify it's still on; if FE power-gated during setup, report it.
   if dev.dev_impl.hw is not None:
-    dev.write32(0x404170, 0x00000012)  # NV_PGRAPH_FE_PWR_MODE_FORCE_ON
-    _fe_deadline = time.time() + 2.0
-    while time.time() < _fe_deadline:
-      if not (dev.read32(0x404170) & 0x00000010):
-        break
-      time.sleep(0.001)
     _fe_pwr_final = dev.read32(0x404170)
     _pgraph_status_pre = dev.read32(0x400000)
     print(f"[kepler] FE_PWR before launch: {_fe_pwr_final:#x} "
           f"RED_SWITCH={dev.read32(0x409614):#x} "
-          f"PGRAPH_STATUS={_pgraph_status_pre:#x}", flush=True)
+          f"PGRAPH_STATUS={_pgraph_status_pre:#x} "
+          f"FECS_CTRL={dev.read32(0x409100):#x}", flush=True)
   if DEBUG:
     pgd_idx = (signal.va_addr >> 27) & 0x1fff
     spt_idx = (signal.va_addr >> 12) & 0x7fff
@@ -3994,21 +6563,26 @@ def run_hardware_demo(dev, cubin=None):
     spt = GK104PageTableEntry(dev.dev_impl, dev.dev_impl.mm.root_page_table.address(pgd_idx), 0)
     print(f"[kepler] vmm signal_va={signal.va_addr:#x} signal_pa={signal.meta['pa']:#x} "
           f"bus={dev.dev_impl.mm.bus_base:#x} pgd={pgd_entry:#x} pte={spt.entry(spt_idx):#x}")
-  if os.environ.get("KEPLER_TEST_SEM_ONLY") == "1":
+  if sem_only:
     allocator._copyin(signal, struct.pack("<I", 0))
-    # Match nvif_chan906f_sem_release(): a host-only semaphore test must not
-    # wait for an engine WFI that has no preceding engine method to retire.
-    words = [*nvm(0, 0x0050, 0x12345678),
-             *nvm(0, 0x0020, 0x00000001),
-             *gk104_semaphore(signal.va_addr, 2, 0x01100002)]
+    # Host-only semaphore RELEASE without WFI: no engine methods precede this,
+    # so a WFI would stall forever waiting for ENGINES!=0.  RELEASE_WFI=DIS
+    # (bit20=1) lets the PBDMA write the semaphore through the HUB VMM directly.
+    # Keep the scheduler gate entirely inside PBDMA.  SET_REFERENCE on an
+    # unbound subchannel raises EMPTY_SUBC/DEVICE before the semaphore packet.
+    words = [*gk104_semaphore(signal.va_addr, 2, 0x01000002)]
   submit_launch(dev, words, signal.va_addr, signal.meta['pa'], 1, 2)
 
-  if os.environ.get("KEPLER_TEST_SEM_ONLY") == "1":
+  if sem_only:
     print("hardware_semaphore=ok value=2")
     return
 
-  # Post-launch diagnostics: check for faults
-  if dev.dev_impl.hw is not None:
+  # Deep trap/status capture changes live GR state and emits hundreds of RPCs.
+  # Keep it available only as an explicit unsafe diagnostic; a normal add run
+  # goes directly from the completed, serialized semaphore to one bulk output
+  # read, matching the smallest proven command path.
+  if (dev.dev_impl.hw is not None and
+      os.environ.get("KEPLER_UNSAFE_POSTLAUNCH_DIAGNOSTICS") == "1"):
     _pgraph_intr_post = dev.read32(0x400100)
     _pgraph_addr_post = dev.read32(0x400704)
     _pgraph_data_post = dev.read32(0x400708)
@@ -4050,9 +6624,96 @@ def run_hardware_demo(dev, cubin=None):
           _unit_addr = dev.read32(0x409c04 + _hub_unit * 0x20)
           print(f"[kepler] HUB fault unit={_hub_unit} stat={_unit_stat:#x} "
                 f"addr={_unit_addr:#x}", flush=True)
+    # Phase 1 capture point 4: after W1C clear (nouveau gf100_gr_trap_intr).
+    # Clear traps in the same order nouveau does, then take a final snapshot.
+    _trap = dev.read32(0x400108)
+    if _trap & 0x1:
+      dev.write32(0x404000, 0xc0000000)
+      dev.write32(0x400108, 0x1)
+    if _trap & 0x2:
+      dev.write32(0x404600, 0xc0000000)
+      dev.write32(0x400108, 0x2)
+    if _trap & 0x8:
+      dev.write32(0x408030, 0xc0000000)
+      dev.write32(0x400108, 0x8)
+    if _trap & 0x10:
+      dev.write32(0x405840, 0xc0000000)
+      dev.write32(0x400108, 0x10)
+    if _trap & 0x40:
+      dev.write32(0x40601c, 0xc0000000)
+      dev.write32(0x400108, 0x40)
+    if _trap & 0x80:
+      dev.write32(0x404490, 0xc0000000)
+      dev.write32(0x400108, 0x80)
+    if _trap & 0x100:
+      stat = dev.read32(0x407020) & 0x3fffffff
+      if stat:
+        dev.write32(0x407020, 0x40000000)
+      dev.write32(0x400108, 0x100)
+    if _trap & 0x01000000:
+      _gpc_stat = dev.read32(0x400118)
+      for _g in range(dev.read32(0x409604) & 0x1f):
+        if _gpc_stat & (1 << _g):
+          # Clear per-GPC TPC traps then the GPC summary.
+          _gb = 0x500000 + _g * 0x8000
+          _gpc_sum = dev.read32(_gb + 0x2c90)
+          _tpc_n = dev.read32(_gb + 0x2608) & 0x1f
+          for _t in range(_tpc_n):
+            _mask = 0x00010000 << _t
+            if _gpc_sum & _mask:
+              _tb = 0x504000 + _g * 0x8000 + _t * 0x800
+              _ts = dev.read32(_tb + 0x508)
+              if _ts & 0x1:
+                dev.write32(_tb + 0x224, 0xc0000000)
+              if _ts & 0x2:
+                dev.write32(_tb + 0x648, 0)
+                dev.write32(_tb + 0x650, dev.read32(_tb + 0x650))
+              if _ts & 0x4:
+                dev.write32(_tb + 0x84, 0xc0000000)
+              if _ts & 0x8:
+                dev.write32(_tb + 0x48c, 0xc0000000)
+              if _ts & 0x10:
+                dev.write32(_tb + 0x430, 0xc0000000)
+              dev.write32(_gb + 0x2c90, _mask)
+          if _gpc_sum & 0x1:
+            dev.write32(_gb + 0x420, 0xc0000000)
+          if _gpc_sum & 0x2:
+            dev.write32(_gb + 0x900, 0xc0000000)
+          if _gpc_sum & 0x4:
+            dev.write32(_gb + 0x1028, 0xc0000000)
+          if _gpc_sum & 0x8:
+            dev.write32(_gb + 0x824, 0xc0000000)
+          dev.write32(0x400118, 1 << _g)
+      dev.write32(0x400108, 0x01000000)
+    if _trap & 0x02000000:
+      _rop_nr = (dev.read32(0x409604) >> 16) & 0x1f
+      for _r in range(max(_rop_nr, 1)):
+        dev.write32(0x410000 + _r * 0x400 + 0x070, 0xc0000000)
+        dev.write32(0x410000 + _r * 0x400 + 0x144, 0xc0000000)
+      dev.write32(0x400108, 0x02000000)
+    if _trap:
+      dev.write32(0x400108, _trap)
+    _intr = dev.read32(0x400100)
+    if _intr:
+      dev.write32(0x400100, _intr)
+    snapshot_gr_traps(dev, "after_w1c_clear")
+    # Restore FE_PWR to AUTO and re-enable ctxctl clock-gate now that the
+    # launch and diagnostics are done.
+    dev.write32(0x404170, 0x00000010)  # NV_PGRAPH_FE_PWR_MODE_AUTO
+    dev.write32(0x000260, 0x00000001)  # nvkm_mc_unk260(1): re-enable ctxctl
 
   out_host = bytearray(N * 4)
-  allocator._copyout(out_host, out_dev)
+  if dev.dev_impl.hw is not None and out_dev.meta.get("vram_pa") is not None:
+    # LAUNCH is followed by GRAPH_SERIALIZE and a WFI-enabled semaphore; the
+    # QMD also requests FE_SYSMEMBAR release ordering.  Read BAR1 in one RPC.
+    # A host-driven LTC flush/invalidate here adds more BAR0 transactions after
+    # completion and is not part of Mesa's NVE4 launch/fence sequence.
+    out_host[:] = dev.dev_impl.hw.mmio_read(
+        1, out_dev.meta["vram_pa"], len(out_host))
+    print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x}",
+          flush=True)
+  else:
+    allocator._copyout(out_host, out_dev)
   out_arr = array.array('f'); out_arr.frombytes(bytes(out_host))
   expected = [a_host[i] + b_host[i] for i in range(N)]
   # Debug: show first few values
@@ -4093,6 +6754,17 @@ def main():
       print(f"vbios-init-info: {e}", file=sys.stderr)
       sys.exit(1)
     return
+  live_probe_flags = {
+    "--probe", "--probe-pgob", "--probe-gpc-clock",
+    "--probe-vbios-devinit", "--probe-falcon",
+  }
+  if (live_probe_flags.intersection(sys.argv)
+      and os.environ.get("KEPLER_LIVE_ACK") != "completion-abort-risk"):
+    print("live Kepler probe refused: repeated AppleT8103PCIeC Completion "
+          "Abort panics; set KEPLER_LIVE_ACK=completion-abort-risk only for "
+          "one explicitly authorized, freshly power-cycled test",
+          file=sys.stderr)
+    sys.exit(2)
   if "--probe" in sys.argv:
     d = APLRemotePCIDevice.probe()
     if d is None:
@@ -4189,23 +6861,32 @@ def main():
   backend = os.environ.get("NV_BACKEND", "kepler")
   cubin = None
   if backend != "software":
+    if os.environ.get("KEPLER_LIVE_ACK") != "completion-abort-risk":
+      print("hardware launch refused: this GK104 path has repeatedly triggered "
+            "AppleT8103PCIeC Completion Abort; set "
+            "KEPLER_LIVE_ACK=completion-abort-risk only for one explicitly "
+            "authorized test after a fresh enclosure power-cycle",
+            file=sys.stderr)
+      sys.exit(2)
     try: cubin = get_kepler_cubin()
     except (RuntimeError, ValueError, KeyError, struct.error) as e:
       print(f"hardware launch refused: {e}", file=sys.stderr)
       sys.exit(2)
   try:
     dev = NVDevice("NV", backend=backend)
-  except (NotImplementedError, OSError) as e:
-    print("LIVE PATH NOT YET IMPLEMENTED (Kepler bring-up pending):")
-    print(f"  {e}")
-    print("Run `python3 examples_kepler/add.py --middle-selftest` for the offline gate,")
-    print("or `NV_BACKEND=software python3 examples_kepler/add.py` for the software demo,")
-    print("or `python3 examples_kepler/add.py --probe` to identify the eGPU.")
+  except (NotImplementedError, OSError, RuntimeError) as e:
+    print(f"hardware initialization failed safely: {e}", file=sys.stderr)
+    print("No automatic probe/retry was made; power-cycle the enclosure and "
+          "confirm the eGPU in System Report before another isolated run.",
+          file=sys.stderr)
     sys.exit(2)
-  if backend == "software":
-    run_software_demo(dev)
-  else:
-    run_hardware_demo(dev, cubin)
+  try:
+    if backend == "software":
+      run_software_demo(dev)
+    else:
+      run_hardware_demo(dev, cubin)
+  finally:
+    dev.close()
 
 if __name__ == "__main__":
   main()

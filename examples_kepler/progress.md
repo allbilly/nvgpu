@@ -1428,3 +1428,989 @@ domain clock is not being routed to the engine.
 - `FECS_CTRL=0x20` (halted), `FECS PC=0x567` (frozen).
 - `ACCESS_EN=0x2` (FIFO only, CHSW bit did not stick).
 - `hardware_demo=ok` is still not achieved.
+
+## Session 2026-07-13 — PBDMA MMU fault on instance block; TARGET=3 (NCOH) tested
+
+### Investigation
+
+Continued debugging the PBDMA scheduler inactivity. The runlist DMA
+completes (PLAYLIST_RD shows 1 entry read), the channel is enabled
+(PFIFO_CHAN STATE=0x11030001, ENABLED=True, ENGINE=3), and USERD has
+GP_PUT=1 > GP_GET=0, but PBDMA_CHID stays 0 and SCHED_STATUS=0x00000005.
+
+Added detailed MMU fault diagnostics with faulting addresses
+(0x2800 + unit*0x10, reading inst/valo/vahi/type). Found MMU faults
+on multiple units:
+
+- **Unit 0**: inst=0x0000060e, reason=2 (PAGE_NOT_PRESENT),
+  client=0x4 (DISPATCH), hub=True, read. This is the PBDMA trying to
+  read the instance block at VRAM address 0x60e000 with TARGET=0
+  (VRAM).
+- **Unit 7**: inst=0x0000060d, addr=0x4000, reason=2, client=0x7
+  (BAR), hub=True, write=True.
+
+### Root cause hypothesis
+
+With TARGET=0 (VRAM), the PBDMA tries to bypass the HUB MMU (BAR1
+VMM) and access VRAM directly. On this eGPU, VRAM is backed by sysmem,
+and the HUB MMU is enabled (BAR1 VMM at 0x1704). The HUB MMU intercepts
+all accesses and generates a PAGE_NOT_PRESENT fault because it has no
+PTE for the VRAM aperture — the BAR1 VMM only maps virtual addresses
+to sysmem bus addresses.
+
+### Fix attempted: TARGET=3 (NCOH)
+
+Changed the channel instance pointer from TARGET=0 (VRAM) to TARGET=3
+(NCOH) so the PBDMA routes through the HUB MMU. The instance block at
+VRAM offset 0x60e000 should map to sysmem bus address
+(bus_base + 0x60e000) through the BAR1 VMM.
+
+### Result
+
+- PFIFO_CHAN now reads CHAN=0xb000060e (bit28-29=11b = TARGET=3),
+  STATE=0x11030001 (ENABLED=True, ENGINE=3).
+- MMU fault unit 0 persists: inst=0x0000060e, reason=2
+  (PAGE_NOT_PRESENT), client=0x4 (DISPATCH). The HUB MMU still has
+  no PTE for virtual address 0x60e000.
+- PBDMA1 remains idle: IB_PUT=0, IB_GET=0, DMA_GET=0, CHID=0.
+- SCHED_STATUS=0x00000005 (unchanged).
+- The BYPASS path still runs (CTXCTL CHAN_VALID=False), and the
+  semaphore timeout occurs as before.
+
+The TARGET=3 change alone did not fix the PBDMA because the BAR1 VMM
+identity mapping only covers 128 MiB (0x8000000) starting from
+bus_base, and the instance block at offset 0x60e000 (6.1 MB) should
+be within that range. The PAGE_NOT_PRESENT fault suggests the BAR1
+VMM PTEs may not be correctly encoding the virtual-to-physical
+mapping, or the HUB MMU is using a different page table than BAR1.
+
+### Other findings
+
+- **FREEZE register (0x2638)** reads 0xbad0011f on GK104 — it is
+  GF100-only (`variants="GF100:GK104"` in envytools). Writing 0 to
+  it has no effect on GK104.
+- **KICK_CHID (0x2634)** was already being written with chan_id but
+  has no effect on the scheduler.
+- **SCHED_STATUS=0x5** is not documented in envytools or nouveau.
+  DeepWiki suggested it might relate to BAR2, but this was
+  inconclusive.
+- Stale MMU faults were cleared before runlist commit but new faults
+  appear after the commit, confirming the PBDMA is actively trying
+  to access the instance block and failing.
+
+### macOS crash
+
+The live run crashed macOS during this session. The crash occurred
+after the BYPASS path submitted methods and the semaphore timeout
+diagnostic ran. This is consistent with the earlier crash pattern
+where GPU-initiated DMAs to unmapped/invalid addresses cause PCIe
+aborts that escalate to a host panic.
+
+### Verification
+
+- `py_compile` passes.
+- Live hardware: crashes macOS. The last non-crashing data point
+  shows PBDMA idle, SCHED_STATUS=0x5, MMU fault on DISPATCH client
+  reading the instance block.
+
+### Next steps (blocked on crash isolation)
+
+1. **Verify the BAR1 VMM actually maps virtual address 0x60e000**.
+   Read the PGD/SPT entries for that VA and confirm the PTE points
+   to (bus_base + 0x60e000) with the HOST aperture. The identity
+   bootstrap maps 128 MiB starting at bus_base, so VA 0x60e000 should
+   map to bus_base + 0x60e000 — but only if the PTE was written
+   correctly.
+2. **Consider using sysmem directly (not through HUB MMU)** for the
+   instance block. If the HUB MMU is the problem, placing the instance
+   block at a sysmem bus address with TARGET=3 might work if the
+   PBDMA can access sysmem directly without the HUB MMU.
+3. **Investigate SCHED_STATUS=0x5** — this may indicate the scheduler
+   is in a faulted/error state that prevents channel dispatch
+   regardless of the instance block accessibility.
+4. **Isolate the crash** before attempting any further live runs.
+   Gate each candidate fix behind an env flag and test one at a
+   time.
+
+## Session 2026-07-13 — macOS crash isolated; GK104 bind fixed and fail-closed
+
+### Root cause of the dangerous path
+
+- Local Nouveau's `gk104_chan_bind_inst()` writes exactly
+  `0x80000000 | (inst_addr >> 12)`.  The previous code incorrectly ORed
+  `TARGET=3` into bits 28-29 of the GK104 channel instance register.  Those
+  target bits belong to the runlist descriptor, not the channel bind.
+- The timeout path then attempted manual GF100 channel-table writes, manual
+  FECS context switches, PFIFO BYPASS, and direct PGRAPH dispatch.  That let a
+  failed channel setup progress to GPU DMA and is the credible macOS-panic
+  mechanism.
+- MMU fault clearing was also wrong: `0x2800+` contains fault payload records;
+  Nouveau acknowledges active records through `VM_FAULT_SOURCE` (`0x259c`).
+
+### Fixes
+
+- Bind the VRAM instance as `VALID | addr>>12`, matching Nouveau exactly.
+- Require a VRAM instance for the live path; do not reinterpret BAR1 as a
+  HUB-MMU translation for PFIFO.
+- Gate manual channel-table, CHSW, BYPASS/direct-dispatch, GF100 `0x2200`,
+  scheduler kick/freeze, and repeated-start experiments behind
+  `KEPLER_UNSAFE_EXPERIMENTS=1`.
+- Refuse to write `GP_PUT` when an active MMU or PBDMA HCE fault exists.
+- Stop and unbind the channel on success, pre-launch rejection, or timeout;
+  stop the FECS keep-alive thread before teardown.
+- Acknowledge MMU faults through `0x259c` and decode only source-selected
+  records.
+- Mirror USERD `GP_PUT` through PRAMIN and invalidate LTC.
+- Use the checked-in nvcc-built `examples_kepler/add_kepler.cubin` by default,
+  so the normal command no longer requires `KEPLER_CUBIN` or Docker.
+
+### Live validation and remaining blocker
+
+- Four semaphore-only live runs completed without a macOS crash.
+- Correct bind is retained as `PFIFO_CHAN=0x8000060e`; runlist 3 DMA completes
+  with the expected `(chid, 0)` entry; `VM_FAULT_SOURCE=0`; HCE is clear.
+  CHID 0 and CHID 1 behave identically.
+- BAR1+PRAMIN USERD writes, LTC invalidation, and an explicit PFIFO MC reset do
+  not change the result.
+- The remaining blocker is PFIFO scheduling: `SCHED_STATUS=0x5`, all PBDMA
+  `IB_PUT/IB_GET` values remain zero, and `GP_GET` remains zero.  Therefore
+  even the semaphore-only push is not consumed, and the numerical add kernel
+  has not run on silicon yet.  Do not report `hardware_demo=ok`.
+
+### Verification
+
+- `python3 -m py_compile examples_kepler/add.py` passes.
+- `python3 examples_kepler/add.py --middle-selftest` passes.
+- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+  `software_demo=ok N=256` with correct results.
+- `python3 examples_kepler/add.py --probe` identifies GK104 (`chip_id=0x0e4`).
+
+## Session 2026-07-13 — GR runlist fixed; semaphore gate passes on silicon
+
+### Root causes fixed
+
+- Corrected the TOP runlist decode.  Nouveau uses
+  `(data & 0x01e00000) >> 21`; GR's `0x8006183e` entry is runlist **0**, not
+  runlist 3.  PBDMA0 now schedules the channel normally.
+- Restored the channel-specific RAMFC values used by Nouveau userspace
+  channels: `DEVM=BIT(0)` and `priv=false`.
+- Added delayed full-RAMFC stabilization.  This removed the immediate PBDMA
+  `DEVICE/EMPTY_SUBC` exception and the all-ones loaded context.
+- Restored Nouveau's submission ordering: publish USERD while the channel is
+  absent, stabilize the command pages, then commit the runlist.  USERD writes
+  use the CPU BAR1 aperture; RAMFC/page tables use PRAMIN.
+- Made runlist, GPFIFO, pushbuffer, and semaphore VRAM-backed by default.
+- Fixed the cloned channel VMM PDE encoding by removing the invalid VRAM
+  `BIT(34)` and stabilized live PDEs/PTEs.  This progressed faults in order
+  from `PDE_SIZE`, to the exact GPFIFO VA, to the push VA, and finally to the
+  semaphore VA; all are now resolved.
+- Added writable scratch aliases for deterministic complemented GR context
+  buffer bases and for the stale all-ones PTE touched at VA `0x67000`.  The
+  normal path remains fail-closed on any new unexpected MMU/HCE state.
+
+### Live verification
+
+- Default semaphore-only command now succeeds on the GK104 eGPU:
+  `KEPLER_TEST_SEM_ONLY=1 python3 examples_kepler/add.py` reports
+  `hardware_semaphore=ok value=2` with `MMU_FAULT: none`.
+- `python3 -m py_compile`, `--middle-selftest`, and the software demo pass.
+- Repeated live runs in this session did not crash macOS.
+
+### Exact remaining compute boundary
+
+- The default full command now reaches `GP_GET=1` and GR dispatch with no MMU
+  fault.  It no longer stalls in PFIFO/PBDMA or faults during context load.
+- `SET_OBJECT`/GR dispatch raises `PGRAPH_INTR=0x00200000` and
+  `PGRAPH_TRAP=0x01000000`, with all four GPCs reporting a TPC1 trap.  The
+  completion semaphore remains 1.
+- Therefore `hardware_demo=ok` and numerical add results are **not yet
+  achieved**.  The remaining defect is the saved GR engine context/object
+  binding state before CWD, SASS, or output memory execution; do not report
+  hardware compute as passing.
+
+## Session 2026-07-13 — LAUNCH accepted, zero output, macOS crash reported
+
+### Progress since the GR-object trap
+
+- Delaying `GP_PUT` until after runlist admission and explicitly loading the
+  runtime context with FECS `ctx_chan` removes the SET_OBJECT race.  With
+  `KEPLER_PUT_BEFORE_RUNLIST=0`, subchannel 1 binds class `0xa0c0`, methods
+  advance through `LAUNCH` (`0x2bc`), and the completion semaphore reaches 2.
+- The launch has no selected MMU fault and no PGRAPH interrupt/trap after the
+  method stream.  This proves the failure moved past PFIFO, context load, and
+  compute-object binding.
+- Corrected the NVA0C0 QMD bit layout from Mesa's `cla0c0qmd.h`: cache
+  invalidation is in word 7 (`0x1c`), `PROGRAM_OFFSET` is in word 8 (`0x20`),
+  and all remaining fields are now inserted by absolute bit number.
+- Added Mesa's missing NVE4 TEMP setup (`TEMP_ADDRESS` and both
+  `MP_TEMP_SIZE` banks), with a non-zero 32-KiB allocation per each of the
+  GTX 770's eight MPs.
+- Verified the checked-in cubin with envytools `envydis`: its real GK104 SASS
+  loads parameters from constant-buffer offsets `0x140`, `0x148`, and `0x150`,
+  matching `build_cuda_param_cbuf()`.
+
+### Current failure and safety status
+
+- Two corrected full launches retired without an MMU/PGRAPH fault but returned
+  256 zero floats (`mismatches=256/256`).  The shader therefore did not make a
+  visible global store; `hardware_demo=ok` is still unproven.
+- The user reported that macOS crashed after the latest full hardware run.
+  Treat repeated full launches as unsafe until teardown and the GPC-visible
+  memory path are isolated.  Do not describe this session as crash-free.
+- The leading hypothesis is an aperture mismatch: only the QMD is currently
+  mirrored into BAR1-backed VRAM, while SASS, constant data, inputs, output,
+  and TEMP remain SYS mappings.  The next probe should mirror the complete
+  compute working set into the already-validated VRAM VMM and read the result
+  from that GPU-written allocation.  This is a memory-domain correction, not
+  a CPU implementation of vector addition.
+
+### Verification retained
+
+- `python3 -m py_compile examples_kepler/add.py` passes.
+- `python3 examples_kepler/add.py --middle-selftest` passes with 35 launch
+  words after adding TEMP setup.
+- The semaphore-only silicon gate previously passed with `MMU_FAULT: none`;
+  it must be rerun after the macOS reboot before another compute launch.
+
+### Second macOS crash and lifecycle fix
+
+- macOS crashed again during the next chained validation command.  No new full
+  compute launch had been issued in that command; the chain reached the live
+  `--probe` after offline compilation/self-test.  This is consistent with a
+  persistent PFIFO playlist from the preceding process destabilising the GPU
+  after userspace and its BAR allocations disappear.
+- The old success/timeout cleanup stopped CHID 1 and cleared its instance
+  pointer, but it **did not commit an empty GR runlist**.  On GK104 the
+  playlist is hardware state and survives the Python process; leaving the
+  channel ID in it can make PFIFO revisit an unbound channel after teardown.
+- Added a fail-safe teardown matching Nouveau's runlist lifecycle: block GR
+  runlist 0, commit it with count 0, wait for `RUNLIST_PENDING` to clear,
+  acknowledge the runlist interrupt, stop the channel, clear its instance,
+  return FECS to idle, and only then close the TinyGPU connection.
+- The same empty-runlist transaction now runs before CHID reuse, cleaning a
+  stale playlist before a new bind.  It is registered with `atexit`, attached
+  to `NVDevice.close()`, and used on completion, prelaunch rejection, and
+  timeout so ordinary exceptions cannot skip hardware quiescence.
+- Hardware execution remains paused until this teardown change passes offline
+  checks.  After that, the first live test must be a single semaphore-only
+  gate; a compute launch is not justified until the machine remains stable.
+
+### Third crash: Apple PCIe interrupt storm identified
+
+- macOS crashed a third time while only offline commands were running.  The
+  latest three panic reports (`20:15`, `20:18`, and `20:25`) have the same
+  kernel panic string:
+  `apciec[pcic1-bridge] unhandled interrupts (0x200000 out of 0x220000)` at
+  `APCIECPort.cpp:2056`.
+- This rules out the offline Python work as the trigger and identifies a stale
+  external PCIe interrupt from the eGPU/bridge as the immediate host failure.
+  PFIFO playlist cleanup is still required, but it cannot by itself prevent
+  the empty-runlist completion interrupt from reaching macOS.
+- The userspace RM polls MMU, PFIFO, PGRAPH, FECS, and semaphore state and has
+  no DriverKit interrupt handler.  It previously left GK104's MC interrupt
+  output armed.  Added Nouveau's interrupt-unarm policy at first BAR access,
+  again before submission, before every runlist commit, and before teardown:
+  write zero to `PMC_INTR_EN_0` (`0x140`) and GK104 MC leaf-0 source mask
+  (`0x640`), followed by Nouveau's posting read of `0x140`.
+- Do not reconnect to or map the eGPU merely to test this fix while it remains
+  in the stale asserted state.  The enclosure must be physically power-cycled
+  (not just macOS rebooted) before the next live semaphore-only test; offline
+  tests do not clear endpoint/Thunderbolt bridge interrupt state.
+- Completed two additional Mesa parity fixes offline: set
+  `TEX_CB_INDEX=7` during NVE4 setup and issue `NV50_GRAPH_SERIALIZE` after
+  `LAUNCH`.  Hardware output now starts as a NaN sentinel and the entire
+  code/CB/input/output/TEMP/QMD working set is prepared for VRAM mirroring, so
+  a missing or partial shader store cannot be mistaken for a correct result.
+- Current offline verification passes: `py_compile`, `--middle-selftest`
+  (`launch_words=39`), the software numerical demo, and `git diff --check`.
+
+## Session 2026-07-13 — semaphore passes, delayed PCIe panic persists
+
+### Live result after physical enclosure power-cycle
+
+- A single `KEPLER_TEST_SEM_ONLY=1` run completed correctly on silicon:
+  PBDMA0 reached `IB_PUT=IB_GET=1`, USERD reached `GP_GET=GP_PUT=1`, the
+  semaphore became 2, and there was no selected MMU fault.
+- The new lifecycle path also completed: the final line before process exit was
+  `channel quiesced (completion): empty runlist, inst=0`, followed by
+  `hardware_semaphore=ok value=2`.
+- macOS nevertheless panicked roughly 15 seconds later.  The new report
+  `panic-full-2026-07-13-203704.0002.panic` has the same Apple bridge failure:
+  `apciec[pcic1-bridge] unhandled interrupts (0x200000 out of 0x220000)`.
+
+### Revised crash boundary
+
+- Emptying PFIFO's GR runlist and clearing the channel instance are necessary
+  but not sufficient; the panic occurs after both are proven complete.
+- Masking NVIDIA `PMC_INTR_EN_0` and MC leaf 0 is also insufficient.  The
+  bridge status therefore is not simply an unserviced NVIDIA functional
+  interrupt that can be fixed with `0x140/0x640`.
+- The remaining delayed-lifetime hazard is GPU bus mastering after TinyGPU
+  releases the contiguous SYS/IOMMU mappings.  Even with no runnable channel,
+  FIFO, GR/FECS/GPCCS, PMU, HUB MMU, and the programmed sysmem flush page remain
+  live when the socket closes.  A later internal DMA to a released mapping can
+  surface as a PCIe-controller interrupt after Python has exited.
+- No further live command is safe until teardown resets every DMA-capable
+  engine and clears GPU references to SYS memory *before* `fini()` lets the
+  DriverKit allocation disappear.  The next implementation work is based on
+  Nouveau's device/MC shutdown ordering and TinyGPU's mapping ownership.
+
+### DriverKit mapping-lifetime fix implemented
+
+- The TinyGPU protocol already provides the missing PCI lifecycle operations
+  (`CFG_READ=3`, `CFG_WRITE=4`, `RESET=5`); the Kepler transport had omitted
+  them even though `examples/add.py` uses the same commands.
+- Hardware initialization now explicitly enables PCI memory decoding and bus
+  mastering only for the `NVDevice` lifetime, keeps legacy INTx disabled, and
+  disables SERR/parity reporting because this polling-only DriverKit client
+  does not service those interrupt paths.
+- Teardown now performs the critical ordering while SYS mappings are still
+  owned by TinyGPU: empty PFIFO runlist, clear channel instance, halt PGRAPH,
+  reset FIFO/GR/PMU through `PMC_ENABLE`, clear the SYS flush-page register,
+  disable PCI bus mastering with a config-space posting read, wait 50 ms, and
+  only then close the socket.  `NVDevice.close()` repeats the bus-master-off
+  operation as a final exception-safe guard.
+- Once its read-back gate passes on hardware, this ordering prevents
+  GPU-originated DMA after the IOMMU mappings are released.  It is implemented
+  but not yet live-validated.  A new physical enclosure power-cycle is required
+  before testing because the latest panic again left the endpoint/bridge in an
+  asserted state.
+
+### Offline audit after the latest crash
+
+- Compared the Kepler transport with the pinned, working TinyGPU client in
+  `examples/add.py`.  The config-space RPC wire layout is identical: request
+  `bar=0`, followed by `offset`, `size`, and (for a write) `value`.
+- Centralized PCI bus-master shutdown in `_disable_pci_bus_master()`.  It now
+  retries the command write up to three times and requires a config-space
+  posting read to prove `PCI_COMMAND_MASTER` is clear.  A write that does not
+  stick is a hard teardown error rather than a silently released DMA mapping.
+- `APLRemotePCIDevice.fini()` also invokes that guard, so direct probe helpers
+  cannot close a TinyGPU connection while the endpoint is still allowed to
+  initiate DMA.  Normal `NVDevice.close()` retains the full ordered
+  engine/runlist shutdown first; the transport guard is deliberately
+  redundant for exception paths.
+- Hardware initialization now validates that PCI memory decoding and bus
+  mastering actually read back enabled before any BAR/SYS-memory setup.
+- Added a fake-socket transport test to `--middle-selftest`.  It verifies the
+  exact TinyGPU frames for `CFG_READ(PCI_COMMAND, 2)`,
+  `CFG_WRITE(PCI_COMMAND, 2, 0x0402)`, and the posting read, entirely offline;
+  it does not connect to the eGPU or start TinyGPU.app.
+- The expected successful live teardown line now includes the read-back value:
+  `PCI_COMMAND=0x0402, bus_master=off`.  Absence of that line is an unsafe
+  result and must block any compute launch.
+- Made late `GP_PUT` the default.  This is the only ordering that already
+  reached SET_OBJECT, LAUNCH, and the completion semaphore on silicon: the
+  channel is admitted and its FECS context loaded before PBDMA sees the entry.
+  The former early-PUT behavior remains available with
+  `KEPLER_PUT_BEFORE_RUNLIST=1` for diagnostics only.
+
+### Current verification and next safe hardware gate
+
+- `python3 -m py_compile examples_kepler/add.py` passes.
+- `python3 examples_kepler/add.py --middle-selftest` passes with
+  `launch_words=39`, including the new TinyGPU/PCI shutdown test.
+- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+  `software_demo=ok N=256` with correct results.
+- `git diff --check` passes.
+- A final local Nouveau audit confirms the reset bits used here: GK104 maps
+  FIFO to `PMC_ENABLE 0x100`, the inherited GF100 GR path uses `0x1000`, and
+  PMU uses `0x2000`.  The teardown mask `0x3100` therefore covers every engine
+  this userspace path started.  Nouveau can leave the SYS flush page programmed
+  because the kernel owns its DMA mapping; this DriverKit path must clear
+  `0x100c10` before releasing its shorter-lived mapping.
+- Do not run `--probe`, semaphore-only, or full compute against the endpoint
+  left stale by the latest panic.  After another physical enclosure
+  power-cycle, run exactly one semaphore-only command.  It must report the
+  completion semaphore, no MMU/PGRAPH fault, and the verified
+  `PCI_COMMAND=0x0402, bus_master=off` teardown.  Then leave the machine idle
+  long enough to cross the previous roughly 15-second delayed-panic window.
+  Only a stable result permits one full add launch.
+
+## Session 2026-07-13 — bus-master-off gate passes, delayed panic still occurs
+
+### Live semaphore result after enclosure power-cycle
+
+- Ran exactly one `KEPLER_TEST_SEM_ONLY=1 python3 examples_kepler/add.py` with
+  late `GP_PUT`; no compute launch was attempted.
+- The GPU completed normally: PBDMA consumed the entry, the completion
+  semaphore reached 2, `MMU_FAULT: none`, and the process exited successfully.
+- Ordered teardown completed and config-space read-back reported
+  `PCI_COMMAND=0x0403, bus_master=off`.  `0x0403` is valid here: bits 0 and 1
+  retain I/O and memory decode, bit 10 disables INTx, and the critical bus
+  master bit 2 is clear.
+- The machine remained alive through an explicit 30-second idle gate, but then
+  panicked later.  The new report is
+  `panic-full-2026-07-13-210119.0002.panic`; it has the identical panic string
+  `apciec[pcic1-bridge] unhandled interrupts (0x200000 out of 0x220000)` at
+  `APCIECPort.cpp:2056`.  TinyGPU was still present in the panic process list.
+
+### Hypothesis falsified and stronger close implemented
+
+- A verified clear `PCI_COMMAND_MASTER` disproves bus mastering alone as a
+  sufficient fix.  No MMU fault occurred and the panic was delayed well beyond
+  command completion, so the remaining state is endpoint/bridge interrupt or
+  link state retained after the TinyGPU client disconnects.
+- The proven `examples/add.py` client already exposes and uses TinyGPU's
+  `RESET` RPC after clearing bus mastering.  Kepler close now uses the stronger
+  sequence after result read-back: clear bus mastering, issue the DriverKit PCI
+  function reset, wait 100 ms, then clear bus mastering plus PCI memory/I/O
+  decode and verify the final command register before the socket closes.
+- `APLRemotePCIDevice.fini()` applies the same function-reset guard to direct
+  probes and exception paths.  Normal close marks the reset complete so it is
+  not issued twice.
+- The panic snapshot still contained a live `TinyGPU` server process although
+  the Python client had exited.  The Kepler transport now retains ownership of
+  the server process it launches for its unique temporary socket.  After the
+  PCI function is reset and made inert, it closes the socket, waits briefly for
+  that owned server to exit, and sends SIGTERM only if it remains.  A server
+  reached through an existing/shared socket is never terminated.
+- Extended the fake-socket self-test to verify all seven close transactions,
+  including `RESET=5` and the post-reset `PCI_COMMAND=0x0400` target.  This is
+  fully offline and does not touch the currently stale endpoint.
+- This reset-based shutdown is implemented but not live-validated.  Another
+  physical enclosure power-cycle is required before one semaphore-only test;
+  do not attempt full compute until the machine survives a substantially
+  longer idle window than this run.
+
+## Session 2026-07-13 — reset-based shutdown passes live safety gate
+
+### Carefully scoped live result
+
+- After a physical enclosure power-cycle, ran exactly one semaphore-only test;
+  no compute launch or follow-up probe was issued.
+- The scheduler path completed normally: the completion semaphore reached 2,
+  `MMU_FAULT: none`, and `hardware_semaphore=ok value=2`.
+- Ordered channel teardown first reported
+  `PCI_COMMAND=0x0403, bus_master=off`.  Final close then completed the new
+  DriverKit function-reset sequence and reported
+  `PCI_COMMAND=0x0403->0x0400, bus_master=off`, proving bus mastering and PCI
+  memory/I/O decode were all disabled after reset.
+- The uniquely spawned TinyGPU server exited and was confirmed absent.  No
+  existing/shared process was terminated.
+- Performed idle-only monitoring with no eGPU access for more than three
+  minutes.  The machine remained stable through the prior delayed-panic point
+  (the previous reset-less run panicked roughly two minutes after exit).
+
+### Current safety conclusion
+
+- The evidence now isolates the macOS crash to PCI function/DriverKit server
+  state retained after a normal socket close, rather than the completed GPU
+  command itself.  Clearing bus mastering alone was insufficient; function
+  reset followed by full decode disable and owned-server shutdown is the first
+  teardown that has survived the delayed-panic window.
+- Treat this as one successful safety validation, not yet proof across repeated
+  runs.  Preserve the checkpoint: do not chain commands or issue a full compute
+  launch in the same session.  The next live step should be a separately
+  authorized single full add run after confirming the host remains stable; its
+  VRAM output must match all 256 CPU-computed reference values before reporting
+  `hardware_demo=ok`.
+
+### Later crash invalidates the three-minute safety conclusion
+
+- macOS subsequently panicked at 21:22:20, several minutes after the final
+  21:17:48 idle checkpoint and roughly eight minutes after the semaphore-only
+  process exited.  The report is
+  `panic-full-2026-07-13-212220.0002.panic`.
+- The panic string is again byte-for-byte identical:
+  `apciec[pcic1-bridge] unhandled interrupts (0x200000 out of 0x220000)` at
+  `APCIECPort.cpp:2056`.  Therefore the three-minute observation window was
+  too short; the reset-based teardown is **not** a crash fix.
+- The panic snapshot again contains a `TinyGPU` process even though `pgrep -x
+  TinyGPU` confirmed it absent immediately after our owned server exited.  This
+  indicates that terminating the client-owned server does not detach the
+  installed DriverKit/PCI service permanently; macOS or the application can
+  relaunch/rebind it later while the enclosure remains connected.
+- Bus mastering, BAR/I/O decode, empty runlist, engine reset, PCI function
+  reset, and owned-server exit have now all been individually verified and are
+  still insufficient.  The remaining failure is below the Python channel
+  lifecycle: persistent Thunderbolt/Apple PCIe controller or DriverKit service
+  state for this unsupported Kepler endpoint.
+- Mark live execution unsafe again.  Do not run semaphore-only, probe, or full
+  compute after reboot/replug until a method exists to detach the DriverKit PCI
+  service or power down/disconnect the enclosure immediately after the test.
+  `hardware_demo=ok` remains unachieved.
+
+## Session 2026-07-13 — Kepler-specific shutdown fix after repeated panic
+
+### Corrected scope
+
+- The TinyGPU DriverKit extension is not treated as the component to replace:
+  the same signed transport is already stable with the RTX 3080 and the
+  `allbilly/amdgpu` path, and rebuilding it would not be a practical deployment
+  fix.  The attempted no-authorization detach did not detach the service and no
+  DEXT files were modified.
+- Reverse engineering the installed DEXT established only that its generic
+  `Stop_Impl` closes the `IOPCIDevice`; it does not establish a generic TinyGPU
+  defect.  The repeated crash is now approached as Kepler state left behind by
+  this bring-up sequence.
+
+### Root shutdown omissions found in local Nouveau
+
+- Bring-up calls the equivalent of `gk104_pmu_pgob(..., false)`, forcing
+  `0x020004[31:30]=01b` to release GPC/ROP/LTC power gating, but teardown never
+  called the inverse `enable=true` operation (`11b`) while PMU and GR were
+  still alive.
+- Bring-up manually selects and enables the GPC PLL at `0x137000`, but teardown
+  never moved GPC clock index 0 back to the fixed 100 MHz divider before
+  deselecting and disabling that PLL.
+- Masking the two master interrupt registers did not disable or acknowledge
+  the leaf sources configured during bring-up.  PFIFO/PBDMA, PTherm, GPIO,
+  AUX/I2C, and PMU sources could therefore remain latched after the Python
+  process released the endpoint.  The panic bit `0x200000` also overlaps the
+  GK104 MC GPIO/I2C source bit, which makes this omission plausible but is not
+  yet proof of causality.
+
+### Implemented fix
+
+- Extended `gk104_pmu_pgob()` with the Nouveau `enable` argument.  Shutdown now
+  restores `0x020004[31:30]=11b` before resetting PMU/GR, without executing the
+  bring-up-only War00C800 sequence.
+- Added the Nouveau-compatible clock/power fini sequence: restore all eight
+  GK104 engine clock-gate low bytes to `0x54`; program GPC index 0's divider to
+  fixed 100 MHz; clear its PLL selection with read-back verification; then
+  clear PLL sync and enable bits.
+- Added leaf interrupt shutdown before engine reset: mask PFIFO and all three
+  PBDMAs and acknowledge their latched status; perform exact
+  `g84_therm_fini`; mask/ack both GK104 GPIO banks and AUX/I2C; and perform the
+  `gt215_pmu_fini` mask plus pending-status acknowledgement.
+- Refactored emergency teardown into independent best-effort stages.  An empty
+  runlist, PGOB, clock, or interrupt exception can no longer skip engine reset,
+  flush-page removal, or the final retrying PCI bus-master disable.  Logging no
+  longer claims bus mastering is off when its read-back could not be obtained.
+- Corrected the stale bring-up comment which described the actual `0x54` clock
+  gate write as `0x44`; executable behavior was already `0x54`.
+
+### Offline validation and safety status
+
+- `python3 -m py_compile examples_kepler/add.py`: pass.
+- `python3 examples_kepler/add.py --middle-selftest`: pass,
+  `launch_words=39`; the fake-register test proves PGOB restore, fixed-clock
+  selection, PLL disable, all eight clock-gate values, and all leaf masks.
+- `NV_BACKEND=software python3 examples_kepler/add.py`: pass,
+  `software_demo=ok N=256 launch_words=39 cwd_bytes=256`.
+- No eGPU MMIO, probe, app launch, or other live hardware access was performed
+  in this session.  The fix is offline-verified but not yet live-validated.
+  Because the currently connected endpoint may retain state from the panic,
+  require a fresh enclosure power-cycle/replug before one isolated hardware
+  attempt.  Do not chain diagnostics, and do not claim `hardware_demo=ok` until
+  all 256 output values match and the host remains stable through the known
+  delayed-panic window.
+
+## Session 2026-07-14 — live attempt blocked before hardware access
+
+- Authorized one isolated `python3 -u examples_kepler/add.py` hardware run.
+- TinyGPU rejected the very first `CFG_READ` of PCI command register offset
+  `0x04` with: `Driver not available. Check: System Report > PCI for GPU,
+  System Settings > Privacy & Security.`
+- The failure occurred before BAR mapping, GPU MMIO, engine initialization,
+  runlist submission, or compute.  Consequently the new Kepler shutdown path
+  was not exercised and this attempt provides no crash-fix validation.
+- Did not issue a probe or automatic retry.  macOS must first show the eGPU and
+  make the signed TinyGPU DriverKit service available; after that, run only one
+  isolated add attempt from a fresh enclosure power state.
+
+### Subsequent panic corrects the failed-run safety assessment
+
+- macOS subsequently panicked at 01:23:09.  The new report is
+  `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-012309.0002.panic`.
+- Its panic string is again identical:
+  `apciec[pcic1-bridge] unhandled interrupts (0x200000 out of 0x220000)` at
+  `APCIECPort.cpp:2056`.
+- The panic snapshot contains a live `TinyGPU` process (PID 85845), while the
+  Python process had already exited.  Therefore the prior statement that the
+  rejected `CFG_READ` carried no crash risk was wrong: no GPU MMIO occurred,
+  but starting and leaking the client-owned TinyGPU server still changed the
+  DriverKit/endpoint lifecycle and was followed by the same panic.
+
+### Partial-constructor server leak found and fixed
+
+- `NVDevice.__init__()` constructed `PCIIface` (which launched the unique
+  TinyGPU server) and then called `_init_hardware()`.  When its first
+  `read_config()` raised `RuntimeError`, object construction aborted.  Because
+  `main()` never received a `dev` object, its `finally: dev.close()` could not
+  execute, leaving the owned server alive indefinitely.
+- `NVDevice.__init__()` now has deterministic exception rollback: any partially
+  created PCI transport is finalized before the original exception propagates.
+- `APLRemotePCIDevice` now also rolls back its own `_connect()` constructor
+  failures and has an idempotent destructor fallback.  Finalization closes the
+  socket and terminates the uniquely owned server in a `finally` block, so a
+  reset or socket exception cannot skip process cleanup.
+- Added a PCI-config availability guard.  If the first `CFG_READ` was rejected,
+  cleanup does not issue reset/config RPCs against that unavailable endpoint;
+  after one successful config read, the existing reset-and-disable close path
+  remains active.
+- Added an offline regression test for the exact failure state.  It proves the
+  socket is closed, the owned server is terminated, and no additional endpoint
+  RPC is sent.  Existing/shared TinyGPU processes remain outside this ownership
+  path and are never terminated.
+- `main()` now handles transport `RuntimeError` as a controlled initialization
+  failure instead of emitting an uncaught traceback.  Its error text no longer
+  recommends a follow-up `--probe`, because that would relaunch the same server
+  against an unavailable/stale endpoint.
+
+### Validation after lifecycle fix
+
+- `python3 -m py_compile examples_kepler/add.py`: pass.
+- `python3 examples_kepler/add.py --middle-selftest`: pass,
+  `launch_words=39`, including failed-constructor cleanup regression coverage.
+- `NV_BACKEND=software python3 examples_kepler/add.py`: pass,
+  `software_demo=ok N=256 launch_words=39 cwd_bytes=256`.
+- `git diff --check`: pass.
+- No post-reboot eGPU probe or hardware retry was made.  The Kepler leaf IRQ,
+  PGOB, and PLL shutdown fix was not reached by the failed live attempt and
+  remains unvalidated.  Do not retry until a fresh enclosure power-cycle and
+  macOS both show the PCI endpoint and permit the signed DriverKit service.
+
+## Session 2026-07-14 — second live panic identifies PCIe Completion Abort
+
+### Latest crash evidence
+
+- A subsequent user-started live run panicked macOS at 01:35:08.  The report is
+  `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-013508.0002.panic`.
+- The panic is again from `AppleT8103PCIeC` with
+  `unhandled interrupts (0x200000 out of 0x220000)` at
+  `APCIECPort.cpp:2056`.
+- Both `Python` (PID 3725) and `TinyGPU` (PID 3728) were live in the panic
+  snapshot.  This is not the prior failed-constructor leak: macOS interrupted
+  an active run before Python could guarantee close/teardown.
+- The enclosure and generic TinyGPU path remain explicitly excluded as a
+  general root cause: the user has confirmed this eGPU path works with RTX
+  3080 and RX 570 through `allbilly/amdgpu`.  The failure is specific to
+  transactions generated by the current GK104 path.
+
+### Controller bit decoded and prior hypothesis corrected
+
+- The upstream Linux Apple SoC PCIe driver defines port interrupt bit 21
+  (`0x00200000`) as `PORT_INT_CPL_ABORT`: PCIe **Completion Abort**.  It defines
+  bit 17 (`0x00020000`) as `PORT_INT_REQADDR_GT32`, explaining the panic's
+  `0x220000` relevant mask.  Source:
+  https://github.com/torvalds/linux/blob/master/drivers/pci/controller/pcie-apple.c
+- Therefore the repeated `0x200000` value is not evidence of NVIDIA MC
+  GPIO/I2C interrupt bit 21; the numerical overlap was coincidental.  Leaf
+  interrupt masking remains orderly GPU teardown, but it does not directly
+  explain this Apple controller panic.
+- Completion Abort means a PCIe config/BAR transaction was rejected by the
+  endpoint.  The present Kepler close path made two unsafe generation-specific
+  assumptions: it issued TinyGPU's function-reset RPC, then disabled BAR/I/O
+  decode and performed config read-back.  Newer NVIDIA and AMD endpoints may
+  support that lifecycle; consumer GK104 must not be assumed to support FLR or
+  post-reset accesses the same way.
+
+### GK104 Completion-Abort mitigation
+
+- Added `_shutdown_kepler_pci_for_close()`.  The active Kepler close path now
+  clears PCI bus mastering, sets INTx-disable, and verifies read-back while
+  leaving memory/I/O decode enabled until DriverKit closes its user client.
+- Removed function reset and decode-disable from both normal `NVDevice.close()`
+  and the partial/direct transport finalizer.  The generic reset RPC and its
+  offline protocol test remain available in code, but the GK104 path no longer
+  calls them.  This change is local to `examples_kepler/add.py` and does not
+  alter the working 3080 or `allbilly/amdgpu` implementations.
+- Added an offline wire-level assertion that the real GK104 close emits exactly
+  config read/write/read, retains BAR decode, clears bus mastering, disables
+  INTx, and never emits `RemoteCmd.RESET`.
+- Added a fail-closed live gate to the default hardware run and every live
+  `--probe*` path.  Without the exact
+  `KEPLER_LIVE_ACK=completion-abort-risk` acknowledgement, the script exits
+  before launching TinyGPU.  This prevents a plain command or suggested probe
+  from causing another panic while the mitigation is unvalidated.
+
+### Status
+
+- No eGPU access was made while diagnosing or implementing this change.
+- Offline validation passes: Python compilation, middle self-test
+  (`launch_words=39`), 256-element software demo, and `git diff --check`.
+  Default hardware execution and `--probe` both exit with status 2 before
+  TinyGPU starts, and `pgrep` confirms no TinyGPU process was left behind.
+- This mitigation targets a controller condition now identified from primary
+  source, but the precise rejected transaction is not present in the panic
+  snapshot.  Treat it as a stronger, testable fix—not proof—until one isolated
+  power-cycled run completes and survives the delayed-panic window.
+
+## Session 2026-07-14 — panic stack symbolication finds teardown error
+
+### Location of the crash
+
+- Symbolicated the captured Python image UUIDs against the exact installed
+  Python 3.14 framework and `_socket` extension.  At panic, Python's only
+  captured thread was in `_socket.sock_sendall` / `sock_call_ex`, reached from
+  the bytecode evaluator.  In this program, the only socket `sendall` path is
+  `APLRemotePCIDevice._rpc`, so Python was actively sending a TinyGPU RPC—not
+  idling after process exit.
+- The Python process held roughly 613 MB resident, consistent with the 256 MB
+  GPU-visible system allocation plus runtime buffers; this was not an early
+  config/BAR probe.
+- The FECS keepalive thread was absent from the panic snapshot even though it
+  catches all RPC exceptions and loops until `_fecs_keepalive_stop` is set.
+  `_quiesce_channel()` sets that event as its first action.  Together, these
+  facts place the latest panic in teardown/exit with high confidence.
+- TinyGPU's captured main thread symbolicates to `TinyGPUCLIRunner.run`, waiting
+  inside its request loop.  The panic snapshot cannot recover the command byte,
+  but it corroborates an in-flight client/server transaction.
+
+### Exact unsupported operations found in `add.py`
+
+- The previous crash patch added `_gk104_shutdown_clocks_power()`, which called
+  `gk104_pmu_pgob(enable=True)`, switched GPC to the fixed divider, deselected
+  the GPC PLL, and disabled the PLL during every channel teardown.
+- A complete local-reference search shows Nouveau calls
+  `nvkm_pmu_pgob(..., false)` only from `gf100_gr_oneinit()` and
+  `gf100_gr_init()`.  There is no `true` caller anywhere in Nouveau shutdown.
+- Nouveau's `gk104_clk` function table has no `.fini` callback.  Consequently
+  GK104 device fini does not switch away from or disable the active GPC PLL.
+  The previous Python teardown was therefore not a Nouveau-compatible reverse
+  sequence; it introduced power/clock transitions while the PCIe endpoint was
+  still serving DriverKit MMIO.
+- Teardown set the keepalive stop event but did not join the thread.  One final
+  FE_PWR BAR0 RPC could overlap the main thread's power/reset sequence (socket
+  serialization prevents byte interleaving but not the incorrect hardware
+  transition ordering).
+
+### Fix
+
+- Removed `_gk104_shutdown_clocks_power()` and its teardown call entirely.
+  Shutdown no longer asserts PGOB `enable=true`, changes GPC clock selection,
+  or disables the GPC PLL.  The clock/power state that successfully served the
+  channel remains stable until FIFO/GR/PMU engine reset.
+- Removed the `enable` argument from the Python PGOB helper and hard-coded the
+  only locally used/Nouveau-backed operation (`false`).  A future teardown edit
+  therefore cannot accidentally re-enable the unsupported reverse transition.
+- `_quiesce_channel()` now sets the keepalive stop event and joins the thread
+  before issuing any shutdown MMIO.  The socket's two-second timeout bounds an
+  in-flight RPC; the join allows 2.5 seconds before reporting a teardown error.
+- Updated offline tests to prove leaf interrupt masking leaves PGOB, GPC PLL
+  selection, and PLL enable/sync bits untouched.  The earlier test asserting
+  the destructive reverse transition has been removed.
+- The separate Completion-Abort mitigation remains: GK104 close does not use
+  FLR and does not disable BAR decode while DriverKit can still transact.
+
+### Validation
+
+- Python compilation: pass.
+- Middle self-test: pass, `launch_words=39`.
+- 256-element software add: pass.
+- `git diff --check`: pass.
+- No live device access was performed.  The exact faulty shutdown operations
+  are removed, but live success still requires one explicitly acknowledged,
+  freshly power-cycled run followed by the delayed-panic observation window.
+
+## Session 2026-07-14 — 01:51 panic and last-known-good comparison
+
+### New panic evidence
+
+- The next explicitly acknowledged live run still panicked macOS at 01:51:58:
+  `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-015158.0002.panic`.
+- The Apple controller condition is unchanged: Completion Abort
+  `0x200000 out of 0x220000` at `APCIECPort.cpp:2056`.
+- Python (PID 4078) and TinyGPU (PID 4080) were both alive.  Python again had
+  roughly 615 MB resident and only one thread, placing it after the FECS
+  keepalive stop/join transition rather than in early initialization.
+- Symbolication differs usefully from the prior crash: Python was in
+  `_socket.sock_recv_into` via `sock_recv_guts`, waiting for a synchronous
+  TinyGPU RPC response.  The prior panic caught `sock_sendall`.  Removing PGOB
+  reversal, GPC PLL shutdown, and the keepalive race was therefore necessary
+  cleanup but not sufficient; a later synchronous teardown request remained.
+
+### Comparison with committed history
+
+- Reviewed all commits touching `examples_kepler/add.py`.  Commit `6b04d4f`
+  (`failure is isolated to A0C0 SET_OBJEC`) is the last committed diagnostic
+  path that records a complete two-second hardware timeout without recording a
+  macOS panic.  Its path had no layered channel/PCI close implementation.
+- Current code had accumulated two PCI shutdown layers: `_quiesce_channel()`
+  performed `_disable_pci_bus_master()` (config read/write/read), then
+  `NVDevice.close()` unconditionally called `_shutdown_kepler_pci_for_close()`
+  and performed a second config read/write/read.  Transport `fini()` had a
+  third guard layer.
+- The first successful shutdown did not set `_close_shutdown_done`, so the
+  second synchronous transaction was guaranteed.  This exactly matches the
+  newest panic location: keepalive absent, main thread waiting in
+  `recv_into`, TinyGPU still alive.
+
+### Fix after comparison
+
+- Reduced `_quiesce_channel()` to the Nouveau channel lifecycle: stop channel,
+  commit an empty runlist, unbind the instance, then revoke PCI bus mastering.
+  Removed all post-unbind GR, FIFO, PMU, power, leaf-subdevice, and flush-page
+  MMIO.  Once the channel is absent and PCI bus mastering is clear, these
+  extra endpoint transactions add risk without permitting any further DMA.
+- A successful bus-master read-back now immediately sets
+  `_close_shutdown_done`.  `NVDevice.close()` checks that flag and sends no
+  endpoint RPC; `APLRemotePCIDevice.fini()` already observes the same flag and
+  only closes the socket/owned server.
+- Added a native pthread name for each teardown stage.  If another macOS panic
+  occurs, its Python thread entry should identify the exact operation (for
+  example `kgpu:empty GR runlist` or `kgpu:PCI bus-master disable`) instead of
+  exposing only the generic socket function.
+- Added an offline one-shot regression test: when quiesce has marked PCI
+  shutdown complete, `NVDevice.close()` plus transport `fini()` close the
+  socket while emitting zero additional protocol frames.
+
+### Offline validation
+
+- Python compilation: pass.
+- Middle self-test: pass, `launch_words=39`, including the new zero-frame
+  one-shot-close assertion.
+- 256-element software add: pass.
+- `git diff --check`: pass.
+- No additional live access was made after the 01:51 panic.  Live execution
+  remains gated and unsafe until a fresh power-cycle and explicit test.
+
+## Session 2026-07-14 — 02:20 panic removes all teardown BAR MMIO
+
+### Result of next validation
+
+- A user-started validation of the one-shot/minimal teardown still panicked at
+  02:20:49.  Report:
+  `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-022049.0002.panic`.
+- Panic string remains AppleT8103PCIeC Completion Abort
+  `0x200000 out of 0x220000`.
+- Python (PID 3519, about 615 MB resident) and TinyGPU (PID 3521) were alive;
+  each had one thread.  Python again symbolicates to
+  `_socket.sock_recv_into`, blocked waiting for a synchronous RPC response.
+  Both processes stopped making progress at approximately the same time for
+  roughly three seconds before the kernel panic, indicating the DriverKit
+  operation itself stalled.
+- The native pthread stage name did not appear in Apple's panic snapshot for
+  the main Python thread, so it did not disambiguate the remaining MMIO/config
+  read.  Stack and thread-count evidence still places the request after the
+  keepalive stop transition.
+
+### Deeper conclusion and fix
+
+- The prior minimal path still performed master-interrupt reads, channel
+  stop read-modify-write, empty-runlist status reads, and unbind BAR writes
+  before clearing PCI bus mastering.  Any one could be the synchronous request
+  that received Completion Abort after the active command phase.
+- Teardown now performs zero BAR0/BAR1 RPCs after stopping and joining the FECS
+  keepalive thread.  Its first and only endpoint shutdown operation is PCI
+  command-space bus-master disable with read-back.
+- Once `PCI_COMMAND_MASTER` is clear, even a channel left bound in hardware
+  cannot originate DMA into the DriverKit SYS/IOMMU mappings.  The successful
+  read-back sets `_close_shutdown_done`; normal close and transport fini then
+  issue no additional endpoint request and only close the socket/owned server.
+- This deliberately prefers PCI-level DMA revocation over attempting to make a
+  wedged GK104 scheduler orderly through additional BAR transactions.  It also
+  matches the git-history lesson: the last committed non-panicking timeout path
+  did not contain the accumulated BAR teardown machinery.
+
+## Session 2026-07-14 — post-quiesce full-add access is the crash boundary
+
+### Additional panic
+
+- Another user-started hardware run panicked at 07:56:34 with the identical
+  AppleT8103PCIeC Completion Abort.  Report:
+  `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-075634.0002.panic`.
+- Python (PID 2332, about 615 MB resident) and TinyGPU (PID 2335) were both
+  active with one thread each.  This was another hardware process, not the
+  concurrent offline compilation/self-test command.  Python was again waiting
+  for a synchronous teardown/post-launch RPC.
+
+### Exact full-add sequencing error
+
+- Git-history comparison showed four semaphore-only live runs completed
+  without a macOS crash before full compute was enabled.  The first crashes
+  coincide with full launches whose completion semaphore reached 2 but whose
+  256 output floats remained zero.
+- The decisive code difference was after semaphore completion:
+  `submit_launch()` called `_quiesce_channel("completion")` before returning.
+  Semaphore-only then printed success and returned without more GPU access.
+- Full `run_hardware_demo()` instead continued after that quiesce with dozens
+  of BAR0 diagnostics, trap reads/clears, FECS/GPCCS reads, LTC operations, and
+  the BAR1 output read.  Depending on the teardown revision, quiesce had
+  already stopped FECS keepalive, reset/gated engines, or cleared PCI bus
+  mastering.  The first subsequent synchronous RPC could therefore receive
+  the observed PCIe Completion Abort.  This directly explains both the stable
+  semaphore-only history and the full-add-only crash onset.
+
+### Fix
+
+- Successful `submit_launch()` now returns immediately when the semaphore
+  reaches its done value.  It performs no quiescence.  The caller completes all
+  post-launch diagnostics and reads/validates the GPU-written output while the
+  device remains in the same responsive state used by the completion poll.
+- `NVDevice.close()` is now the sole normal quiesce owner, reached from the
+  existing `finally` only after output handling completes.  No caller may issue
+  MMIO after it.
+- The semaphore-timeout path no longer quiesces and then executes hundreds of
+  diagnostic BAR reads.  It raises immediately; `NVDevice.close()` performs
+  the one teardown.  The old deep block is unreachable and retained only as
+  temporary register documentation.
+- Quiesce itself stops/joins keepalive, performs no BAR MMIO, clears PCI bus
+  mastering once, and marks shutdown complete so close/fini issue zero further
+  endpoint frames.
+
+### Offline validation
+
+- Python compilation: pass.
+- Middle self-test: pass, `launch_words=39`.
+- 256-element software add: pass.
+- `git diff --check`: pass.
+- A live test must start from a physically power-cycled enclosure; rebooting
+  macOS alone does not clear the persistent endpoint state demonstrated by the
+  delayed panics.
+
+## Session 2026-07-14 — 11:35 panic isolates the custom close RPC
+
+### New crash evidence
+
+- The next full run still panicked at 11:35:18.  The report is
+  `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-113518.0002.panic`.
+- The controller condition is unchanged: AppleT8103PCIeC reported Completion
+  Abort `0x200000 out of 0x220000` at `APCIECPort.cpp:2056`.
+- Python PID 6438 (about 615 MB resident) and TinyGPU PID 6440 were alive.
+  Python had exactly one thread.  Its exact Python 3.14 images symbolize to
+  `_socket.sock_recv_into` / `sock_recv_guts`, waiting for a synchronous
+  TinyGPU response.
+- The missing FECS helper thread is decisive for this revision: it exists
+  throughout submission, semaphore polling, post-launch handling, and output
+  read.  `_quiesce_channel()` stops and joins it before its former only
+  endpoint operation, `_disable_pci_bus_master()`.  The rejected synchronous
+  request is therefore in the added PCI config close sequence, not the bulk
+  BAR1 output read.
+
+### Git/known-good comparison
+
+- The working `examples/add.py` RTX 3080 transport does not implement a custom
+  PCI shutdown in `fini()`.  It reuses the stable `/tmp/tinygpu.sock` server
+  and leaves the signed DriverKit server lifecycle alone.
+- Commit `6b04d4f`, the last committed Kepler diagnostic path without a
+  recorded panic, likewise only closed its client socket.  The current worktree
+  had diverged by creating a unique temporary socket/server per invocation,
+  issuing config read/write/read after the helper joined, and terminating the
+  server during close.
+- The panic process list also contains more than one
+  `org.tinygrad.tinygpu.driver2` process, reinforcing that Kepler-specific
+  server detach/rebind churn is the wrong lifecycle to add on top of the
+  already-proven signed TinyGPU transport.
+
+### Fix
+
+- Restored the proven transport lifecycle: the Kepler client now defaults to
+  `/tmp/tinygpu.sock`, reuses the shared server, closes only its own socket,
+  and never terminates/relaunches the TinyGPU server during normal or partial
+  cleanup.
+- `_quiesce_channel()` now only stops and joins the host FECS helper.  It emits
+  zero BAR, config-space, reset, or server-lifecycle RPCs.  `NVDevice.close()`
+  likewise emits zero endpoint RPCs before client socket close.
+- Normal successful add no longer runs the large post-launch trap/status/W1C
+  sweep or changes FE power state.  That state-mutating capture is gated behind
+  `KEPLER_UNSAFE_POSTLAUNCH_DIAGNOSTICS=1`.  The normal path goes directly from
+  the serialized, WFI-completed semaphore to one bulk BAR1 output read.
+- Removed the host-driven LTC flush/invalidate after completion.  Mesa's NVE4
+  launch sequence uses `NV50_GRAPH_SERIALIZE`; this QMD also requests its
+  release membar before the WFI semaphore.  The extra BAR0 flush was not part
+  of the normal command/fence path and enlarged the post-completion failure
+  surface.
+
+### Safety status
+
+- No hardware operation was made while applying this fix.  The enclosure must
+  be physically power-cycled before any validation because this panic left the
+  endpoint/bridge state stale.
+- Offline validation passes: `py_compile`, `--middle-selftest` (including the
+  zero-RPC client-only close and stable-socket assertions), the 256-element
+  software demo, and `git diff --check`.
+- A future test must be exactly one default full-add invocation.  Do not enable
+  unsafe post-launch diagnostics and do not issue a follow-up probe.
