@@ -29,7 +29,7 @@ NO imports from tinygrad.runtime.support / ops / device / renderer / uop / helpe
 are permitted on the live path — those have been vendored inline below.
 """
 from __future__ import annotations
-import os, sys, ctypes, ctypes.util, time, mmap, struct, math, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib, json
+import os, sys, ctypes, ctypes.util, time, mmap, struct, math, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib, json, threading
 from typing import cast, Any, ClassVar, Generic, TypeVar
 
 # --- autogen ctypes (allowed: "ctypes constants only") ---
@@ -497,14 +497,16 @@ def _temp_sock():
   # across invocations.  Spawning a new DriverKit server on every Kepler run
   # and terminating it during close caused avoidable service detach/rebind
   # churn on the Apple PCIe path.
-  return temp("tinygpu.sock")
+  # Keep this literal: macOS tempfile.gettempdir() is often a per-user
+  # /var/folders path, while the shared TinyGPU server contract is /tmp.
+  return "/tmp/tinygpu.sock"
 
 class APLRemotePCIDevice(RemotePCIDevice):
   """macOS: TinyGPU.app signed DriverKit extension exposes raw PCIe BAR access
   for an eGPU over a local Unix socket.  This is a faithful port of the proven
   client in examples/add.py (which drives this same hardware), adapted for
-  Kepler bring-up.  The server is auto-started from /Applications/TinyGPU.app
-  if not already running, exactly like examples/add.py."""
+  Kepler bring-up.  The shared server must already own the stable socket; this
+  crash-isolation client never starts or terminates the DriverKit service."""
   APP_PATH = "/Applications/TinyGPU.app/Contents/MacOS/TinyGPU"
   APP_COMMIT = "c0d024f9ff0e1dc8fdf217f255da7101d91e8323"
 
@@ -516,8 +518,22 @@ class APLRemotePCIDevice(RemotePCIDevice):
     self._server_proc = None
     self._pci_config_available = False
     self._fini_done = False
-    self._sock_lock = __import__('threading').Lock()
+    self._sock_lock = threading.Lock()
+    self._rpc_seq = 0
+    self._rpc_phase = "connect"
+    self._rpc_owner_thread = threading.get_ident()
+    self._single_thread_rpc = os.environ.get("KEPLER_SINGLE_THREAD_RPC", "1") != "0"
+    self._endpoint_frozen = False
+    self._endpoint_freeze_reason = None
+    self._final_rpc_budget = None
+    self._trace_fd = None
+    trace_path = os.environ.get("KEPLER_RPC_TRACE")
+    if trace_path:
+      flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+      if hasattr(os, "O_CLOEXEC"): flags |= os.O_CLOEXEC
+      self._trace_fd = os.open(trace_path, flags, 0o600)
     try:
+      self.set_phase("connect")
       self._connect(timeout_ms)
     except Exception:
       # __init__ failures never reach NVDevice.close().  Roll back this client
@@ -533,13 +549,49 @@ class APLRemotePCIDevice(RemotePCIDevice):
       try:
         self._sock.connect(self.sock_path); connected = True; break
       except (ConnectionRefusedError, FileNotFoundError):
-        if i == 0:
-          self._server_proc = subprocess.Popen(
-              [self.APP_PATH, "server", self.sock_path],
-              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.05)
     if not connected:
-      raise RuntimeError(f"Failed to connect to TinyGPU server at {self.sock_path}")
+      raise RuntimeError(
+          f"shared TinyGPU server is not reachable at {self.sock_path}; "
+          "start exactly one intended server before the cold live run")
+
+  def _trace_record(self, record):
+    fd = getattr(self, "_trace_fd", None)
+    if fd is not None:
+      data = (record.rstrip("\n") + "\n").encode("utf-8", "backslashreplace")
+      while data:
+        written = os.write(fd, data)
+        if written <= 0:
+          raise OSError("RPC flight recorder made no write progress")
+        data = data[written:]
+
+  @staticmethod
+  def _trace_atom(value):
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace(" ", "\\x20")
+
+  def set_phase(self, phase):
+    self._rpc_phase = str(phase)
+    self._trace_record(
+        f"PHASE monotonic_ns={time.monotonic_ns()} thread={threading.get_ident()} "
+        f"phase={self._trace_atom(self._rpc_phase)}")
+
+  def arm_final_output_read(self, bar, offset, size):
+    """Allow exactly one final BAR read after the completion semaphore."""
+    if self._endpoint_frozen:
+      raise RuntimeError(f"cannot arm output read after freeze: {self._endpoint_freeze_reason}")
+    self._final_rpc_budget = (int(RemoteCmd.MMIO_READ), int(bar), int(offset), int(size))
+    self.set_phase("output-read")
+
+  def freeze(self, reason):
+    """Reject every future protocol frame while still allowing local close."""
+    if self._endpoint_frozen:
+      return
+    self._endpoint_frozen = True
+    self._endpoint_freeze_reason = str(reason)
+    self._trace_record(
+        f"FREEZE monotonic_ns={time.monotonic_ns()} thread={threading.get_ident()} "
+        f"phase={self._trace_atom(self._rpc_phase)} "
+        f"reason={self._trace_atom(self._endpoint_freeze_reason)}")
 
   def _recvall(self, n):
     buf = bytearray(n)
@@ -551,21 +603,72 @@ class APLRemotePCIDevice(RemotePCIDevice):
     return bytes(buf)
 
   def _rpc(self, cmd, bar, *args, readout=0, payload=b'', has_fd=False):
+    if getattr(self, "_endpoint_frozen", False):
+      raise RuntimeError(
+          f"endpoint RPC after freeze: cmd={cmd} bar={bar} args={args}")
+    owner = getattr(self, "_rpc_owner_thread", threading.get_ident())
+    if getattr(self, "_single_thread_rpc", False):
+      assert threading.get_ident() == owner, (
+          f"endpoint RPC from non-owner thread: owner={owner} "
+          f"current={threading.get_ident()} cmd={cmd} bar={bar} args={args}")
+    cmd_id = int(cmd)
+    padded_args = (tuple(args) + (0, 0, 0))[:3]
+    offset = int(padded_args[0])
+    size = int(padded_args[1])
+    budget = getattr(self, "_final_rpc_budget", None)
+    if budget == "consumed":
+      raise RuntimeError(
+          f"endpoint RPC after final output read: cmd={cmd} bar={bar} args={args}")
+    if budget is not None:
+      attempted = (cmd_id, int(bar), offset, size)
+      if attempted != budget:
+        raise RuntimeError(
+            f"RPC outside final output budget: allowed={budget} attempted={attempted}")
+      # Consume before sendall: a failed final read must never be retried.
+      self._final_rpc_budget = "consumed"
     with self._sock_lock:
-      self._sock.sendall(struct.pack("<BIIQQQ", int(cmd), self.dev_id, bar, *((tuple(args) + (0, 0, 0))[:3])) + payload)
-      if payload:  # writes: server sends no response (matches examples/add.py)
-        return None
-      if has_fd:
-        msg, anc, _, _ = self._sock.recvmsg(17, socket.CMSG_LEN(4))
-        fd = struct.unpack('<i', anc[0][2][:4])[0]
-      else:
-        msg = self._recvall(17); fd = None
-      status, value1, value2 = struct.unpack("<BQQ", msg)
-      if status != 0:
-        err = self._recvall(value1).decode('utf-8') if value1 > 0 else 'unknown error'
-        raise RuntimeError(f"TinyGPU RPC cmd={int(cmd)} bar={bar} args={args} failed: {err}")
-      data = self._recvall(readout) if readout else b""
-      return value1, value2, data, fd
+      self._rpc_seq = getattr(self, "_rpc_seq", 0) + 1
+      seq = self._rpc_seq
+      start_ns = time.monotonic_ns()
+      phase = getattr(self, "_rpc_phase", "unknown")
+      cmd_name = cmd.name if isinstance(cmd, RemoteCmd) else RemoteCmd(cmd_id).name
+      payload_hash = hashlib.sha256(payload).hexdigest() if payload else "-"
+      config_offset = offset if cmd_id in (int(RemoteCmd.CFG_READ), int(RemoteCmd.CFG_WRITE)) else "-"
+      common = (
+          f"seq={seq} monotonic_ns={start_ns} phase={self._trace_atom(phase)} "
+          f"thread={threading.get_ident()} cmd={cmd_name} cmd_id={cmd_id} "
+          f"bar={bar} offset={offset} size={size} config_offset={config_offset} "
+          f"args={self._trace_atom(repr(tuple(args)))} "
+          f"readout={readout} payload_len={len(payload)} payload_sha256={payload_hash}")
+      self._trace_record(f"BEGIN {common}")
+      try:
+        self._sock.sendall(struct.pack("<BIIQQQ", cmd_id, self.dev_id, bar,
+                                       *padded_args) + payload)
+        if payload:  # writes: server sends no response (matches examples/add.py)
+          self._trace_record(
+              f"END {common} status=ok bytes={len(payload)} "
+              f"duration_us={(time.monotonic_ns() - start_ns) // 1000}")
+          return None
+        if has_fd:
+          msg, anc, _, _ = self._sock.recvmsg(17, socket.CMSG_LEN(4))
+          fd = struct.unpack('<i', anc[0][2][:4])[0]
+        else:
+          msg = self._recvall(17); fd = None
+        status, value1, value2 = struct.unpack("<BQQ", msg)
+        if status != 0:
+          err = self._recvall(value1).decode('utf-8') if value1 > 0 else 'unknown error'
+          raise RuntimeError(f"TinyGPU RPC cmd={cmd_id} bar={bar} args={args} failed: {err}")
+        data = self._recvall(readout) if readout else b""
+        self._trace_record(
+            f"END {common} status=ok bytes={len(data)} "
+            f"duration_us={(time.monotonic_ns() - start_ns) // 1000}")
+        return value1, value2, data, fd
+      except BaseException as exc:
+        self._trace_record(
+            f"END {common} status=exception "
+            f"exception={self._trace_atom(type(exc).__name__ + ':' + str(exc))} "
+            f"duration_us={(time.monotonic_ns() - start_ns) // 1000}")
+        raise
 
   def bar_info(self, bar):
     v1, v2, _, _ = self._rpc(RemoteCmd.MAP_BAR, bar)
@@ -620,6 +723,12 @@ class APLRemotePCIDevice(RemotePCIDevice):
         pass
     self._sock = None
     self._server_proc = None
+    trace_fd = getattr(self, "_trace_fd", None)
+    if trace_fd is not None:
+      try:
+        os.close(trace_fd)
+      finally:
+        self._trace_fd = None
 
   def __del__(self):
     # Fallback only; normal and partial-constructor paths call fini directly.
@@ -650,53 +759,6 @@ class APLRemotePCIDevice(RemotePCIDevice):
       return APLRemotePCIDevice(sock_path=sock_path, timeout_ms=timeout_ms)
     except (OSError, RuntimeError):
       return None
-
-
-def _disable_pci_bus_master(hw, disable_decode=False):
-  """Revoke endpoint DMA and prove the PCI_COMMAND write reached hardware."""
-  observed = None
-  forbidden = pci.PCI_COMMAND_MASTER
-  if disable_decode:
-    forbidden |= pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_IO
-  for _ in range(3):
-    command = hw.read_config(pci.PCI_COMMAND, 2)
-    command = ((command | pci.PCI_COMMAND_INTX_DISABLE) &
-               ~pci.PCI_COMMAND_MASTER)
-    if disable_decode:
-      command &= ~(pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_IO)
-    observed = hw.write_config_flush(pci.PCI_COMMAND, command, 2)
-    if not (observed & forbidden):
-      return observed
-    time.sleep(0.005)
-  raise RuntimeError(
-      f"PCI function disable did not stick (mask={forbidden:#06x}): "
-      f"PCI_COMMAND={observed:#06x}")
-
-
-def _reset_pci_function_for_close(hw, settle_s=0.1):
-  """Stop DMA, reset all endpoint state, and prove reset did not re-arm DMA."""
-  before = _disable_pci_bus_master(hw)
-  hw.reset()
-  if settle_s:
-    time.sleep(settle_s)
-  # Leave the reset function completely inert: no DMA and no BAR/IO decode.
-  after = _disable_pci_bus_master(hw, disable_decode=True)
-  hw._close_reset_done = True
-  return before, after
-
-
-def _shutdown_kepler_pci_for_close(hw):
-  """Revoke GK104 DMA/INTx without FLR or disabling BAR decode.
-
-  Apple T8103 port interrupt bit 21 is PCIe Completion Abort.  Unlike the
-  working newer/AMD paths, this consumer GK104 endpoint cannot be assumed to
-  support FLR, and DriverKit may still make final config/BAR transactions while
-  closing.  Keep those transactions completable while making DMA impossible.
-  """
-  command = _disable_pci_bus_master(hw, disable_decode=False)
-  hw._close_shutdown_done = True
-  return command
-
 
 class SoftwarePCIDevice:
   """Offline stand-in for the eGPU transport (no socket, no TinyGPU.app).
@@ -845,8 +907,8 @@ class NVDevice:
         self._init_hardware()
     except Exception:
       # main() cannot call close() when construction itself raises.  Ensure a
-      # partially initialized transport cannot leak its TinyGPU server/DEXT
-      # user client; fini() conditionally resets only after CFG_READ succeeded.
+      # partially initialized transport closes only its TinyGPU client socket;
+      # fini() never resets the endpoint or changes the shared server lifecycle.
       if self.iface is not None:
         self.iface.pci_dev.fini()
       raise
@@ -900,6 +962,7 @@ class NVDevice:
     the real GTX 770 + TinyGPU.app + nouveau GK104 firmware are present."""
     dev = self.dev_impl
     dev.hw = self.iface.pci_dev
+    dev.hw.set_phase("map-bars")
     # TinyGPU exposes PCI config-space RPCs.  Keep legacy INTx disabled because
     # this userspace driver polls, while explicitly enabling memory decoding
     # and bus mastering only for the lifetime of this NVDevice.
@@ -914,6 +977,7 @@ class NVDevice:
           f"PCI memory/bus-master enable did not stick: PCI_COMMAND={_pci_observed:#06x}")
     dev.hw.bar_info(0)  # MAP_BAR: map the register BAR before any MMIO
     dev.bar1_addr, dev.bar1_size = dev.hw.bar_info(1)  # real BAR1 USERD aperture
+    dev.hw.set_phase("vbios-devinit")
     # This userspace RM polls every GPU event; TinyGPU's DriverKit transport
     # does not install a handler for NVIDIA's external interrupt.  Match
     # nv04_mc_intr_unarm() and gt215_mc_intr_block() before enabling engines,
@@ -988,6 +1052,7 @@ class NVDevice:
       _dmem_probe("after VBIOS devinit")
       program_gk104_gpc_pll(self)
       _dmem_probe("after GPC PLL")
+    dev.hw.set_phase("firmware-load")
     def _rd(name):
       p = os.path.join(fdir, name)
       if not os.path.exists(p):
@@ -1529,6 +1594,9 @@ class NVDevice:
         print("[kepler] client-only close: no teardown MMIO/config/reset RPC",
               flush=True)
     finally:
+      pci_dev = self.iface.pci_dev
+      if hasattr(pci_dev, "set_phase"):
+        pci_dev.set_phase("client-close")
       self.iface.pci_dev.fini()
 
   # MMIO convenience helpers used by the host-driven hardware bring-up.
@@ -2693,9 +2761,8 @@ def kepler_selftest():
   assert spt.address(spt_idx) == 0x2000, "PTE frame must match paddr"
   assert mp.size == 0x3000 and mp.paddrs == [0x2000]
 
-  # TinyGPU transport and PCI shutdown sanity.  This uses a fake socket, so it
-  # proves the exact config-space wire layout and bus-master read-back without
-  # connecting to the eGPU or starting TinyGPU.app.
+  # TinyGPU final-RPC budget sanity.  A successful completion permits exactly
+  # one bulk BAR1 read; freeze and close must emit no protocol frames.
   class _FakeSocket:
     def __init__(self, values):
       self.sent = []
@@ -2708,53 +2775,61 @@ def kepler_selftest():
       del self.rx[:count]
       return count
     def close(self): self.closed = True
-  fake_sock = _FakeSocket([0x0006, 0, 0x0402])
-  fake_hw = object.__new__(APLRemotePCIDevice)
-  fake_hw.dev_id, fake_hw._sock = 7, fake_sock
-  fake_hw._sock_lock = __import__('threading').Lock()
-  assert _disable_pci_bus_master(fake_hw) == 0x0402
-  frames = [struct.unpack("<BIIQQQ", frame) for frame in fake_sock.sent]
-  assert frames == [
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0402),
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-  ], f"unexpected TinyGPU PCI config frames: {frames}"
-  fake_hw.fini(reset_endpoint=False)
-
-  reset_sock = _FakeSocket([0x0402, 0, 0x0402, 0, 0x0003, 0, 0x0400])
-  reset_hw = object.__new__(APLRemotePCIDevice)
-  reset_hw.dev_id, reset_hw._sock = 7, reset_sock
-  reset_hw._sock_lock = __import__('threading').Lock()
-  assert _reset_pci_function_for_close(reset_hw, settle_s=0) == (0x0402, 0x0400)
-  reset_frames = [struct.unpack("<BIIQQQ", frame) for frame in reset_sock.sent]
-  assert reset_frames == [
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0402),
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-    (int(RemoteCmd.RESET), 7, 0, 0, 0, 0),
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0400),
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-  ], f"unexpected TinyGPU reset/close frames: {reset_frames}"
-  assert not reset_sock.rx, "TinyGPU reset self-test left an unread response"
-  reset_hw.fini(reset_endpoint=False)
-
-  # The actual Kepler close path must not send RESET or clear BAR decode.  Both
-  # remain available to other GPU implementations, but are unsafe assumptions
-  # for this GK104 path after a confirmed Apple PCIe Completion Abort.
-  close_sock = _FakeSocket([0x0007, 0, 0x0403])
-  close_hw = object.__new__(APLRemotePCIDevice)
-  close_hw.dev_id, close_hw._sock = 7, close_sock
-  close_hw._sock_lock = __import__('threading').Lock()
-  assert _shutdown_kepler_pci_for_close(close_hw) == 0x0403
-  close_frames = [struct.unpack("<BIIQQQ", frame) for frame in close_sock.sent]
-  assert close_frames == [
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-    (int(RemoteCmd.CFG_WRITE), 7, 0, pci.PCI_COMMAND, 2, 0x0403),
-    (int(RemoteCmd.CFG_READ), 7, 0, pci.PCI_COMMAND, 2, 0),
-  ], f"unexpected Kepler no-FLR close frames: {close_frames}"
-  assert all(frame[0] != int(RemoteCmd.RESET) for frame in close_frames)
-  close_hw.fini(reset_endpoint=False)
+  output = bytes(range(32))
+  budget_sock = _FakeSocket([0])
+  budget_sock.rx.extend(output)
+  trace_rd, trace_wr = os.pipe()
+  budget_hw = object.__new__(APLRemotePCIDevice)
+  budget_hw.dev_id, budget_hw._sock = 7, budget_sock
+  budget_hw._sock_lock = threading.Lock()
+  budget_hw._rpc_seq = 0
+  budget_hw._rpc_phase = "semaphore-poll"
+  budget_hw._rpc_owner_thread = threading.get_ident()
+  budget_hw._single_thread_rpc = True
+  budget_hw._endpoint_frozen = False
+  budget_hw._endpoint_freeze_reason = None
+  budget_hw._final_rpc_budget = None
+  budget_hw._trace_fd = trace_wr
+  budget_hw._fini_done = False
+  owner_errors = []
+  def _non_owner_rpc():
+    try:
+      budget_hw.mmio_read(0, 0, 4)
+    except BaseException as exc:
+      owner_errors.append(exc)
+  owner_thread = threading.Thread(target=_non_owner_rpc)
+  owner_thread.start()
+  owner_thread.join()
+  assert len(owner_errors) == 1 and isinstance(owner_errors[0], AssertionError)
+  assert budget_sock.sent == [], "non-owner thread emitted an RPC frame"
+  budget_hw.arm_final_output_read(1, 0x123400, len(output))
+  try:
+    budget_hw.mmio_read(0, 0x400100, 4)
+    raise AssertionError("BAR0 read escaped final output budget")
+  except RuntimeError as exc:
+    assert "outside final output budget" in str(exc)
+  assert budget_hw.mmio_read(1, 0x123400, len(output)) == output
+  sent_after_output = len(budget_sock.sent)
+  try:
+    budget_hw.mmio_write32(0, 0x404170, 0x10)
+    raise AssertionError("BAR0 write escaped consumed final output budget")
+  except RuntimeError as exc:
+    assert "after final output read" in str(exc)
+  budget_hw.freeze("output-read-complete")
+  try:
+    budget_hw.mmio_read(1, 0x123400, len(output))
+    raise AssertionError("RPC escaped transport freeze")
+  except RuntimeError as exc:
+    assert "after freeze" in str(exc)
+  budget_hw.fini()
+  trace = os.read(trace_rd, 65536).decode()
+  os.close(trace_rd)
+  assert len(budget_sock.sent) == sent_after_output == 1
+  frame = struct.unpack("<BIIQQQ", budget_sock.sent[0])
+  assert frame == (int(RemoteCmd.MMIO_READ), 7, 1, 0x123400, len(output), 0)
+  assert "BEGIN seq=1" in trace and "cmd=MMIO_READ" in trace
+  assert "END seq=1" in trace and "status=ok" in trace
+  assert "FREEZE" in trace and "reason=output-read-complete" in trace
 
   # The actual Kepler close must send no config/MMIO/reset request at all.
   # It follows the working examples/add.py client-only socket lifecycle.
@@ -2791,7 +2866,7 @@ def kepler_selftest():
   assert failed_sock.closed and not failed_proc.terminated
   assert failed_proc.waits == 0
   assert failed_sock.sent == [], "failed-init cleanup retried endpoint RPC"
-  assert _temp_sock() == temp("tinygpu.sock"), "Kepler must reuse TinyGPU socket"
+  assert _temp_sock() == "/tmp/tinygpu.sock", "Kepler must reuse /tmp/TinyGPU socket"
 
   # GK104 shutdown must silence leaf interrupts without inventing a reverse
   # PGOB transition or turning off the active PLL.  Nouveau has neither
@@ -3918,6 +3993,16 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   (`dev.vram`); `signal_pa` is the mmap offset of the semaphore page.  The GR
   context-buffer content (RAMIN 0x0210) and the exact GPFIFO ring base wiring
   are KEPLER-TODO pending a nouveau GK104 channel trace on silicon."""
+  hw = dev.dev_impl.hw
+  if hw is not None:
+    hw.set_phase("channel-build")
+  single_thread_rpc = (hw is None or getattr(hw, "_single_thread_rpc", True))
+  submit_mode = os.environ.get("KEPLER_SUBMIT_MODE", "gpfifo")
+  if submit_mode not in ("gpfifo", "bypass", "dispatch"):
+    raise ValueError(
+        f"invalid KEPLER_SUBMIT_MODE={submit_mode!r}; expected gpfifo, bypass, or dispatch")
+  if submit_mode != "gpfifo" and os.environ.get("KEPLER_PUT_BEFORE_RUNLIST", "0") != "0":
+    raise ValueError("KEPLER_PUT_BEFORE_RUNLIST is only valid in gpfifo mode")
   # Reassert the polling-only interrupt policy after VBIOS/engine init and
   # before any operation that can raise a PFIFO or PGRAPH source.
   dev.write32(0x000140, 0x00000000)
@@ -4103,11 +4188,25 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # FECS saves only defined context words; all gaps must start at zero.
     # TinyGPU BAR1 bulk stores can leave inverted/stale dwords, so repair the
     # golden-context allocation before it becomes the source for every channel.
+    attrib_repair_mode = os.environ.get("KEPLER_ATTRIB_REPAIR", "literal")
+    if attrib_repair_mode not in ("literal", "bar1"):
+      raise ValueError(
+          "invalid KEPLER_ATTRIB_REPAIR; expected literal or bar1")
     def repair_zero(label, pa, size):
       # The compensated writer cannot be used for zero here: its transformed
       # immediate readback makes a raw 0xffffffff operand look like zero while
       # the GPU still observes all ones.  Store literal zero dwords instead.
-      _gk104_pramin_write_literal(dev, pa, bytes(size))
+      phase_label = label.lower().replace(" ", "-")
+      if hw is not None:
+        hw.set_phase(f"channel-build-repair-zero-{phase_label}")
+      if label == "attrib" and attrib_repair_mode == "bar1":
+        # Isolation mode: avoid the per-dword BAR0 PRAMIN aperture stream.
+        # bar1_write() remains page-bounded, matching the already-used bulk
+        # initialization path.  This is deliberately opt-in because the
+        # unclaimed eGPU has shown stale/inverted BAR1 readback in places.
+        bar1_write(pa, bytes(size))
+      else:
+        _gk104_pramin_write_literal(dev, pa, bytes(size))
       _gk104_bar_flush(dev)
       if not _gk104_ltc_invalidate(dev):
         raise TimeoutError(f"GK104 LTC invalidate while zeroing {label} failed")
@@ -4478,6 +4577,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   # 6. Wait for CHAN_ADDR bit31 to clear (context switch complete)
   # 7. Clear CHAN_ADDR bit31
   if dev.dev_impl.hw is not None:
+    hw.set_phase("golden-context")
     inst_phys = ramin_vram_pa if use_vram_inst else (base + ramin_pa)
     inst_tag = 0x80000000 | (inst_phys >> 12)
     print(f"[kepler] FECS golden ctx: inst_tag={inst_tag:#x} inst_phys={inst_phys:#x} "
@@ -4594,8 +4694,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # Start a keep-alive thread to prevent FE domain power-gating during
     # grctx_main and the golden context save.  The FECS sleeps after ctx_chan
     # and the FE domain power-gates without FORCE_ON.
-    import threading as _th2
-    _ka_stop2 = _th2.Event()
+    _ka_stop2 = threading.Event()
+    _ka_thread2 = None
     def _ka2():
       while not _ka_stop2.is_set():
         try:
@@ -4607,8 +4707,13 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         except Exception:
           pass
         time.sleep(0.0002)
-    _ka_thread2 = _th2.Thread(target=_ka2, daemon=True)
-    _ka_thread2.start()
+    if single_thread_rpc:
+      # Strict crash-isolation mode: the main thread is the sole RPC owner.
+      # Keep FE forced on immediately around the synchronous grctx sequence.
+      dev.write32(0x404170, 0x00000002)
+    else:
+      _ka_thread2 = threading.Thread(target=_ka2, daemon=True)
+      _ka_thread2.start()
     # 3. Populate GR context via grctx->main() (gf100_grctx_generate_main).
     #    This writes the GR register init lists, pagepool/bundle/attrib_cb
     #    addresses, icmd and mthd bundles.  The channel is current so GR
@@ -4675,6 +4780,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
           f"IREN={dev.read32(0x409010):#x} head={[hex(x) for x in saved_head]}", flush=True)
     # Stop the golden-save keep-alive thread.
     _ka_stop2.set()
+    if _ka_thread2 is not None:
+      _ka_thread2.join(timeout=2.5)
+      if _ka_thread2.is_alive():
+        raise RuntimeError("golden-context keepalive did not stop")
     # Verify RAMFC is intact after golden context save
     if use_vram_inst:
       _ramfc_94 = _gk104_pramin_read32(dev, ramin_vram_pa + 0x94)
@@ -4878,8 +4987,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # Start a background FECS keep-alive thread before snapshot.
     # Continuously re-assert FE_PWR FORCE_ON to prevent the FE domain
     # from power-gating during/after the context switch.
-    import threading
     _fecs_keepalive_stop = threading.Event()
+    _ka_thread = None
     def _fecs_keepalive():
       while not _fecs_keepalive_stop.is_set():
         try:
@@ -4897,9 +5006,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         except Exception:
           pass
         time.sleep(0.0001)  # 0.1ms — fast enough to catch the handshake
-    _ka_thread = threading.Thread(target=_fecs_keepalive, daemon=True)
-    _ka_thread.start()
-    print("[kepler] FECS keep-alive thread started (FE_PWR FORCE_ON)", flush=True)
+    if single_thread_rpc:
+      print("[kepler] strict single-thread RPC mode: FECS helper disabled", flush=True)
+    else:
+      _ka_thread = threading.Thread(target=_fecs_keepalive, daemon=True)
+      _ka_thread.start()
+      print("[kepler] FECS keep-alive thread started (FE_PWR FORCE_ON)", flush=True)
     # Phase 1 capture point 1: before runlist submission.
     # Skip snapshot_gr_traps for now — it reads GPC/TPC registers which
     # may trigger FECS power-gating.  Test if FECS stays alive without it.
@@ -5268,9 +5380,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
 
     _fecs_keepalive_stop.set()
     # Do not let the helper retain the socket while the client is closing.
-    _ka_thread.join(timeout=2.5)
-    if _ka_thread.is_alive():
-      errors.append("FECS keepalive did not stop before client close")
+    if _ka_thread is not None:
+      _ka_thread.join(timeout=2.5)
+      if _ka_thread.is_alive():
+        errors.append("FECS keepalive did not stop before client close")
     # Do not issue BAR, config-space, FLR, or server-lifecycle operations here.
     # The working examples/add.py transport has no such close protocol.  The
     # latest panic caught this thread in recv_into only after keepalive joined,
@@ -5591,6 +5704,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   if DEBUG:
     print(f"[kepler] pre-runlist chan_ctrl=0x{dev.read32(CHAN_START_REG + chan_id * 8):08x}", flush=True)
   dev.write32(0x2270, (runlist_target << 28) | (runlist_addr >> 12))
+  if hw is not None:
+    hw.set_phase("runlist-submit")
   dev.write32(PFIFO_RUNLIST_SUBMIT, (GR_RUNLIST_ID << 20) | 1)
   if DEBUG and use_vram_runlist:
     print(f"[kepler] runlist_vram pa={runlist_pa:#x} words="
@@ -6023,7 +6138,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     raise RuntimeError(
       f"unsafe GK104 channel state before GP_PUT: "
       f"mmu_faults={_prelaunch_faults} hce={_prelaunch_hce}")
-  if not put_before_runlist:
+  if not put_before_runlist and submit_mode == "gpfifo":
     # The cold eGPU's saved context restores complemented scratch-buffer
     # bases.  With PUT still zero the channel is resident and idle here, so
     # load it with the documented internal-FECS ctx_chan command, then replay
@@ -6073,12 +6188,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                                  struct.pack("<I", 1))
       _gk104_bar_flush(dev)
   userd_put_readback = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, userd_mmio_base + USERD_GP_PUT, 4))[0]
-  # If the PBDMA scheduler is not functional (CHAN_TABLE empty, PBDMA idle),
-  # use the PFIFO BYPASS mechanism to submit methods directly to PGRAPH.
-  # This bypasses the PBDMA/scheduler entirely and feeds methods one-by-one
-  # through the BYPASS registers at 0x5000.
+  # Submission paths are selected before launch.  Never fall through from the
+  # normal GPFIFO path into BYPASS or direct DISPATCH in the same invocation.
   _ct_check = dev.read32(0x3000 + chan_id * 8)
-  if unsafe_experiments and _ct_check == 0 and dev.dev_impl.hw is not None:
+  if submit_mode == "bypass" and dev.dev_impl.hw is not None:
     if DEBUG:
       print("[kepler] CHAN_TABLE empty — using BYPASS path", flush=True)
     # Enable BYPASS for PGRAPH (engine 0).
@@ -6154,39 +6267,32 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
             f"FIFO_CTRL=0x{_fifo_ctrl_post:08x} FIFO_STAT=0x{_fifo_stat_post:08x} "
             f"DISP_TRAP=0x{_disp_trap:08x} PGRAPH_STAT=0x{_pgraph_stat:08x} "
             f"subch1=0x{_subch1_post:08x}", flush=True)
-    # If SET_OBJECT didn't bind (subch1 still 0), try direct DISPATCH injection.
-    # The DISPATCH.CMD_ADDR (0x404004) and CMD_DATA_LOW (0x404008) can accept
-    # methods directly, bypassing the FIFO.
+    # SET_OBJECT failure is terminal for this deterministic invocation.
     _subch1_check = dev.read32(0x404200 + 4)
     if _subch1_check == 0:
-      if DEBUG:
-        print("[kepler] SET_OBJECT not bound — trying direct DISPATCH injection", flush=True)
-      # Clear the FIFO to remove stuck entries
-      dev.write32(0x400500, 0x00000000)  # Disable PULL
-      time.sleep(0.001)
-      dev.write32(0x400500, 0x00010001)  # Re-enable PULL with UNK16
-      time.sleep(0.001)
-      # Directly inject methods via DISPATCH CMD_ADDR/CMD_DATA
-      _wi2 = 0
-      while _wi2 < len(words):
-        _hdr2 = words[_wi2]
-        _size2 = (_hdr2 >> 16) & 0xfff
-        _subc2 = (_hdr2 >> 13) & 0x7
-        _mthd2 = (words[_wi2] & 0x1fff) << 2
-        _args2 = words[_wi2 + 1:_wi2 + 1 + _size2]
-        # Write CMD_ADDR: MTHD at bits 2-12, SUBCH at bits 16-18, VALID at bit 31
-        _addr_val = (1 << 31) | (_subc2 << 16) | ((_mthd2 >> 2) << 2)
-        for _ai2, _arg2 in enumerate(_args2):
-          dev.write32(0x404004, _addr_val)
-          dev.write32(0x404008, _arg2)
-          if _ai2 + 1 < len(_args2):
-            # Auto-increment: just advance MTHD by 4 for next write
-            _addr_val += 4
-        if DEBUG and _wi2 < 40:
-          _sc = dev.read32(0x404200 + 4)
-          print(f"[kepler] DISPATCH inject: subc={_subc2} mthd=0x{_mthd2:x} "
-                f"args={[hex(_a) for _a in _args2]} subch1=0x{_sc:08x}", flush=True)
-        _wi2 += 1 + _size2
+      raise RuntimeError(
+          "SET_OBJECT did not bind in bypass mode; direct DISPATCH fallback disabled")
+  elif submit_mode == "dispatch" and dev.dev_impl.hw is not None:
+    # Explicitly dangerous diagnostic path.  It is never reached from gpfifo
+    # or bypass mode as an automatic recovery action.
+    _wi2 = 0
+    while _wi2 < len(words):
+      _hdr2 = words[_wi2]
+      _size2 = (_hdr2 >> 16) & 0xfff
+      _subc2 = (_hdr2 >> 13) & 0x7
+      _mthd2 = (words[_wi2] & 0x1fff) << 2
+      _args2 = words[_wi2 + 1:_wi2 + 1 + _size2]
+      _addr_val = (1 << 31) | (_subc2 << 16) | ((_mthd2 >> 2) << 2)
+      for _ai2, _arg2 in enumerate(_args2):
+        dev.write32(0x404004, _addr_val)
+        dev.write32(0x404008, _arg2)
+        if _ai2 + 1 < len(_args2):
+          _addr_val += 4
+      if DEBUG and _wi2 < 40:
+        _sc = dev.read32(0x404200 + 4)
+        print(f"[kepler] DISPATCH inject: subc={_subc2} mthd=0x{_mthd2:x} "
+              f"args={[hex(_a) for _a in _args2]} subch1=0x{_sc:08x}", flush=True)
+      _wi2 += 1 + _size2
   if DEBUG:
     print(f"[kepler] BAR1 USERD GP_PUT write=1 readback={userd_put_readback:#x} "
           f"userd_pa={userd_addr:#x} bar1_off={userd_mmio_base:#x} "
@@ -6258,6 +6364,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
           f"IREN=0x{_fecs_iren:08x}", flush=True)
   _fecs_poll_count = 0
   _gp_get_snapshot_taken = False
+  if hw is not None:
+    hw.set_phase("semaphore-poll")
   for _ in range(2000):
     # FECS keep-alive: re-assert FE_PWR FORCE_ON (bit 1 only, NOT bit 4).
     # The FECS firmware uses bit 4 as a ctx_4170s/ctx_4170w handshake.
@@ -6478,13 +6586,38 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                      f"userd_push_get={[hex(x) for x in push_get]}, regs={diag}, "
                      f"top={[hex(x) for x in top if x]})")
 
+def _freeze_stop_and_hold(dev, reason):
+  """Freeze protocol traffic, stop local helpers, and retain live mappings."""
+  hw = dev.dev_impl.hw
+  if hw is None:
+    return
+  hw.freeze(reason)
+  hw.set_phase("host-helper-stop")
+  teardown = getattr(dev, "_kepler_emergency_teardown", None)
+  if teardown is not None:
+    teardown(reason)
+  hold_seconds = float(os.environ.get("KEPLER_HOLD_OPEN_SECONDS", "0"))
+  if not math.isfinite(hold_seconds) or hold_seconds < 0:
+    raise ValueError("KEPLER_HOLD_OPEN_SECONDS must be a finite non-negative number")
+  if hold_seconds:
+    hw.set_phase("hold-open")
+    print(f"[kepler] zero-RPC hold with mappings alive: {hold_seconds:g}s", flush=True)
+    time.sleep(hold_seconds)
+
+
 def run_hardware_demo(dev, cubin=None):
   """End-to-end add on the real GTX 770 over TinyGPU (sysmem compute path,
   plan §24.1).  Requires TinyGPU.app, a GK104 firmware tree ($NV_FIRMWARE_DIR),
   and on-silicon FIFO validation."""
   import random
   N = 256
-  sem_only = os.environ.get("KEPLER_TEST_SEM_ONLY") == "1"
+  test_stage = os.environ.get("KEPLER_TEST_STAGE", "full-add")
+  if test_stage not in ("sem", "set-object", "full-add"):
+    raise ValueError(
+        f"unsupported KEPLER_TEST_STAGE={test_stage!r}; "
+        "implemented stages are sem, set-object, and full-add")
+  sem_only = test_stage == "sem"
+  set_object_only = test_stage == "set-object"
   if cubin is None: cubin = get_kepler_cubin()
   prog = dev.runtime("E_4", cubin)
   allocator = NVAllocator(dev)
@@ -6526,7 +6659,7 @@ def run_hardware_demo(dev, cubin=None):
 
   words = build_launch_words(signal.va_addr, 1, 2, cwd_dev.va_addr,
                              code_dev.va_addr, temp_dev.va_addr, 0x40000)
-  if os.environ.get("KEPLER_TEST_SET_OBJECT") == "1":
+  if set_object_only:
     words = [*nvm(1, 0x0000, KEPLER_COMPUTE_A),
              *gk104_semaphore(signal.va_addr, 2, 0x00000002),
              *nvm(0, 0x0020, 0)]
@@ -6573,8 +6706,9 @@ def run_hardware_demo(dev, cubin=None):
     words = [*gk104_semaphore(signal.va_addr, 2, 0x01000002)]
   submit_launch(dev, words, signal.va_addr, signal.meta['pa'], 1, 2)
 
-  if sem_only:
-    print("hardware_semaphore=ok value=2")
+  if sem_only or set_object_only:
+    print(f"hardware_{test_stage}=ok value=2")
+    _freeze_stop_and_hold(dev, f"{test_stage}-complete")
     return
 
   # Deep trap/status capture changes live GR state and emits hundreds of RPCs.
@@ -6703,13 +6837,19 @@ def run_hardware_demo(dev, cubin=None):
     dev.write32(0x000260, 0x00000001)  # nvkm_mc_unk260(1): re-enable ctxctl
 
   out_host = bytearray(N * 4)
-  if dev.dev_impl.hw is not None and out_dev.meta.get("vram_pa") is not None:
+  if dev.dev_impl.hw is not None and out_dev.meta.get("vram_pa") is None:
+    dev.dev_impl.hw.freeze("missing-output-vram-mapping")
+    raise RuntimeError("full-add output has no VRAM BAR1 mapping")
+  if dev.dev_impl.hw is not None:
     # LAUNCH is followed by GRAPH_SERIALIZE and a WFI-enabled semaphore; the
     # QMD also requests FE_SYSMEMBAR release ordering.  Read BAR1 in one RPC.
     # A host-driven LTC flush/invalidate here adds more BAR0 transactions after
     # completion and is not part of Mesa's NVE4 launch/fence sequence.
+    dev.dev_impl.hw.arm_final_output_read(
+        1, out_dev.meta["vram_pa"], len(out_host))
     out_host[:] = dev.dev_impl.hw.mmio_read(
         1, out_dev.meta["vram_pa"], len(out_host))
+    dev.dev_impl.hw.freeze("output-read-complete")
     print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x}",
           flush=True)
   else:
@@ -6727,6 +6867,7 @@ def run_hardware_demo(dev, cubin=None):
     print(f"[kepler] raw output hex: {out_host[:32].hex()}", flush=True)
     print(f"[kepler] raw a_host hex: {a_host.tobytes()[:32].hex()}", flush=True)
     print(f"[kepler] raw b_host hex: {b_host.tobytes()[:32].hex()}", flush=True)
+  _freeze_stop_and_hold(dev, "output-read-complete")
   assert _mismatches == 0, f"hardware add mismatch ({_mismatches}/{N} wrong)"
   print(f"hardware_demo=ok N={N}")
 
@@ -6867,6 +7008,34 @@ def main():
             "KEPLER_LIVE_ACK=completion-abort-risk only for one explicitly "
             "authorized test after a fresh enclosure power-cycle",
             file=sys.stderr)
+      sys.exit(2)
+    if DEBUG != 0:
+      print("hardware launch refused: DEBUG must remain 0 during crash isolation",
+            file=sys.stderr)
+      sys.exit(2)
+    if os.environ.get("KEPLER_SINGLE_THREAD_RPC", "1") != "1":
+      print("hardware launch refused: KEPLER_SINGLE_THREAD_RPC=1 is required",
+            file=sys.stderr)
+      sys.exit(2)
+    if not os.environ.get("KEPLER_RPC_TRACE"):
+      print("hardware launch refused: KEPLER_RPC_TRACE must name the persistent flight recorder",
+            file=sys.stderr)
+      sys.exit(2)
+    submit_mode = os.environ.get("KEPLER_SUBMIT_MODE", "gpfifo")
+    if submit_mode not in ("gpfifo", "bypass", "dispatch"):
+      print(f"hardware launch refused: invalid KEPLER_SUBMIT_MODE={submit_mode!r}",
+            file=sys.stderr)
+      sys.exit(2)
+    test_stage = os.environ.get("KEPLER_TEST_STAGE", "full-add")
+    if test_stage not in ("sem", "set-object", "full-add"):
+      print(f"hardware launch refused: unsupported KEPLER_TEST_STAGE={test_stage!r}; "
+            "implemented stages are sem, set-object, and full-add",
+            file=sys.stderr)
+      sys.exit(2)
+    if ("KEPLER_TEST_SEM_ONLY" in os.environ or
+        "KEPLER_TEST_SET_OBJECT" in os.environ):
+      print("hardware launch refused: legacy test-stage variables are disabled; "
+            "use KEPLER_TEST_STAGE", file=sys.stderr)
       sys.exit(2)
     try: cubin = get_kepler_cubin()
     except (RuntimeError, ValueError, KeyError, struct.error) as e:

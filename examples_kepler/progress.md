@@ -2414,3 +2414,182 @@ aborts that escalate to a host panic.
   software demo, and `git diff --check`.
 - A future test must be exactly one default full-add invocation.  Do not enable
   unsafe post-launch diagnostics and do not issue a follow-up probe.
+
+## Session 2026-07-14 — P0 completion-abort isolation patch
+
+### Source reconciliation
+
+- The post-launch trap sweep, trap W1C writes, `FE_PWR=AUTO`, and `0x260=1`
+  remain available only behind the explicitly dangerous
+  `KEPLER_UNSAFE_POSTLAUNCH_DIAGNOSTICS=1` mode.  The normal `full-add` path
+  performs none of them.
+- After the completion semaphore, normal `full-add` now arms an exact RPC
+  budget for one `MMIO_READ` of BAR1 at the output range.  Any BAR0 read/write,
+  config request, reset, mapping request, wrong BAR1 range, retry, or second
+  protocol frame raises in Python before `sendall()`.
+- The transport freezes immediately after the successful output read.  Output
+  validation, helper stop, optional hold-open sleep, and client close are local
+  operations and cannot emit another endpoint request.
+
+### Transport and lifecycle enforcement
+
+- `_rpc()` records unbuffered `BEGIN` and `END` lines through an already-open
+  `os.write()` file descriptor.  Records include sequence, monotonic timestamp,
+  phase, thread ID, command name and ID, BAR, offset, size, config offset,
+  payload length/hash, result, byte count, exception, and duration.
+- `KEPLER_SINGLE_THREAD_RPC=1` is mandatory for hardware launch.  `_rpc()`
+  asserts the owner thread, and both FECS helper threads are disabled in this
+  mode.  The main semaphore loop performs the FE power keepalive until the
+  semaphore completes.
+- High-level phases now include `connect`, `map-bars`, `vbios-devinit`,
+  `firmware-load`, `channel-build`, `golden-context`, `runlist-submit`,
+  `semaphore-poll`, `output-read`, `host-helper-stop`, `hold-open`, and
+  `client-close`.
+- `KEPLER_HOLD_OPEN_SECONDS` freezes the transport, retains the Python process,
+  socket, mappings, page tables, RAMIN, USERD, GPFIFO, and allocations, and
+  sleeps without endpoint RPCs before client-only close.
+- The client no longer auto-starts TinyGPU.  Exactly one external shared server
+  must already own `/tmp/tinygpu.sock`; the script never launches or terminates
+  it.  No TinyGPU server or socket was present during this offline patch, so a
+  live run is currently forbidden by the test plan.
+
+### Deterministic launch selection
+
+- `KEPLER_SUBMIT_MODE` accepts `gpfifo`, `bypass`, or `dispatch`.  The normal
+  `gpfifo` mode cannot automatically fall through to either experimental path.
+  BYPASS stops if `SET_OBJECT` does not bind instead of injecting DISPATCH.
+- `KEPLER_TEST_STAGE` currently implements `sem`, `set-object`, and `full-add`.
+  Legacy `KEPLER_TEST_SEM_ONLY` and `KEPLER_TEST_SET_OBJECT` variables are
+  rejected.  Constant-store and reduced-width add stages remain P1 work and
+  are rejected before hardware initialization rather than silently mapped to
+  a different test.
+- Hardware launch also refuses `DEBUG != 0` or a missing `KEPLER_RPC_TRACE`.
+
+### Offline enforcement and remaining external work
+
+- `--middle-selftest` uses a fake TinyGPU socket to prove that a non-owner
+  thread emits no frame, the final budget permits exactly one bulk BAR1 read,
+  BAR0/config/reset/extra frames are rejected, freeze permits zero frames, and
+  socket close is local-only.  It also verifies matching flight-recorder
+  `BEGIN`/`END` and `FREEZE` records.
+- Dormant `_disable_pci_bus_master()`, `_reset_pci_function_for_close()`, and
+  `_shutdown_kepler_pci_for_close()` helpers were removed from the live script
+  to prevent accidental reintroduction into close.
+- Matching server-side DriverKit flight recording is not implemented here:
+  the TinyGPU server source is not present in this repository.  That must be
+  patched and rebuilt in its owning repository before server-side attribution
+  is available.
+- No live GPU command, probe, reset, or TinyGPU process was started during this
+  session.
+
+## Session 2026-07-14 — first corrected live run panicked during channel-build
+
+### Exact run
+
+- After replugging the enclosure, one invocation was run with
+  `KEPLER_LIVE_ACK=completion-abort-risk`, `KEPLER_SUBMIT_MODE=gpfifo`,
+  `KEPLER_TEST_STAGE=full-add`, `KEPLER_SINGLE_THREAD_RPC=1`,
+  `KEPLER_HOLD_OPEN_SECONDS=120`, `DEBUG=0`, and a persistent RPC trace.
+- The client connected to the shared `/tmp/tinygpu.sock` server.  This was the
+  first corrected run after fixing `_temp_sock()` to use the literal `/tmp`
+  path; the earlier failed attempt never connected to hardware.
+- Source commit: `eec69db1d7e887bdb79dbf936159f02bc7e8d126`.
+- `examples_kepler/add.py` SHA-256:
+  `61acbb9f0a4f77d437b73527ae8d19f86fae3ad3fd3a53c3f9e19fcfa79a4a8a8`.
+- Program log: `logs/add-20260714-124500.log`.
+- Client trace: `logs/rpc-20260714-124500.log` (577,654,916 bytes).
+- Panic report: `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-124607.0002.panic`.
+
+### Result and plan comparison
+
+- macOS panicked with the same AppleT8103PCIeC `0x200000` Completion Abort.
+  The panic report contains Python PID 5626, TinyGPU PID 5445, and the
+  `org.tinygrad.tinygpu.driver2` processes.
+- The run did **not** reach the post-completion path that P0 was intended to
+  isolate.  The program log stops after GR context/pagepool/bundle raw-zero
+  stores.  The final trace phase is `channel-build`; it contains no
+  `runlist-submit`, `semaphore-poll`, `output-read`, `FREEZE`, or hold-open
+  phase.
+- The trace has no unmatched `BEGIN`: the last recorded RPC completed before
+  the delayed panic.  It ended with roughly 1,006,000 BAR0 RPCs in
+  `channel-build`, followed by about 50 seconds before the 12:46:07 panic.
+  This points to autonomous GPU/DriverKit activity or a delayed PCIe fault
+  from channel construction, not a post-output close RPC.
+- Therefore the run followed the §13 command envelope and the transport
+  prerequisites, but it did not validate §8 Stage E or the P0 output-freeze
+  boundary.  The next step must be the controlled ladder in §8, beginning with
+  a fresh power-cycle and a smaller Stage B/C channel-free or semaphore-only
+  invocation; do not repeat full-add merely because the process stopped.
+
+## Session 2026-07-14 — semaphore-only Stage C survived hold and close
+
+- After another physical replug, the shared server was restarted on
+  `/tmp/tinygpu.sock` and exactly one `KEPLER_TEST_STAGE=sem` invocation was
+  run with `DEBUG=0`, `KEPLER_SUBMIT_MODE=gpfifo`, single-thread RPC, and a
+  120-second hold.
+- The run reached `hardware_sem=ok value=2`, froze the transport, stopped the
+  host helper, held all mappings alive for 120 seconds with zero endpoint RPCs,
+  and closed the client socket cleanly with exit status 0.
+- Trace phase order was `channel-build` → `golden-context` →
+  `runlist-submit` → `semaphore-poll` → `FREEZE sem-complete` →
+  `host-helper-stop` → `hold-open` → `client-close`.
+- No new panic report appeared.  This is a successful §8 Stage C result and
+  demonstrates that the post-semaphore freeze/hold/client-close boundary is
+  stable for the semaphore-only path.
+- Program log: `logs/add-20260714-125311-sem.log`.
+- Client trace: `logs/rpc-20260714-125311-sem.log` (779,959,159 bytes).
+- The trace is very large because the current channel/golden-context setup
+  emits roughly 1.4 million BAR0 frames before the semaphore.  This is within
+  the pre-completion scope of the plan, but should be reduced or sampled before
+  repeated live testing.
+
+## Session 2026-07-14 — SET_OBJECT stage panicked in channel-build
+
+- After another physical replug, exactly one `KEPLER_TEST_STAGE=set-object`
+  invocation was run with the shared `/tmp/tinygpu.sock` server,
+  `KEPLER_SUBMIT_MODE=gpfifo`, `KEPLER_SINGLE_THREAD_RPC=1`,
+  `KEPLER_HOLD_OPEN_SECONDS=120`, and `DEBUG=0`.
+- macOS panicked again with Completion Abort `0x200000` at 13:24:40.
+  Panic report: `/Library/Logs/DiagnosticReports/panic-full-2026-07-14-132440.0002.panic`.
+  Python PID was 3023 and TinyGPU PID was 3014.
+- The program stopped during the same GR buffer/channel construction area;
+  it never reached SET_OBJECT submission, semaphore completion, freeze, or
+  hold-open.  Program log: `logs/add-20260714-132301-set-object.log`.
+- This run demonstrates the flight recorder's intended failure boundary.  The
+  final unmatched request is:
+
+  `BEGIN seq=902015 phase=channel-build cmd=MMIO_WRITE bar=0 offset=8088260 size=4`
+
+  There is no matching `END`, so this BAR0 write is the operation that was in
+  flight when the controller panic occurred.  Client trace:
+  `logs/rpc-20260714-132301-set-object.log`.
+- Therefore the controlled invocation procedure was followed, but the system
+  is not yet safe for another live run.  The repeated fault is pre-semaphore
+  channel construction, not the post-completion lifecycle.  Stop live testing
+  and isolate or remove the GR/channel-build BAR0 write sequence before any
+  further replugged invocation.
+
+### Exact PRAMIN mapping for the SET_OBJECT-stage panic
+
+- BAR0 offset `0x7b6ac4` is not a standalone register literal.  It is the
+  `0x700000 + (pa & 0xfffff)` aperture used by `_gk104_pramin_write_literal()`;
+  the preceding request writes the PRAMIN window selector at `0x1700`.
+- The contiguous aperture-write run begins at `0x70d000`, which is the start
+  of the VRAM-backed attrib allocation (`pa=0x50d000`).  The unmatched request
+  is therefore attrib dword `0xa9ac4`, physical address `0x5b6ac4`, payload
+  `0xffffffff`, during `repair_zero("attrib", ...)`.
+- The process log ends immediately after the GR-context, pagepool, and bundle
+  zero repairs; it never prints attrib completion.  `SET_OBJECT` was not
+  reached.  The next code work should label and isolate this attrib PRAMIN
+  zeroing sequence (or replace it with a bounded alternative) offline before
+  another hardware invocation.
+
+### Offline isolation patch
+
+- `add.py` now labels each `repair_zero()` operation in the RPC phase field and
+  accepts the explicit `KEPLER_ATTRIB_REPAIR=bar1` experiment.  The default
+  remains `literal`; the opt-in mode bypasses only the attrib buffer's
+  per-dword BAR0 PRAMIN stream and uses the existing page-bounded BAR1 writer.
+- `py_compile`, `--middle-selftest`, the software backend demo, and scoped
+  `git diff --check` pass.  No live invocation has been started after this
+  patch.
