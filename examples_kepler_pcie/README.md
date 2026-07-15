@@ -39,6 +39,28 @@ first 5: 0 3 6 9 12
 PASS
 ```
 
+### GTX 770 health check
+
+After binding `09:00.0` to Nouveau, run the Kepler-specific wrapper from this
+directory:
+
+```sh
+./opencl_add_health.sh
+```
+
+Expected device/output on this box:
+
+```
+device: NVE4
+first 5: 0 3 6 9 12
+PASS
+```
+
+The wrapper requires the GTX 770 to be bound to Nouveau and restricts OpenCL
+to Rusticl.  It also puts Ubuntu's ICD loader before CUDA 12.6's bundled
+`libOpenCL.so.1`; the CUDA copy returns `CL_PLATFORM_NOT_FOUND_KHR` when used
+with the Rusticl-only ICD on this installation.
+
 The `pci id for fd ... driver (null)` lines are Mesa's rusticl ICD probing the
 fd before the NVIDIA ICD wins device selection — cosmetic, not an error.
 
