@@ -1,0 +1,40 @@
+=== OpenCL add ioctl summary ===
+Total ioctls: 590
+
+=== ioctl type distribution ===
+    170 type=46 nr=2a dir=_IOC_READ|_IOC_WRITE
+     99 type=46 nr=2b dir=_IOC_READ|_IOC_WRITE
+     93 type=46 nr=29 dir=_IOC_READ|_IOC_WRITE
+     25 type=46 nr=4e dir=_IOC_READ|_IOC_WRITE
+     23 type=46 nr=4f dir=_IOC_READ|_IOC_WRITE
+     16 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x1c, 0), 0x7fffe209f9e0) = 0
+     16 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x1b, 0), 0x7fffe209eef0) = 0
+     10 type=46 nr=c9 dir=_IOC_READ|_IOC_WRITE
+      8 type=46 nr=ce dir=_IOC_READ|_IOC_WRITE
+      7 type=46 nr=cf dir=_IOC_READ|_IOC_WRITE
+      7 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x18, 0), 0x7fffe209faa0) = 0
+      7 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x17, 0), 0x7fffe209f040) = 0
+      6 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x22, 0), 0x7fffe209f4f0) = 0
+      6 4182  ioctl(12, DRM_IOCTL_VERSION, 0x5f53f3f655c0) = 0
+      4 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x22, 0), 0x7fffe209f4d0) = 0
+      4 4182  ioctl(12, DRM_IOCTL_VERSION, 0x5f53f3f65030) = 0
+      3 type=46 nr=27 dir=_IOC_READ|_IOC_WRITE
+      3 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x22, 0), 0x7fffe209f4c0) = 0
+      2 type=46 nr=d6 dir=_IOC_READ|_IOC_WRITE
+      2 type=46 nr=c8 dir=_IOC_READ|_IOC_WRITE
+
+=== NVIDIA driver ioctl sequence (type 0x46) ===
+    170   0x46:0x2a
+     99   0x46:0x2b
+     93   0x46:0x29
+     25   0x46:0x4e
+     23   0x46:0x4f
+     10   0x46:0xc9
+      8   0x46:0xce
+      7   0x46:0xcf
+      3   0x46:0x27
+      2   0x46:0xd6
+      2   0x46:0xc8
+      1 4182  ioctl(6, _IOC(_IOC_NONE, 0, 0x46, 0), 0x7fffe209f6b0) = 0
+      1   0x46:0xd7
+      1   0x46:0x5e

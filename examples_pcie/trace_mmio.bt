@@ -1,0 +1,8 @@
+#!/usr/bin/env bpftrace
+// Trace all MMIO writes via iowrite32. Filter to nouveau in post-processing.
+// The BAR0 mapping is a contiguous 16MB region — we identify it by clustering.
+
+kprobe:iowrite32
+{
+  printf("W %lx %x\n", arg1, arg0);
+}
