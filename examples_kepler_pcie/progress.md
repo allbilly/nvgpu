@@ -680,3 +680,46 @@ causes issues (though the interrupt-masking fix helps).
 - Added quiet live-mode output filtering: the normal hardware command keeps
   only the output summary and `hardware_demo=ok`; the register/firmware trace
   remains available through the existing debug path.
+
+## 2026-07-15 — restore post-filter-repo cleanup
+
+- Reapplied the standalone layout: `examples_kepler_pcie/add.py` now contains
+  the complete shared Linux implementation (8,180 lines); the macOS entrypoint
+  is a 377-line wrapper with the TinyGPU transport embedded directly and imports
+  the shared implementation with `from examples_kepler_pcie import add as shared`.
+- Restored the transport-factory hook so the wrapper can inject its TinyGPU
+  socket device without a second copy of the RM/GMMU/launch implementation.
+- Restored local CUDA 10.2 PTX assembly for both operations, byte comparison
+  against the add reference and the verified multiply digest, plus operation-
+  aware hardware expectations. `mul.py` now assembles and launches through the
+  shared implementation instead of requiring a precompiled cubin.
+- Verification step 1: all three files compile with `python3 -m py_compile`.
+- Verification step 2: Linux and macOS `--middle-selftest` both pass.
+- Verification step 3: Linux and macOS `NV_BACKEND=software` demos pass
+  (`software_demo=ok N=256`); the standalone multiply CPU smoke test passes.
+- Verification step 4: add and mul assembly both report
+  `cubin_compare=byte-identical` (1,768 bytes); mul SHA-256 is
+  `edde9272ed2b6e5a98c47cd52c18cfdfec40670af77383ab14d59762bb77fbd8`.
+- Final layout check: `examples_kepler_pcie/add.py` is 8,196 lines and
+  `examples_kepler/add.py` is 389 lines, matching the recovered cleanup target.
+- Final repeat after the documentation/count adjustment: py_compile, both
+  middle self-tests, the software demo, both cubin comparisons, and
+  `git diff --check` all pass.
+- Wrapper smoke step: macOS add `--compare-cubin` reports byte-identical for
+  both add and mul, and the standalone multiply CPU smoke test reports
+  `software_mul=ok N=256`.
+- Tightened the cubin gate: an available assembler that produces bytes differing
+  from either reference now fails closed; only an unavailable assembler permits
+  the checked-in add fallback (mul still requires local CUDA 10.2 ptxas).
+- Post-gate regression check passes again: line counts remain 8,196/389,
+  add and mul byte comparisons are identical, both self-tests/software paths
+  pass, the mul smoke test passes, and `git diff --check` is clean.
+
+## 2026-07-15 — MMIO trace availability
+
+- Checked the working tree, Git refs, and unreachable Git objects for the
+  historical `nouveau_gk104_mmiotrace.txt` capture and compressed variants.
+  No copy is present or recoverable; only source-code/progress references
+  remain. A fresh Nouveau MMIO capture must therefore be made and compressed
+  (for example, `gzip -9 nouveau_gk104_mmiotrace.txt`).
+
