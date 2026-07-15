@@ -32,6 +32,19 @@ The only external dependencies this module has are:
 
 NO imports from tinygrad.runtime.support / ops / device / renderer / uop / helpers
 are permitted on the live path — those have been vendored inline below.
+
+`python3 examples_kepler_pcie/add.py --middle-selftest` exercises the offline
+builders without touching the card.  `NV_BACKEND=software` runs the complete
+allocator and launch-word path against host memory.  A normal live invocation
+selects the unbound GK104 from sysfs, requests sudo when necessary, assembles
+the checked-in PTX with CUDA 10.2 ptxas, and only then opens BAR0/BAR1.
+`KEPLER_OPERATION=mul` selects the multiply image and expected vector result;
+The macOS TinyGPU wrapper imports this module and swaps only the PCI transport;
+Linux and macOS therefore use identical RM sequencing, firmware loading, GMMU
+tables, FIFO setup, semaphore completion, and validation.
+DEBUG=1 enables the detailed register trace; normal launches keep only summary
+lines so a successful health check is easy to spot in logs.
+Progress and crash-safety notes live beside this file in `progress.md`.
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, math, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib, json, threading, io
@@ -48,6 +61,19 @@ for _path in (TINYGRAD_ROOT, SHARED_KEPLER_DIR):
   if _path not in sys.path: sys.path.insert(0, _path)
 DEFAULT_VBIOS = os.path.join(SHARED_KEPLER_DIR, "Palit.GTX770.4096.131216.rom")
 DEFAULT_CUBIN = os.path.join(SHARED_KEPLER_DIR, "add_kepler.cubin")
+# Reference produced by CUDA 10.2 `ptxas -arch=sm_30` for the multiply
+# variant assembled from the checked-in Kepler PTX.  Keep this independent of
+# the add cubin so a stale/precompiled add image cannot silently run a mul test.
+MUL_CUBIN_BYTES = 1768
+MUL_CUBIN_SHA256 = "edde9272ed2b6e5a98c47cd52c18cfdfec40670af77383ab14d59762bb77fbd8"
+
+# The Linux implementation owns the RM/GMMU/launch code, while the macOS
+# wrapper supplies a TinyGPU socket transport.  This small hook avoids
+# duplicating the 8k-line implementation in the platform wrapper.
+_PCI_TRANSPORT_FACTORY = None
+def set_pci_transport_factory(factory):
+  global _PCI_TRANSPORT_FACTORY
+  _PCI_TRANSPORT_FACTORY = factory
 
 # --- autogen ctypes (allowed: "ctypes constants only") ---
 from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
@@ -866,7 +892,9 @@ KEPLER_DMA_COPY_A       = 0xa0b5
 class PCIIface(PCIIfaceBase):
   def __init__(self, dev, dev_id, software=False):
     self.dev = dev
-    self.pci_dev = SoftwarePCIDevice(dev_id) if software else LinuxPCIDevice(dev_id=dev_id)
+    self.pci_dev = (SoftwarePCIDevice(dev_id) if software else
+                    (_PCI_TRANSPORT_FACTORY(dev_id=dev_id) if _PCI_TRANSPORT_FACTORY
+                     else LinuxPCIDevice(dev_id=dev_id)))
     PCIIfaceBase.__init__(self, dev, 1, 0x1000, 1 << 40, NVDev)
     # On Kepler there is NO gsp; these classes come from the GR engine directly
     # (confirmed class IDs above — see nvif/class.h).
@@ -2106,6 +2134,33 @@ extern "C" __global__ void E_4(const float* a, const float* b, float* out) {
 }
 """
 
+def assemble_kepler_cubin(operation="add"):
+  """Assemble the checked-in sm_30 PTX locally and return its cubin bytes.
+
+  CUDA 10.2 is required for Kepler; newer toolkits intentionally reject sm_30.
+  The source is tiny and is transformed for mul before invoking ptxas, so no
+  precompiled operation-specific image is needed.
+  """
+  if operation not in ("add", "mul"):
+    raise ValueError(f"unsupported Kepler operation: {operation}")
+  ptx_path = os.path.join(SHARED_KEPLER_DIR, "add_kepler.ptx")
+  with open(ptx_path, "r", encoding="utf-8") as f:
+    ptx = f.read()
+  if operation == "mul":
+    ptx = ptx.replace("add.f32", "mul.f32")
+  candidates = [os.environ.get("KEPLER_PTXAS"),
+                "/usr/local/cuda-10.2/bin/ptxas",
+                "/tmp/cuda102-nvcc/usr/local/cuda-10.2/bin/ptxas"]
+  ptxas = next((p for p in candidates if p and os.path.exists(p)), None)
+  if ptxas is None:
+    raise RuntimeError("CUDA 10.2 ptxas not found (set KEPLER_PTXAS)")
+  with tempfile.TemporaryDirectory(prefix="kepler_ptxas_") as d:
+    src, out = os.path.join(d, f"{operation}.ptx"), os.path.join(d, f"{operation}.cubin")
+    with open(src, "w", encoding="utf-8") as f: f.write(ptx)
+    subprocess.run([ptxas, "-arch=sm_30", src, "-o", out],
+                   check=True, capture_output=True, timeout=60)
+    with open(out, "rb") as f: return f.read()
+
 def compile_kepler_cubin_docker(tag="nvidia/cuda:11.0.3-devel-ubuntu20.04"):
   """Compile a genuine sm_30 cubin with the locally cached CUDA 11.0 image."""
   try:
@@ -2124,10 +2179,29 @@ def compile_kepler_cubin_docker(tag="nvidia/cuda:11.0.3-devel-ubuntu20.04"):
     return None
 
 def get_kepler_cubin():
+  operation = os.environ.get("KEPLER_OPERATION", "add")
   path = os.environ.get("KEPLER_CUBIN")
-  # The repository carries the verified nvcc-built sm_30 image used by this
-  # example.  Prefer it so `python3 examples_kepler/add.py` is self-contained;
-  # Docker remains a fallback for source-only checkouts.
+  # Assemble from PTX first.  This makes the normal path self-contained and
+  # verifies that the local assembler reproduces the checked-in add image (or
+  # the known-good mul digest) before any MMIO launch.
+  if not path:
+    assembled = None
+    try:
+      assembled = assemble_kepler_cubin(operation)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+      pass
+    if assembled is not None:
+      if operation == "add":
+        with open(DEFAULT_CUBIN, "rb") as f: expected = f.read()
+        if assembled != expected:
+          raise RuntimeError("local sm_30 add cubin differs from checked-in reference")
+      elif (len(assembled) != MUL_CUBIN_BYTES or
+            hashlib.sha256(assembled).hexdigest() != MUL_CUBIN_SHA256):
+        raise RuntimeError("local sm_30 mul cubin differs from verified reference")
+      return assembled
+    if operation == "mul":
+      raise RuntimeError("live mul requires CUDA 10.2 ptxas (set KEPLER_PTXAS)")
+  # Explicit cubins are accepted for bring-up, then validated as sm_30 ELF.
   bundled = DEFAULT_CUBIN
   if not path and os.path.exists(bundled): path = bundled
   if not path or not os.path.exists(path): path = compile_kepler_cubin_docker()
@@ -3269,7 +3343,9 @@ def run_software_demo(dev):
   allocator._copyout(out_host, out_dev)
   out_arr = array.array('f'); out_arr.frombytes(bytes(out_host))
 
-  expected = [a_host[i] + b_host[i] for i in range(N)]
+  operation = os.environ.get("KEPLER_OPERATION", "add")
+  expected = ([a_host[i] * b_host[i] for i in range(N)] if operation == "mul"
+              else [a_host[i] + b_host[i] for i in range(N)])
   assert all(abs(out_arr[i] - expected[i]) < 1e-5 for i in range(N)), "software add mismatch"
   print(f"software_demo=ok N={N} launch_words={len(words)} cwd_bytes={len(cwd)}")
 
@@ -7910,7 +7986,7 @@ def run_hardware_demo(dev, cubin=None):
     print(f"[kepler] raw a_host hex: {a_host.tobytes()[:32].hex()}", flush=True)
     print(f"[kepler] raw b_host hex: {b_host.tobytes()[:32].hex()}", flush=True)
   _freeze_stop_and_hold(dev, "output-read-complete")
-  assert _mismatches == 0, f"hardware add mismatch ({_mismatches}/{N} wrong)"
+  assert _mismatches == 0, f"hardware {operation} mismatch ({_mismatches}/{N} wrong)"
   print(f"hardware_demo=ok N={N}")
 
 def main():
@@ -7919,6 +7995,24 @@ def main():
   os.environ.setdefault("KEPLER_FIFO_RESET", "1")
   if "--middle-selftest" in sys.argv:
     kepler_selftest()
+    return
+  if "--compare-cubin" in sys.argv:
+    operation = os.environ.get("KEPLER_OPERATION", "add")
+    try:
+      assembled = assemble_kepler_cubin(operation)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+      print(f"cubin_compare=assembler-unavailable operation={operation} reason={e}")
+      return
+    if operation == "add":
+      with open(DEFAULT_CUBIN, "rb") as f: expected = f.read()
+      same = assembled == expected
+      ref_bytes = len(expected)
+    else:
+      same = (len(assembled) == MUL_CUBIN_BYTES and
+              hashlib.sha256(assembled).hexdigest() == MUL_CUBIN_SHA256)
+      ref_bytes = MUL_CUBIN_BYTES
+    print(f"cubin_compare={'byte-identical' if same else 'mismatch'} "
+          f"operation={operation} assembled_bytes={len(assembled)} reference_bytes={ref_bytes}")
     return
   if "--vbios-info" in sys.argv:
     i = sys.argv.index("--vbios-info")
@@ -7947,7 +8041,8 @@ def main():
   backend = os.environ.get("NV_BACKEND", "kepler")
   needs_hardware = backend != "software" and (bool(live_probe_flags.intersection(sys.argv)) or
                                                 "--middle-selftest" not in sys.argv)
-  if needs_hardware and hasattr(os, "geteuid") and os.geteuid() != 0:
+  if (needs_hardware and os.environ.get("KEPLER_NO_AUTO_SUDO") != "1" and
+      hasattr(os, "geteuid") and os.geteuid() != 0):
     # Raw sysfs BAR mmap normally requires root.  Re-exec the exact interpreter
     # so `python3 file.py` is the only command the user has to remember.
     print("[kepler] raw PCIe access needs privilege; requesting sudo...", flush=True)
