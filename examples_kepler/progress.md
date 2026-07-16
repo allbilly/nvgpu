@@ -2596,10 +2596,10 @@ aborts that escalate to a host panic.
 
 ## Session 2026-07-16 — cold GDDR5 / PRAMIN / `KEPLER_N=8`
 
-Operator notes also live in `examples_kepler/reset_egpu.md` (night–night16).
+Operator notes also live in `examples_kepler/reset_egpu.md` (night–night17).
 Goal this arc: cold bring-up far enough for `hardware_demo=ok N=8`.
-**Not yet achieved** — furthest point: **FECS ready** on true cold; PRAMIN
-still blocked (host `0x1700` hostile; PMU wedged for MEMX-PRAMIN).
+**Not yet achieved** — furthest point: **FECS ready + deferred bit0 + enabled
+BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.
 
 ### Proven on silicon
 
@@ -2610,28 +2610,111 @@ still blocked (host `0x1700` hostile; PMU wedged for MEMX-PRAMIN).
 - **all-MEMX** reaches `MEMX WR32 totals: 78 execs, 210 words`.
 - **Defer bit0** until after PGRAPH/FECS (`KEPLER_RAM_BIT0_DEFER=1`): full
   PGRAPH pack + **FECS IMEM match + FECS ready** (`FE_PWR=0x2`,
-  `gpc=4 tpc=[2,2,2,2]`) on true cold (night13–16).
+  `gpc=4 tpc=[2,2,2,2]`) on true cold (night13–17).
 - **After deferred bit0, host `0x1700` alone kills BAR0** (night14) — cannot
   use host PRAMIN window setup.  **MEMX WR32** is the intended PRAMIN path
   (`KEPLER_PRAMIN_MEMX=1`), assuming virgin XOR (`0xffffffff ^ wanted`).
-- **After FECS path, PMU MEMX is often wedged** (`0x10a580=0xffffffff` on
-  acquire, nights15–16).  Night16 proved an internal Falcon CPUCTL reset cannot
-  recover an inaccessible PMU aperture.  Local Nouveau's GK104 path instead
-  pulses PMU MC reset through `PMC_ENABLE[13]` (`0x2000`); the recovery helper
-  now does that, waits for `0x10a10c[2:1]` scrub completion, reloads firmware,
-  and rediscovers MEMX.  This fix is offline-tested but not yet cold-validated.
+- **After deferred bit0, PMU host MMIO is inaccessible**, not merely wedged:
+  night17 read `PMC_ENABLE`, `0x10a10c`, and the PMU ring as `0xffffffff`.
+  The correct Nouveau MC-level PMU reset through `PMC_ENABLE[13]` did not
+  restore `0x10a10c`.  Therefore all required roots must be staged before the
+  bit0 crossing.
+- **Night18 disproved post-bit0 work inside that same script:** the queued
+  order was `0x1700`, bit0, then PRAMIN roots.  FECS was ready, but the first
+  post-transition Falcon `nv_wr32(0x700000...)` collapsed all BAR0
+  (`PMC_BOOT_0=0xffffffff`).  Local `ref/linux_drm/.../pmu/fuc/memx.fuc`
+  confirms WR32 pairs execute serially; the PMU cannot service a following
+  MMIO store once bit0 has hidden its aperture.
+- **Night19 validated pre-staging:** the `0x5c` root script returned normally,
+  host bit0 kept `PMC_BOOT_0=0x0e4040a2`, and PMU was no longer needed.  The
+  next failure was our own ordering error: `0x070000` BAR flush was issued
+  while `0x1704` was still disabled and its status reads became 43-ms
+  timeouts.  Local Nouveau orders `gf100_bar_bar1_init()` (enable `0x1704`)
+  before `gf100_bar_bar1_wait()` (two flushes); the atomic branch now matches
+  that order and removes its unnecessary first-activation VMM invalidate.
+- **Night20 proved the whole `0x070000` block is post-bit0-inaccessible:**
+  `0x1704` enable completed in 9 us, but the immediately following BAR flush
+  again produced 43-ms status reads and timed out.  The new `0xa4` pre-bit0
+  MEMX script now stages roots, enables `0x1704`, and performs both BAR
+  flush/wait cycles before the host bit0 clear.  After the crossing, the
+  TinyGPU-only path uses exact BAR1 readback as its posting barrier and never
+  touches `0x070000/0x070010/0x070004`; shared/Linux behavior is unchanged.
+- **Night21 reached the first real BAR1 read:** the complete `0xa4` pre-bit0
+  roots+enable+flush script returned, bit0 kept BAR0 live, and BAR1 returned
+  structured walk-failure sentinels (`0xbad0fb03`, `...12`, `...13`, `...14`)
+  instead of the two control PTEs.
+- **Night22 eliminated PRAMIN encoding as the variable:** it staged two
+  complete trees in separate bit19-safe banks—literal at
+  `0x200000/0x210000/0x220000` and virgin-XOR at
+  `0x100000/0x110000/0x120000`—and pre-enabled/flushed both.  Literal returned
+  the same `0xbad0fbxx` walk-failure sentinel; switching `0x1704` to XOR
+  returned all ones.  Because night21 already tested XOR while active and got
+  the sentinel, neither encoding populated physical VRAM.  Pre-bit0 PRAMIN is
+  therefore an acknowledging stub, not a usable storage path.
+- **Patched for night23:** use the PMU Falcon's documented external transfer
+  engine instead of PRAMIN.  MEMIF port 0 is set to direct VRAM (`TYPE=4`);
+  the 40 root bytes are DMA-stored and independently DMA-loaded into a second
+  DMEM scratch area for exact comparison.  Only after all comparisons pass do
+  we enable/flush BAR1 pre-bit0 and perform the proven host bit0-only clear.
+  `ref/cmpunlocker` confirms a fixed/aligned Falcon DMA target pattern but
+  delegates transfer setup to GSP booter; the actual GK104 sequence comes from
+  local `ref/envytools/docs/hw/falcon/xfer.rst` and `rnndb/falcon.xml`.
+- **Night23 true-cold reached the first PMU DMA request:** FECS was ready and
+  topology was again 4×2.  The store command was accepted (`CTRL=0x220`) but
+  stayed at `STATUS=0x10012`—data transfer busy with exactly one store pending.
+  This is an activation stall, not a rejected command or bad address.
+  **Patched for night24:** set documented MEMIF.CTRL `ENABLE` (bit4) and
+  `IGNORE_ACTIVATION` (bit7) before selecting port0 direct VRAM.  Nouveau also
+  sets `IGNORE_ACTIVATION` before host-originated Falcon DMA on supported
+  engines.  Readback of both control bits is mandatory, and the timeout is
+  reduced from 500 ms/~25k reads to 50 ms with 500-us polling.
+- **Night24 activated PMU MEMIF successfully:** control read back
+  `0x110→0x190`, port0 read back `0x110→0x114`, and both the first DMA store
+  and load completed.  Loadback was sixteen `ff` bytes, proving the engine and
+  target selection work but pre-bit0 physical VRAM discards stores just like
+  PRAMIN.  Bit0 was not crossed.
+- **Patched for night25:** use the already-running FECS transfer engine after
+  bit0.  GK104 `hub.fuc` reserves DMEM `xfer_data` at `0x200..0x2ff` and uses
+  `MEM_BASE`/`MEM_TARGET=VRAM` plus Falcon transfers for physical channel
+  headers.  Before bit0, the three roots are placed in this reserved buffer
+  and FECS physical target registers are read back.  After bit0 makes VRAM
+  real, FECS store→loads all 40 bytes for exact comparison, then BAR1 is
+  enabled and its first page walk validates the roots.  No channel exists yet,
+  so the firmware cannot concurrently consume `xfer_data`.
 - Also avoid: early LTC/ZBC after RAM; BLCG `0x4041f0`; PRAMIN literal `0`
   fallback; dirty GPC-awake+PRAMIN-stub without `ALLOW_DIRTY`.
 - **VRAM bit19 alias**: `KEPLER_VRAM_BIT19_SAFE=1`.
 
-### Furthest live cold (night13–16)
+### Furthest live cold (night13–17)
 
 1. all-MEMX 78/210 → bit0 deferred → skip LTC/BLCG
 2. full PGRAPH pack OK → **FECS ready** (topology 4×2)
 3. deferred bit0 OK (`PMC_BOOT_0` live)
-4. **Blocker:** PRAMIN — host `0x1700` fatal (night14); internal-CPUCTL PMU
-   reload did not restore MEMX (night16).  MC-level PMU reset is patched and
-   awaits the next true-cold run.
+4. **Blocker:** PRAMIN/BAR1 bootstrap — host `0x1700` is fatal and neither
+   internal nor MC-level PMU reset restores host PMU MMIO after bit0.
+5. Night18 `0x1700` + bit0 + roots ordering killed BAR0 before BAR1 enable.
+6. **Patched for night19:** stage only the 10 required root dwords
+   (instance `+0x200/+0x208`, PDE, two PTEs) in a `0x5c` MEMX script and wait
+   for its reply while PMU is live; only then do the proven host bit0 clear.
+   Expand the 16-MiB identity SPT through verified BAR1.
+7. Night19 proved step 6 through the bit0 crossing; failed at a pre-enable BAR
+   flush.  **Patched for night20:** enable `0x1704` first, then flush twice,
+   matching Nouveau exactly.
+8. Night20 enabled `0x1704`, but post-bit0 `0x070000` still timed out.
+   **Patched for night21:** do roots + enable + both flush/waits in one
+   pre-bit0 `0xa4` MEMX script, then use BAR1 readback only after bit0.
+9. Night21 completed step 8; BAR1 walk returned `0xbad0fbxx` for the XOR tree.
+10. Night22 tested complete literal and XOR roots; neither produced a valid
+    walk.  **Patched for night23:** bypass PRAMIN with PMU direct-VRAM DMA,
+    require DMA store→load equality for all 40 root bytes, then enable/flush
+    BAR1 and cross bit0.
+11. Night23 accepted the first 16-byte DMA store but left it pending because
+    MEMIF was not activated.  **Patched for night24:** enable MEMIF and ignore
+    channel activation before the transfer; require exact control readback.
+12. Night24 completed PMU DMA but read back virgin all-ones: pre-bit0 VRAM is
+    a discard stub independent of aperture.  **Patched for night25:** stage in
+    FECS `xfer_data`, cross bit0, then FECS-DMA store/load roots while VRAM is
+    live, before enabling BAR1.
 
 ### Code defaults / guards (macOS live)
 
@@ -2640,6 +2723,7 @@ still blocked (host `0x1700` hostile; PMU wedged for MEMX-PRAMIN).
 | `KEPLER_RAM_BLOCK` | `bit0` | `[0]`-only clear |
 | `KEPLER_RAM_BIT0_DEFER` | `1` | PGRAPH/FECS before unstub |
 | `KEPLER_PRAMIN_MEMX` | `1` | MEMX WR32; host `0x1700` kills |
+| `KEPLER_TINYGPU_ATOMIC_BAR1` | `1` | macOS only; DMA-store/verify BAR1 roots before bit0 |
 | `KEPLER_PRAMIN_LITERAL` | `0` | XOR-only |
 | `KEPLER_BAR1_MAP_SIZE` | `0x1000000` | 16 MiB covers bit19 layout |
 | `KEPLER_POST_RAM_LTC` | `0` | Skip early LTC/ZBC |
@@ -2647,31 +2731,46 @@ still blocked (host `0x1700` hostile; PMU wedged for MEMX-PRAMIN).
 | `KEPLER_REFUSE_DIRTY` | `1` | Refuse half-POST |
 | `KEPLER_COLD_FLR` | `0` | FLR → residual topo=0 |
 
-Also: `_gk104_ensure_pmu_memx_ready()` now performs the GK104 MC-level PMU
-reset before MEMX-PRAMIN; `_gk104_require_bar0_live()` checkpoints.
+The atomic path is enabled only by `examples_kepler/add.py`; the shared/Linux
+entrypoint never defaults `KEPLER_TINYGPU_ATOMIC_BAR1`.  Once BAR1 identity is
+ready, post-bit0 PRAMIN reads/repairs use verified BAR1 dword access.
 
 Offline: `--middle-selftest` passes on macOS/software and
 `--mmiotrace-selftest` is **24/24**.
 
 ### Still missing for `hardware_demo=ok N=8`
 
-1. **MEMX-PRAMIN stores succeed** after PMU MC reset + reload (BAR0 stays live)
-2. BAR1 identity + channel RAMIN / GPFIFO (bit19-safe layout coded)
+1. PMU direct-VRAM DMA store/load verifies, then the two-page BAR1 bootstrap reads back
+2. Expand BAR1 identity + channel RAMIN / GPFIFO (bit19-safe layout coded)
 3. Launch + signal → `hardware_demo=ok N=8`
 4. Later: optional LTC/ZBC, fuller GDDR train
 
 ### Current hardware state / next step
 
-- Card left MMIO-hung after night16 — **enclosure power cycle**, then one
-  cold run (no probe, no FLR):
+- The first night23 invocation was safely refused before PMU DMA: boot was
+  already `GPC topology=0x40004` with PRAMIN/DMEM `badf` sentinels.  The trace
+  stops after 22 map/boot-state operations; bit0 was not crossed and no
+  probe/FLR/retry followed.  A cable replug did not remove auxiliary GPU power.
+- After a full power removal, night23b was genuinely cold and reached FECS
+  ready, then stopped on the first DMA store with `CTRL=0x220` and
+  `STATUS=0x10012`.  Bit0 was not crossed.  The card is now dirty from that
+  cold initialization and must be power-cycled again.
+- Night24 was also genuinely cold.  PMU DMA completed but confirmed that
+  pre-bit0 VRAM discards stores; bit0 was not crossed.  The card is dirty from
+  initialization and needs another full power cycle for the FECS experiment.
+- Fully power off the eGPU enclosure, wait for its PSU/GPU LEDs and fans to go
+  dark, then power it back on.  Start a fresh TinyGPU server and run exactly
+  one cold invocation (no probe, no FLR):
 
 ```bash
 /Applications/TinyGPU.app/Contents/MacOS/TinyGPU server \
-  "$PWD/logs/tinygpu-night17.sock" &
-APL_REMOTE_SOCK="$PWD/logs/tinygpu-night17.sock" \
-  KEPLER_LIVE_ACK=completion-abort-risk KEPLER_RPC_TRACE=logs/rpc-n8-night17.log \
+  "$PWD/logs/tinygpu-night25.sock" &
+APL_REMOTE_SOCK="$PWD/logs/tinygpu-night25.sock" \
+  KEPLER_LIVE_ACK=completion-abort-risk KEPLER_RPC_TRACE=logs/rpc-n8-night25.log \
   KEPLER_N=8 KEPLER_COLD_FLR=0 python3 -u examples_kepler/add.py
 ```
 
-Expect: … → FECS ready → deferred bit0 → **PMU MC reset + reload** →
-MEMX-PRAMIN → channel → `hardware_demo=ok N=8`.
+Expect: … → FECS ready → **roots staged in FECS xfer_data** → host bit0 →
+**FECS physical-VRAM DMA store/load verified (40 bytes)** → BAR1 enable →
+exact two-PTE readback → expanded/verified BAR1
+identity → channel → `hardware_demo=ok N=8`.

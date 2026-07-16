@@ -3666,6 +3666,150 @@ def kepler_selftest():
   assert [v for r, v in _pmu_reset_full.writes if r == PMC_ENABLE] == [
       0xffffdfff, 0xffffffff]
 
+  # Exercise the macOS-only crossing end-to-end against an XOR-like BAR1
+  # model.  The fake FECS implements its physical-VRAM MEM_BASE/TARGET path,
+  # requires the transfer to occur after bit0, and independently loads every
+  # stored root back before BAR1 is enabled.
+  class _AtomicBar1Hw:
+    def __init__(self, owner):
+      self.owner = owner
+    def _xlate(self, va, size):
+      o = self.owner
+      ctl = o.regs.get(0x1704, 0)
+      assert ctl & 0x80000000, f"BAR1 disabled for VA {va:#x}"
+      inst_pa = (ctl & 0x3fffffff) << 12
+      limit = struct.unpack_from("<Q", o.vram, inst_pa + 0x208)[0]
+      assert va + size - 1 <= limit, (va, size, limit)
+      pgd_pa = struct.unpack_from("<Q", o.vram, inst_pa + 0x200)[0] & ~0x7
+      assert 0 <= pgd_pa <= len(o.vram) - 8, pgd_pa
+      pde = struct.unpack_from("<Q", o.vram, pgd_pa)[0]
+      spt_pa = (pde >> 24) & ~0xfff
+      assert 0 <= spt_pa <= len(o.vram) - 8, spt_pa
+      pte = struct.unpack_from("<Q", o.vram, spt_pa + (va >> 12) * 8)[0]
+      assert pte & 1, f"invalid fake BAR1 PTE va={va:#x} pte={pte:#x}"
+      # VRAM PTE stores PA>>8; a 4-KiB-aligned PA leaves four low address
+      # bits free in that encoding (VALID occupies bit0).
+      pa = ((pte & ~0xf) << 8) | (va & 0xfff)
+      return pa
+    def mmio_read(self, bar, va, size):
+      assert bar == 1
+      try:
+        pa = self._xlate(va, size)
+        return bytes(self.owner.vram[pa:pa + size])
+      except (AssertionError, struct.error):
+        bad = b"".join(struct.pack("<I", 0xbad0fb00 | (i & 0xff))
+                       for i in range((size + 3) // 4))
+        return bad[:size]
+    def mmio_write(self, bar, va, data):
+      assert bar == 1 and len(data) == 4
+      pa = self._xlate(va, len(data))
+      cur = struct.unpack_from("<I", self.owner.vram, pa)[0]
+      val = struct.unpack("<I", data)[0]
+      struct.pack_into("<I", self.owner.vram, pa, cur ^ val)
+
+  class _AtomicBar1Dev:
+    def __init__(self):
+      self.regs = {0: 0x0e4040a2, 0x1620: 0xaab, 0x1704: 0,
+                   0x409118: 0, 0x409120: 0x10, 0x10a580: 0,
+                   0x100c80: 0x00018000}
+      self.vram = bytearray(b"\xff") * 0x1000000
+      self.dmem = bytearray(0x2000)
+      self._dmem_addr = 0
+      self._dmem_write = False
+      self._pmu_memx_data = (0x3cc, 0x800)
+      impl = type("_AtomicImpl", (), {})()
+      impl.hw = _AtomicBar1Hw(self)
+      impl.bar1_size = len(self.vram)
+      self.dev_impl = impl
+    def read32(self, reg):
+      if reg == FECS_FALCON_BASE + FALCON_DATA:
+        assert not self._dmem_write
+        value = struct.unpack_from("<I", self.dmem, self._dmem_addr)[0]
+        self._dmem_addr += 4
+        return value
+      return self.regs.get(reg, 0)
+    def write32(self, reg, value):
+      value &= 0xffffffff
+      if reg == FECS_FALCON_BASE + FALCON_DATA_INDEX:
+        self._dmem_addr = value & 0x00ffffff
+        self._dmem_write = bool(value & FALCON_IDX_WRITE)
+        return
+      if reg == FECS_FALCON_BASE + FALCON_DATA:
+        assert self._dmem_write
+        struct.pack_into("<I", self.dmem, self._dmem_addr, value)
+        self._dmem_addr += 4
+        return
+      if reg == FECS_FALCON_BASE + 0x118:
+        ext_base = self.regs[FECS_FALCON_BASE + 0x110]
+        local = self.regs[FECS_FALCON_BASE + 0x114]
+        ext_off = self.regs[FECS_FALCON_BASE + 0x11c]
+        pa = (self.regs[0x409a04] << 8) + (ext_base << 8) + ext_off
+        size = 4 << ((value >> 8) & 0x7)
+        mode = (value >> 4) & 0x3
+        assert self.regs[0x409a20] == 0x80000002
+        assert (self.regs[0x1620] & 1) == 0, "FECS DMA ran before bit0"
+        assert pa + size <= len(self.vram)
+        assert local + size <= len(self.dmem)
+        if mode == 0x2:
+          self.vram[pa:pa + size] = self.dmem[local:local + size]
+        else:
+          assert mode == 0x0
+          self.dmem[local:local + size] = self.vram[pa:pa + size]
+        # The fake completes synchronously: no pending/full or busy bits.
+        self.regs[reg] = value & ~0x3
+        self.regs[FECS_FALCON_BASE + 0x120] = 0x10
+        return
+      self.regs[reg] = value
+    def pmu_memx_exec_commands(self, commands, timeout_s=5.0):
+      if commands[0][0] == PMU_MEMX_DELAY:
+        return (0, 0)
+      window = 0
+      for opcode, payload in commands:
+        if opcode == PMU_MEMX_WAIT:
+          reg, mask, value, _nsec = payload
+          assert (self.regs.get(reg, 0) & mask) == value
+          continue
+        assert opcode == PMU_MEMX_WR32 and len(payload) % 2 == 0
+        for i in range(0, len(payload), 2):
+          reg, value = payload[i:i + 2]
+          if reg == 0x1700:
+            window = value << 16
+          elif reg == 0x1620:
+            self.regs[reg] = value
+          elif 0x700000 <= reg < 0x800000:
+            pa = window + reg - 0x700000
+            cur = struct.unpack_from("<I", self.vram, pa)[0]
+            struct.pack_into("<I", self.vram, pa, cur ^ value)
+          else:
+            self.regs[reg] = value
+      return (0, 0)
+
+  _atomic_env = {k: os.environ.get(k) for k in (
+      "KEPLER_TINYGPU_ATOMIC_BAR1", "KEPLER_PRAMIN_MEMX",
+      "KEPLER_RAM_BIT0_DEFER", "KEPLER_RAM_BLOCK",
+      "KEPLER_BAR1_MAP_SIZE")}
+  try:
+    os.environ["KEPLER_TINYGPU_ATOMIC_BAR1"] = "1"
+    os.environ["KEPLER_PRAMIN_MEMX"] = "1"
+    os.environ["KEPLER_RAM_BIT0_DEFER"] = "1"
+    os.environ["KEPLER_RAM_BLOCK"] = "bit0"
+    os.environ["KEPLER_BAR1_MAP_SIZE"] = "0x1000000"
+    _atomic_dev = _AtomicBar1Dev()
+    _gk104_init_bar1_identity(
+        _atomic_dev, map_vram=True, userd_alias_pa=0x400000)
+    assert _atomic_dev._bar1_identity_ready
+    assert _atomic_dev.regs[0x1620] == 0xaaa
+    assert struct.unpack_from("<Q", _atomic_dev.vram, 0x100000 + 0x208)[0] == 0xffffff
+    assert struct.unpack_from("<Q", _atomic_dev.vram, 0x120000)[0] == 0x4001
+    assert struct.unpack_from("<Q", _atomic_dev.vram, 0x120008)[0] == 0x4011
+    assert struct.unpack_from("<Q", _atomic_dev.vram, 0x120000 + 0x120 * 8)[0] == 0x1201
+  finally:
+    for _key, _value in _atomic_env.items():
+      if _value is None:
+        os.environ.pop(_key, None)
+      else:
+        os.environ[_key] = _value
+
   # BAR0 MSE recovery: PMC_BOOT_0=0xffffffff must not imply physical replug
   # when config space is alive and COMMAND.MSE was cleared (DEXT Close()).
   class _FakeBarHw:
@@ -4713,7 +4857,7 @@ def _gk104_vmm_flush(dev):
   return False
 
 def _gk104_ensure_pmu_memx_ready(dev) -> None:
-  """Re-discover or reload PMU MEMX after FECS/bit0 (semaphore often wedged)."""
+  """Re-discover or reload PMU MEMX after FECS (semaphore can be wedged)."""
   _gk104_require_bar0_live(dev, "before PMU MEMX ensure")
   def _smoke() -> bool:
     try:
@@ -4730,7 +4874,8 @@ def _gk104_ensure_pmu_memx_ready(dev) -> None:
       return False
   if _smoke():
     return
-  print("[kepler] PMU MEMX not ready for PRAMIN; reloading PMU falcon",
+  print("[kepler] PMU MEMX not ready for BAR1 bootstrap/PRAMIN; "
+        "reloading PMU falcon",
         flush=True)
   fw = find_kepler_firmware()
   if not fw:
@@ -4824,6 +4969,10 @@ def _gk104_pramin_write(dev, pa, data):
   if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
     _gk104_bit0_unstub(dev)
   _gk104_require_bar0_live(dev, f"before PRAMIN store @{pa:#x}")
+  if getattr(dev, "_bar1_identity_ready", False):
+    _gk104_bar1_write_verified(
+        dev, pa, data, label=f"BAR1 PRAMIN substitute @{pa:#x}")
+    return
   # Host 0x1700 after bit0 kills TinyGPU (night14); prefer MEMX WR32.
   if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and
       hasattr(dev, "pmu_memx_exec_commands")):
@@ -4863,6 +5012,8 @@ def _gk104_pramin_write(dev, pa, data):
                          f"wanted={wanted:#x} actual={actual:#x}{stub}")
 
 def _gk104_pramin_read32(dev, pa):
+  if getattr(dev, "_bar1_identity_ready", False):
+    return _gk104_bar1_read32(dev, pa)
   base = pa & 0xffffff00000
   dev.write32(0x001700, base >> 16)
   return dev.read32(0x700000 + (pa & 0xfffff))
@@ -4871,6 +5022,10 @@ def _gk104_pramin_write_literal(dev, pa, data):
   """Write raw dwords without the readback/XOR compensation."""
   if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
     _gk104_bit0_unstub(dev)
+  if getattr(dev, "_bar1_identity_ready", False):
+    _gk104_bar1_write_verified(
+        dev, pa, data, label=f"BAR1 literal substitute @{pa:#x}")
+    return
   if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and
       hasattr(dev, "pmu_memx_exec_commands")):
     # Still use virgin-XOR encoding via MEMX — literal host path is TinyGPU-hostile.
@@ -4887,6 +5042,16 @@ def _gk104_pramin_write_literal(dev, pa, data):
 
 def _gk104_bar_flush(dev):
   """Flush pending framebuffer/BAR writes (g84_bar_flush)."""
+  if getattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", False):
+    # Nights19/20 proved 0x070000 becomes a 43-ms timeout source after the
+    # host bit0-only crossing, even with BAR1 enabled.  A BAR1 read is the only
+    # safe posting barrier left on TinyGPU; verified writers additionally
+    # require exact readback for every dword.
+    try:
+      raw = dev.dev_impl.hw.mmio_read(1, 0, 4)
+      return len(raw) == 4
+    except Exception:
+      return False
   for _ in range(2):  # gf100_bar_bar1_wait() deliberately flushes twice.
     dev.write32(0x070000, 0x00000001)
     deadline = time.time() + 0.2
@@ -5213,6 +5378,196 @@ def _gk104_post_ram_fb_ltc(dev):
   except Exception:
     pass
 
+
+def _gk104_bar1_read32(dev, va: int) -> int:
+  """Read one dword through the CPU BAR1 aperture."""
+  raw = dev.dev_impl.hw.mmio_read(1, va, 4)
+  if len(raw) != 4:
+    raise RuntimeError(f"short BAR1 read at {va:#x}: {len(raw)} bytes")
+  return struct.unpack("<I", raw)[0]
+
+
+def _gk104_bar1_write_verified(dev, va: int, data, *, label="BAR1") -> None:
+  """Write framebuffer dwords through BAR1 with XOR/literal compensation.
+
+  Cold TinyGPU BAR1 has exhibited both ordinary stores and XOR-like/stale
+  stores.  Read the current dword, try the exact XOR delta first, then a
+  literal store, and require readback before advancing.  This replaces the
+  old post-bit0 PRAMIN repair path, whose 0x1700 access is fatal.
+  """
+  data = memoryview(data).cast("B")
+  if (va & 3) or (len(data) & 3):
+    raise ValueError("verified BAR1 write must be dword aligned")
+  for off in range(0, len(data), 4):
+    addr = va + off
+    wanted = struct.unpack_from("<I", data, off)[0]
+    actual = _gk104_bar1_read32(dev, addr)
+    if actual == wanted:
+      continue
+    for _attempt in range(4):
+      delta = (actual ^ wanted) & 0xffffffff
+      dev.dev_impl.hw.mmio_write(1, addr, struct.pack("<I", delta))
+      actual = _gk104_bar1_read32(dev, addr)
+      if actual == wanted:
+        break
+      dev.dev_impl.hw.mmio_write(1, addr, struct.pack("<I", wanted))
+      actual = _gk104_bar1_read32(dev, addr)
+      if actual == wanted:
+        break
+    if actual != wanted:
+      raise RuntimeError(
+          f"{label} store failed at {addr:#x}: wanted={wanted:#x} "
+          f"actual={actual:#x}")
+
+
+def _gk104_fecs_dmem_write(dev, addr: int, data) -> None:
+  """Write the FECS firmware's reserved 0x200..0x2ff xfer_data area."""
+  data = memoryview(data).cast("B")
+  if (addr & 3) or (len(data) & 3) or addr < 0x200 or addr + len(data) > 0x300:
+    raise ValueError("FECS DMA scratch must be dword aligned within 0x200..0x2ff")
+  dev.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX,
+              FALCON_IDX_WRITE | addr)
+  for off in range(0, len(data), 4):
+    dev.write32(FECS_FALCON_BASE + FALCON_DATA,
+                struct.unpack_from("<I", data, off)[0])
+
+
+def _gk104_fecs_dmem_read(dev, addr: int, size: int) -> bytes:
+  if (addr & 3) or (size & 3) or addr < 0x200 or addr + size > 0x300:
+    raise ValueError("FECS DMA scratch must be dword aligned within 0x200..0x2ff")
+  out = bytearray()
+  dev.write32(FECS_FALCON_BASE + FALCON_DATA_INDEX,
+              0x02000000 | addr)
+  for _ in range(0, size, 4):
+    out += struct.pack("<I", dev.read32(
+        FECS_FALCON_BASE + FALCON_DATA) & 0xffffffff)
+  return bytes(out)
+
+
+def _gk104_fecs_dma_xfer(dev, ext_offset: int, local: int, size_log2: int,
+                         *, store: bool) -> None:
+  """Run one FECS transfer through its already-configured physical VRAM port."""
+  size = 4 << size_log2
+  if (ext_offset & (size - 1)) or (local & (size - 1)):
+    raise ValueError(
+        f"unaligned FECS DMA xfer offset={ext_offset:#x} "
+        f"local={local:#x} size={size:#x}")
+  deadline = time.monotonic() + 0.05
+  while True:
+    prior_ctrl = dev.read32(FECS_FALCON_BASE + 0x118) & 0xffffffff
+    if prior_ctrl == 0xffffffff:
+      raise RuntimeError("FECS XFER_CTRL inaccessible before DMA request")
+    if not (prior_ctrl & 0x1):
+      break
+    if time.monotonic() >= deadline:
+      raise TimeoutError(
+          f"FECS DMA request queue stayed full ctrl={prior_ctrl:#x}")
+    time.sleep(0.0005)
+  # FECS MEM_BASE supplies the physical base; keep Falcon EXT_BASE zero and
+  # use EXT_OFFSET for the sparse root fragments.
+  dev.write32(FECS_FALCON_BASE + 0x110, 0)
+  dev.write32(FECS_FALCON_BASE + 0x114, local)
+  dev.write32(FECS_FALCON_BASE + 0x11c, ext_offset)
+  ctrl = ((0x2 << 4) if store else 0) | ((size_log2 & 0x7) << 8)
+  dev.write32(FECS_FALCON_BASE + 0x118, ctrl)
+  deadline = time.monotonic() + 0.05
+  while True:
+    actual_ctrl = dev.read32(FECS_FALCON_BASE + 0x118) & 0xffffffff
+    status = dev.read32(FECS_FALCON_BASE + 0x120) & 0xffffffff
+    if actual_ctrl == 0xffffffff or status == 0xffffffff:
+      raise RuntimeError(
+          f"FECS DMA MMIO became inaccessible offset={ext_offset:#x} "
+          f"ctrl={actual_ctrl:#x} status={status:#x}")
+    if not ((actual_ctrl & 0x1) or (status & 0x2)):
+      return
+    if time.monotonic() >= deadline:
+      raise TimeoutError(
+          f"FECS DMA {'store' if store else 'load'} timeout "
+          f"offset={ext_offset:#x} "
+          f"ctrl={actual_ctrl:#x} status={status:#x}")
+    time.sleep(0.0005)
+
+
+def _gk104_fecs_dma_prepare(dev, segments, aperture_base: int):
+  """Stage sparse BAR1 roots in FECS xfer_data before crossing bit0."""
+  segments = tuple((int(pa), bytes(blob)) for pa, blob in segments)
+  staged = []
+  local = 0x200
+  for pa, blob in segments:
+    if len(blob) not in (4, 8, 16, 32, 64, 128, 256):
+      raise ValueError(f"unsupported FECS DMA root fragment size {len(blob):#x}")
+    if pa < aperture_base:
+      raise ValueError(f"FECS DMA root {pa:#x} precedes base {aperture_base:#x}")
+    size_log2 = (len(blob) // 4).bit_length() - 1
+    local = round_up(local, len(blob))
+    _gk104_fecs_dmem_write(dev, local, blob)
+    staged.append((pa, blob, local, size_log2))
+    local += len(blob)
+  verify = round_up(local, 0x10)
+  max_size = max((len(blob) for _pa, blob in segments), default=0)
+  if verify + max_size > 0x300:
+    raise RuntimeError("FECS xfer_data has no root verification scratch")
+
+  # hub.fuc uses MEM_BASE/MEM_TARGET plus Falcon port0 for physical VRAM
+  # channel-header transfers.  Configure the same target while FECS/PGRAPH
+  # MMIO is still proven safe, but submit no external request until bit0 has
+  # made framebuffer storage real.
+  dev.write32(0x409a04, aperture_base >> 8)
+  dev.write32(0x409a20, 0x80000002)
+  base_actual = dev.read32(0x409a04) & 0xffffffff
+  target_actual = dev.read32(0x409a20) & 0xffffffff
+  if base_actual != aperture_base >> 8 or target_actual != 0x80000002:
+    raise RuntimeError(
+        f"FECS physical-VRAM target rejected: base={base_actual:#x} "
+        f"target={target_actual:#x}")
+  print(f"[kepler] FECS DMA roots staged in xfer_data: count={len(staged)} "
+        f"base={aperture_base:#x}", flush=True)
+  return tuple(staged), verify
+
+
+def _gk104_fecs_dma_store_verify(dev, staged, verify: int,
+                                  aperture_base: int) -> int:
+  """Post-bit0 FECS DMA store/load each root and require exact equality."""
+  transferred = 0
+  for pa, blob, local, size_log2 in staged:
+    ext_offset = pa - aperture_base
+    _gk104_fecs_dma_xfer(dev, ext_offset, local, size_log2, store=True)
+    _gk104_fecs_dmem_write(dev, verify, bytes(len(blob)))
+    _gk104_fecs_dma_xfer(dev, ext_offset, verify, size_log2, store=False)
+    actual = _gk104_fecs_dmem_read(dev, verify, len(blob))
+    if actual != blob:
+      raise RuntimeError(
+          f"FECS DMA root verify failed pa={pa:#x}: "
+          f"wanted={blob.hex()} actual={actual.hex()}")
+    transferred += len(blob)
+  return transferred
+
+
+def _gk104_atomic_bar1_bootstrap(
+    dev, segments, inst_pa: int) -> None:
+  """Cross bit0, FECS-DMA minimal BAR1 roots, then enable BAR1."""
+  _gk104_require_bar0_live(dev, "before atomic BAR1 bootstrap")
+  aperture_base = inst_pa & ~0xfffff
+  staged, verify = _gk104_fecs_dma_prepare(dev, segments, aperture_base)
+  bar1_ctl = 0x80000000 | (inst_pa >> 12)
+  # The host bit0-only clear makes framebuffer storage real but hides PMU,
+  # PRAMIN, and BAR/LTC flush MMIO.  FECS remains the running GR controller;
+  # its dedicated xfer_data/MEM_TARGET path writes the roots afterwards.
+  _gk104_bit0_unstub(dev)
+  boot0 = _gk104_require_bar0_live(dev, "after staged BAR1 bit0 crossing")
+  try:
+    setattr(dev, "_pmu_memx_data", None)
+    setattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", True)
+    setattr(dev, "_tinygpu_bar1_ctl", bar1_ctl)
+  except Exception:
+    pass
+  transferred = _gk104_fecs_dma_store_verify(
+      dev, staged, verify, aperture_base)
+  _gk104_require_bar0_live(dev, "after post-bit0 FECS root DMA")
+  dev.write32(0x001704, bar1_ctl)
+  print(f"[kepler] post-bit0 FECS BAR1 roots DMA-verified: "
+        f"bytes={transferred:#x} PMC_BOOT_0={boot0:#x}", flush=True)
+
 def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
                               map_vram=True, userd_alias_pa=None):
   """Bootstrap an identity BAR1 mapping for GK104 VRAM.
@@ -5235,6 +5590,15 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
   # MEMX PRAMIN is slow; 16 MiB covers bit19-safe GR/attrib (≤0x900000).
   if os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1":
     mapped_size = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x1000000"), 0)
+  if getattr(dev, "_bar1_identity_ready", False):
+    prior_size = getattr(dev, "_bar1_identity_size", mapped_size)
+    prior_alias = getattr(dev, "_bar1_identity_userd", userd_alias_pa)
+    if prior_size != mapped_size or prior_alias != userd_alias_pa:
+      raise RuntimeError(
+          f"BAR1 identity already active with size={prior_size:#x} "
+          f"alias={prior_alias}, requested size={mapped_size:#x} "
+          f"alias={userd_alias_pa}")
+    return
   dev.write32(0x001704, dev.read32(0x001704) & ~0x80000000)
   inst_pa = 0x00100000
   pgd_pa = 0x00110000
@@ -5247,13 +5611,11 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
   inst = bytearray(0x220)
   struct.pack_into("<Q", inst, 0x200, pgd_pa)
   struct.pack_into("<Q", inst, 0x208, mapped_size - 1)
-  _gk104_pramin_write(dev, inst_pa, inst)
   # PDE: 4-KiB SPT in PRAMIN (VRAM target).  In gf100_vmm_pgd_pde() the SPT
   # is pt[1] (desc->type == SPT → type=1), encoded in the high 32 bits:
   #   data |= 1ULL << 32; data |= pt->addr << 24;
   # (The low 32 bits are for pt[0] = LPT, which we do not use.)
-  _gk104_pramin_write(dev, pgd_pa,
-                      struct.pack("<Q", (1 << 32) | (spt_pa << 24)))
+  pde = struct.pack("<Q", (1 << 32) | (spt_pa << 24))
 
   # PTEs: map each 4 KiB BAR1 VA to the corresponding VRAM page, or to host
   # sysmem for the legacy diagnostic mode.  gf100_vmm_valid() encodes VRAM as
@@ -5273,6 +5635,94 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
       pa = bus_base + page * 0x1000
       pte = (pa >> 8) | 0x1 | (0x1 << 32) | (0x2 << 33)
     struct.pack_into("<Q", pte_data, page * 8, pte)
+
+  atomic_bootstrap = (
+      os.environ.get("KEPLER_TINYGPU_ATOMIC_BAR1", "0") == "1" and
+      os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and
+      os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1" and
+      not getattr(dev, "_bit0_unstub_done", False) and
+      hasattr(dev, "pmu_memx_exec_commands"))
+  if atomic_bootstrap:
+    # The PMU aperture becomes permanently host-inaccessible after bit0
+    # (night17), so stage just enough BAR1 state before the host-only bit0
+    # clear.  VA0 maps the first SPT page (control); VA0x1000 maps the instance
+    # page for verification.  The full aperture limit is staged up front.
+    bootstrap_inst = bytearray(inst)
+    bootstrap_pte = struct.pack(
+        "<QQ", (spt_pa >> 8) | 0x1, (inst_pa >> 8) | 0x1)
+    # gf100_vmm_join() consumes only instance +0x200/+0x208.  DMA-store just
+    # those four dwords plus the PDE and two temporary PTEs, then DMA-load
+    # each fragment back before enabling BAR1.  This bypasses the pre-bit0
+    # PRAMIN stub demonstrated by nights 21-22.
+    _gk104_atomic_bar1_bootstrap(
+        dev, ((inst_pa + 0x200, bootstrap_inst[0x200:0x210]),
+              (pgd_pa, pde), (spt_pa, bootstrap_pte)), inst_pa)
+
+    actual = dev.dev_impl.hw.mmio_read(1, 0, len(bootstrap_pte))
+    if actual != bootstrap_pte:
+      raise RuntimeError(
+          f"DMA-rooted BAR1 control mapping mismatch: "
+          f"wanted={bootstrap_pte.hex()} actual={actual.hex()}")
+    print("[kepler] BAR1 root mechanism selected: post-bit0 FECS VRAM DMA",
+          flush=True)
+
+    # Populate the first SPT page through VA0 while it maps the SPT itself.
+    # Entries 0/1 remain the control/instance aliases until expansion ends.
+    _gk104_bar1_write_verified(
+        dev, 0x10, pte_data[0x10:0x1000], label="BAR1 SPT page0")
+    first_page_checks = {
+        inst_pa // 0x1000: dev.dev_impl.hw.mmio_read(
+            1, (inst_pa // 0x1000) * 8, 8),
+        spt_pa // 0x1000: dev.dev_impl.hw.mmio_read(
+            1, (spt_pa // 0x1000) * 8, 8),
+    }
+    for index, actual in first_page_checks.items():
+      wanted = pte_data[index * 8:index * 8 + 8]
+      if actual != wanted:
+        raise RuntimeError(
+            f"BAR1 SPT page0 identity[{index:#x}] mismatch: "
+            f"wanted={wanted.hex()} actual={actual.hex()}")
+    # The first SPT page installed identity leaves for all eight SPT pages.
+    # Fill pages 1..7 through those identity mappings.
+    for off in range(0x1000, spt_bytes, 0x1000):
+      end = min(off + 0x1000, spt_bytes)
+      _gk104_bar1_write_verified(
+          dev, spt_pa + off, pte_data[off:end],
+          label=f"BAR1 SPT page {off // 0x1000}")
+    # Now access the first SPT page by its identity VA, replace the temporary
+    # roots with the intended USERD aliases, and keep the identity page usable
+    # for later verified PRAMIN substitutions.
+    _gk104_bar1_write_verified(
+        dev, spt_pa, pte_data[:0x10], label="BAR1 final alias PTEs")
+    # PTE0/1 were used as temporary control aliases and may be cached.  BAR1
+    # fini/init invalidates that private walk without touching the inaccessible
+    # post-bit0 0x070000/0x100cbc paths.  Exact BAR1 readback below is the
+    # posting barrier.
+    bar1_ctl = getattr(dev, "_tinygpu_bar1_ctl",
+                       0x80000000 | (inst_pa >> 12))
+    dev.write32(0x001704, bar1_ctl & ~0x80000000)
+    dev.write32(0x001704, bar1_ctl)
+    final_roots = dev.dev_impl.hw.mmio_read(1, spt_pa, 0x10)
+    final_limit = dev.dev_impl.hw.mmio_read(1, inst_pa + 0x208, 8)
+    if final_roots != pte_data[:0x10] or final_limit != inst[0x208:0x210]:
+      inst_identity_pte = dev.dev_impl.hw.mmio_read(
+          1, spt_pa + (inst_pa // 0x1000) * 8, 8)
+      raise RuntimeError(
+          f"expanded BAR1 roots mismatch roots={final_roots.hex()} "
+          f"limit={final_limit.hex()} inst_pte={inst_identity_pte.hex()}")
+    try:
+      setattr(dev, "_bar1_identity_ready", True)
+      setattr(dev, "_bar1_identity_size", mapped_size)
+      setattr(dev, "_bar1_identity_userd", userd_alias_pa)
+    except Exception:
+      pass
+    print(f"[kepler] atomic BAR1 identity ready: inst={inst_pa:#x} "
+          f"pgd={pgd_pa:#x} spt={spt_pa:#x} size={mapped_size:#x}",
+          flush=True)
+    return
+
+  _gk104_pramin_write(dev, inst_pa, inst)
+  _gk104_pramin_write(dev, pgd_pa, pde)
   # Write PTEs in 4 KiB pages to stay within the PRAMIN window.
   for off in range(0, spt_bytes, 0x1000):
     end = min(off + 0x1000, spt_bytes)
@@ -5330,6 +5780,11 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
 
 def _gk104_ltc_invalidate(dev):
   """Invalidate GK104's L2 after CPU BAR1/PRAMIN framebuffer stores."""
+  if getattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", False):
+    # 0x070010/0x070004 share the post-bit0-inaccessible BAR/LTC block with
+    # 0x070000.  On the cold first-use path no GPU client has cached these
+    # freshly written objects yet; use the safe BAR1 posting read instead.
+    return _gk104_bar_flush(dev)
   # gf100_ltc_flush(): commit BAR/PRAMIN writes held by LTC first.
   dev.write32(0x070010, 0x00000001)
   deadline = time.time() + 0.2

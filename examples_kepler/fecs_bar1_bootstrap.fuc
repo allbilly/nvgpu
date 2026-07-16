@@ -1,0 +1,50 @@
+/* GK104 FECS autonomous BAR1-root bootstrap.
+ *
+ * Loaded into the unused 0xb20..0xbff padding of Nouveau's 0xc00-byte
+ * gk104_grhub image.  FECS is halted (not reset), so its initialized stack,
+ * interrupt vector, and firmware state remain intact.  The host starts this
+ * entry before clearing 0x1620[0].  A bounded local loop lets the host cross
+ * bit0; the Falcon then stores the three root fragments already staged in
+ * hub.fuc's xfer_data (DMEM 0x200..), waits for completion, and rejoins the
+ * original firmware at main (0x56a).
+ */
+
+.section #fecs_bar1_bootstrap 0xb20
+.equ main 0x056a
+
+bootstrap:
+	clear b32 $r0
+	/* Roughly milliseconds at the cold GPC clock; host bit0 takes <100 us. */
+	mov $r1 0
+	sethi $r1 0x00100000
+delay:
+	sub b32 $r1 1
+	bra ne #delay
+
+	/* FECS MEM_BASE/MEM_TARGET were configured by the host. */
+	mov $xdbase $r0
+	mov $xtargets $r0
+
+	/* instance +0x200: DMEM 0x200, 16 bytes, external offset 0x200 */
+	movw $r1 0x0200
+	sethi $r1 0x00020000
+	movw $r2 0x0200
+	sethi $r2 0
+	xdst $r2 $r1
+
+	/* page directory: DMEM 0x210, 8 bytes, external offset 0x10000 */
+	movw $r1 0x0210
+	sethi $r1 0x00010000
+	mov $r2 0
+	sethi $r2 0x00010000
+	xdst $r2 $r1
+
+	/* first two SPT entries: DMEM 0x220, 16 bytes, offset 0x20000 */
+	movw $r1 0x0220
+	sethi $r1 0x00020000
+	mov $r2 0
+	sethi $r2 0x00020000
+	xdst $r2 $r1
+	xdwait
+
+	bra #main
