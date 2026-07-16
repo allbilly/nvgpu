@@ -1,0 +1,52 @@
+=== 2026-07-16T10:04:43+08:00 kepler opencl once ===
+cmdline: BOOT_IMAGE=/boot/vmlinuz-6.17.0-40-generic root=UUID=354c01d4-f9b8-4a8f-9939-479b818319ca ro quiet splash amd_iommu=pt iommu=pt vt.handoff=7
+modeset=2 runpm=0
+driver=nouveau
+holders:
+Specified filename /dev/dri/card0 does not exist.
+[    4.674499] [drm] Initialized nouveau 1.4.0 for 0000:09:00.0 on minor 2
+[    4.674906] nouveau 0000:09:00.0: [drm] No compatible format found
+[    4.674908] nouveau 0000:09:00.0: [drm] Cannot find any crtc or sizes
+[    4.813415] NVRM: GPU 0000:04:00.0 is already bound to nouveau.
+[    4.817431] NVRM: GPU 0000:09:00.0 is already bound to nouveau.
+[    4.986452] NVRM: GPU 0000:04:00.0 is already bound to nouveau.
+[    4.990862] NVRM: GPU 0000:09:00.0 is already bound to nouveau.
+[    5.192143] NVRM: GPU 0000:04:00.0 is already bound to nouveau.
+[    5.192148] NVRM: GPU 0000:09:00.0 is already bound to nouveau.
+[    5.361927] NVRM: GPU 0000:04:00.0 is already bound to nouveau.
+[    5.367121] NVRM: GPU 0000:09:00.0 is already bound to nouveau.
+[    5.528976] NVRM: GPU 0000:04:00.0 is already bound to nouveau.
+[    5.534064] NVRM: GPU 0000:09:00.0 is already bound to nouveau.
+[    5.691382] NVRM: GPU 0000:04:00.0 is already bound to nouveau.
+[    5.696569] NVRM: GPU 0000:09:00.0 is already bound to nouveau.
+--- OpenCL ---
+nvc0_screen_create:887 - Error allocating PGRAPH context for M2MF: -16
+get device failed: -1
+rc=1
+[    0.032141] AMD-Vi: Unknown option - 'pt'
+[    0.092843] AMD-Vi: Using global IVHD EFR:0x0, EFR2:0x0
+[    0.442109] pid_max: default: 32768 minimum: 301
+[    0.673845] iommu: Default domain type: Passthrough (set via kernel command line)
+[    0.674641] NetLabel:  unlabeled traffic allowed by default
+[    0.705936] PCI: CLS 64 bytes, default 64
+[    0.705959] pci 0000:00:00.2: AMD-Vi: IOMMU performance counters supported
+[    0.707701] AMD-Vi: Extended features (0x58f77ef22294a5a, 0x0): PPR NX GT IA PC GA_vAPIC
+[    0.707709] AMD-Vi: Interrupt remapping enabled
+[    2.898363] Key type encrypted registered
+[    2.922843] Freeing unused decrypted memory: 2028K
+[    3.154576] nvme nvme0: 24/0/0 default/read/poll queues
+[    3.675946] systemd[1]: systemd 255.4-1ubuntu8.16 running in system mode (+PAM +AUDIT +SELINUX +APPARMOR +IMA +SMACK +SECCOMP +GCRYPT -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP +LIBFDISK +PCRE2 -PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD -BPF_FRAMEWORK -XKBCOMMON +UTMP +SYSVINIT default-hierarchy=unified)
+[    3.821912] systemd[1]: Queued start job for default target graphical.target.
+[    3.875545] ppdev: user-space parallel port driver
+[    5.871565] nouveau 0000:09:00.0: fifo: fault 00 [READ] at 000000000034d000 engine 00 [GR] client 04 [HUB/FE] reason 00 [PDE] on channel 2 [023fb3b000 add_opencl[1509]]
+[    5.871601] nouveau 0000:09:00.0: add_opencl[1509]: channel 2 killed!
+[    7.871639] Modules linked in: nvidia(OE-) qrtr overlay cmac algif_hash algif_skcipher af_alg bnep binfmt_misc snd_hda_codec_alc882 snd_hda_codec_realtek_lib snd_hda_codec_generic snd_hda_codec_nvhdmi snd_hda_codec_hdmi snd_hda_intel snd_hda_codec amd_atl intel_rapl_msr snd_hda_core intel_rapl_common snd_intel_dspcfg snd_intel_sdw_acpi snd_hwdep snd_pcm snd_seq_midi snd_seq_midi_event btusb btrtl snd_rawmidi btintel btbcm edac_mce_amd btmtk snd_seq polyval_clmulni ghash_clmulni_intel aesni_intel bluetooth snd_seq_device gigabyte_wmi wmi_bmof rapl snd_timer i2c_piix4 snd ccp soundcore i2c_smbus k10temp mac_hid nouveau mxm_wmi gpu_sched drm_gpuvm drm_ttm_helper ttm drm_exec drm_display_helper cec rc_core i2c_algo_bit video sch_fq_codel msr parport_pc ppdev lp parport efi_pstore nfnetlink dmi_sysfs ip_tables x_tables autofs4 nvme nvme_core r8169 ahci libahci nvme_keyring realtek nvme_auth wmi
+[    7.872630]  ? handle_mm_fault+0x237/0x370
+[    7.872636]  ? do_user_addr_fault+0x2fc/0x8d0
+[    7.872657]  ? exc_page_fault+0x90/0x1b0
+[   23.873428] Modules linked in: nvidia(OE+) qrtr overlay cmac algif_hash algif_skcipher af_alg bnep binfmt_misc snd_hda_codec_alc882 snd_hda_codec_realtek_lib snd_hda_codec_generic snd_hda_codec_nvhdmi snd_hda_codec_hdmi snd_hda_intel snd_hda_codec amd_atl intel_rapl_msr snd_hda_core intel_rapl_common snd_intel_dspcfg snd_intel_sdw_acpi snd_hwdep snd_pcm snd_seq_midi snd_seq_midi_event btusb btrtl snd_rawmidi btintel btbcm edac_mce_amd btmtk snd_seq polyval_clmulni ghash_clmulni_intel aesni_intel bluetooth snd_seq_device gigabyte_wmi wmi_bmof rapl snd_timer i2c_piix4 snd ccp soundcore i2c_smbus k10temp mac_hid nouveau mxm_wmi gpu_sched drm_gpuvm drm_ttm_helper ttm drm_exec drm_display_helper cec rc_core i2c_algo_bit video sch_fq_codel msr parport_pc ppdev lp parport efi_pstore nfnetlink dmi_sysfs ip_tables x_tables autofs4 nvme nvme_core r8169 ahci libahci nvme_keyring realtek nvme_auth wmi
+[   23.874349]  ? handle_mm_fault+0x237/0x370
+[   23.874355]  ? do_user_addr_fault+0x2fc/0x8d0
+[   23.874376]  ? exc_page_fault+0x90/0x1b0
+[   23.874487] nouveau 0000:09:00.0: gr: failed to construct context
+=== done rc=1 ===

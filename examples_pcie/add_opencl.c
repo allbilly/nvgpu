@@ -28,10 +28,13 @@ int main(void) {
     clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(name), name, NULL);
     printf("device: %s\n", name);
 
-    cl_context ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, NULL);
-    if (!ctx) { fprintf(stderr, "create context failed\n"); return 1; }
-    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, NULL, NULL);
-    if (!q) { fprintf(stderr, "create queue failed\n"); return 1; }
+    cl_int create_err = CL_SUCCESS;
+    cl_context ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &create_err);
+    if (!ctx) { fprintf(stderr, "create context failed: %d\n", create_err); return 1; }
+    /* Kepler's Rusticl/Nouveau path is OpenCL 1.2-era.  Use the legacy queue
+       constructor so it does not enter the OpenCL-3 properties path. */
+    cl_command_queue q = clCreateCommandQueue(ctx, dev, 0, &create_err);
+    if (!q) { fprintf(stderr, "create queue failed: %d\n", create_err); return 1; }
 
     const int N = 1024;
     float *a = malloc(N * sizeof(float)), *b = malloc(N * sizeof(float)), *c = malloc(N * sizeof(float));

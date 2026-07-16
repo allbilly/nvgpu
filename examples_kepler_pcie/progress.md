@@ -723,3 +723,78 @@ causes issues (though the interrupt-masking fix helps).
   remain. A fresh Nouveau MMIO capture must therefore be made and compressed
   (for example, `gzip -9 nouveau_gk104_mmiotrace.txt`).
 
+## 2026-07-16 — GTX 660 Ti bring-up started
+
+- The connected card is `0000:09:00.0`, PCI ID `10de:1183`, subsystem
+  `1458:3556`: NVIDIA GK104 / GeForce GTX 660 Ti.  It was initially unbound;
+  loading `nouveau modeset=1 debug=TRACE` bound it successfully.
+- The existing Rusticl OpenCL add was targeted at the Nouveau render node.  It
+  enumerated `device: NVE4`, but the first launch failed while creating the
+  queue and Nouveau logged a channel PDE fault at `0x00011000`.  This is a
+  recoverable driver/card state issue to clear with a fresh Nouveau reload
+  before accepting a health-check result.
+- A clean Nouveau reload reproduced the failure and recorded the concrete
+  host-side cause: AMD-Vi logged an I/O page fault at `0xbf4a2000` while the
+  OpenCL channel was being created.  `clinfo` still enumerates the card as
+  `NVE4`, so this is a DMA/IOMMU launch failure rather than missing device
+  detection.
+- Captured the full Nouveau `mmiotrace` while unloading/reloading Nouveau and
+  replaying the OpenCL add attempt.  The raw artifact was 168 MiB with
+  `4,372,128` entries; the 256-MiB-per-CPU ring reported
+  `4,372,128/4,372,128` (no wrap/loss).  It is stored as
+  `examples_kepler_pcie/mmiotrace_660ti.txt.gz` (21 MiB, `gzip -t` clean,
+  SHA-256 `dbc5f4db0c43860960a41500f9a083b7653e7409b653acbfc81e9a7f9eee2db4`).
+- Added GTX 660 Ti support to `examples_kepler_pcie/add.py`: PCI ID `0x1183`
+  is now auto-detected and reported as `GeForce GTX 660 Ti`; VBIOS inspection
+  accepts all supported GK104 IDs.  Cold 660 Ti devinit now fails closed unless
+  the operator supplies `KEPLER_VBIOS` containing a real 660 Ti ROM, preventing
+  accidental execution of the checked-in GTX 770 board scripts.  Offline
+  `--middle-selftest`, VBIOS inspection, and `git diff --check` pass.
+- Tried the OpenCL 1.2 legacy queue constructor for Kepler; it still faults in
+  Nouveau, so the API version is not the cause.  The kernel reports AMD-Vi
+  translation faults for the Nouveau GART buffers (and subsequent GPU PTE/PDE
+  faults).  Added `amd_iommu=pt iommu=pt` to `/etc/default/grub` and regenerated
+  GRUB; a reboot is required before the next health-check attempt.  The prior
+  file was preserved as `/etc/default/grub.nvgpu-backup`.
+- Hardened `opencl_add_health.sh` with an IOMMU-mode warning and a 30-second
+  timeout.  Before reboot it now fails closed with `rc=137` instead of leaving
+  a wedged Nouveau submission running indefinitely; this is expected until the
+  new kernel command line is active.
+
+## 2026-07-16 — 660 Ti OpenCL: IOMMU fixed; GPU PDE remains
+
+- After reboot, `iommu=pt` is active (`Default domain type: Passthrough`).
+  Note: this kernel logs `AMD-Vi: Unknown option - 'pt'`; only `iommu=pt`
+  enables pass-through.  Host AMD-Vi DMA faults are gone.
+- Card: GK104 `0e4030a2`, VBIOS `80.04.4b.00.32`, **2048 MiB** GDDR5, BARs
+  16M / 128M / 32M.  Same slot `09:00.0` as the former GTX 770; firmware marks
+  it `boot_vga=1` (3080 Ti is `boot_vga=0`).  That is a BIOS primary-VGA tag,
+  not an OpenCL requirement; it makes GNOME/logind eager to open the KMS node.
+- **Headless control (no reboot):** `systemctl stop gdm`, no compositor holders
+  on Kepler, then `add_opencl` → still fails.  dmesg:
+  `fifo: fault READ at 0000000000011000 engine HOST0 reason PDE` and
+  `get device failed: -1`.  So this is **not** display-race-only.
+- Same PDE class also reproduced earlier with a pre-GDM oneshot and with
+  `vram_pushbuf=1`.  GTX 770 OpenCL PASS on this box used the same Mesa
+  Rusticl path (`NVE4`); 660 Ti does not.  Likely card/stepping/2GB path
+  difference inside Nouveau channel/GART setup, not `add_opencl.c`.
+- Operational landmines (caused extra reboots, avoid):
+  - `rmmod`/unbind Kepler → `nve0_bo_move_copy` oops; leave bound or reboot.
+  - `modprobe nouveau` before nvidia owns `04:00.0` → nouveau steals 3080 Ti.
+  - GNOME opening boot-VGA `card*` → `gf100_grctx_generate` timeout, wedges GR.
+- Verdict: **660 Ti Rusticl OpenCL add = known fail** under current
+  kernel/Mesa (`6.17` + `mesa 25.2.8`) even headless + `iommu=pt`.  Health
+  baseline remains the prior **GTX 770 PASS**.  Next discriminating check is
+  re-insert 770 (same slot/software) to confirm the stack still passes; do not
+  burn more cycles on 660 Ti queue creation without a Nouveau/Mesa change.
+
+## 2026-07-16 — NVK add stability: wedge vs clean bind
+
+- Root cause of “flaky PASS”: not random NVK failure.  After OpenCL/GL/raw
+  `add.py`, Nouveau leaves GK104 GR/FIFO wedged; NVK then gets PDE/PTE /
+  `VK_ERROR_DEVICE_LOST`.  PCI FLR+rebind did **not** recover in testing
+  (`reset` I/O error / still channel-kill).  **Reboot** is the reliable reset.
+- Hardened `vk_add_compute.c` (host↔shader barriers + fence) and added
+  `nvk_add_health.sh` (bind check + one FLR retry).  README documents the
+  stable sequence: headless + `iommu=pt` + nvidia owns 3080 → `modprobe
+  nouveau modeset=2` → NVK add **before** any other Kepler stress.

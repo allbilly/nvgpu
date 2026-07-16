@@ -1,0 +1,16 @@
+[Unit]
+Description=One-shot GTX 660 Ti OpenCL health before display manager
+DefaultDependencies=no
+After=systemd-modules-load.service systemd-udev-settle.service
+Before=display-manager.service gdm.service
+ConditionPathExists=/home/a/nvgpu/examples_kepler_pcie/.run_opencl_once
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /home/a/nvgpu/examples_kepler_pcie/run_opencl_660ti_once.sh
+ExecStartPost=/bin/rm -f /home/a/nvgpu/examples_kepler_pcie/.run_opencl_once
+RemainAfterExit=yes
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

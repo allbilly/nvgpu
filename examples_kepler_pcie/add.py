@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone NV stack for a GTX 770 (Kepler, GK104, sm_30) over raw PCIe on Linux.
+"""Standalone NV stack for Kepler GK104 cards (GTX 660 Ti/770, sm_30) over raw PCIe on Linux.
 
 Linux port of examples_kepler/add.py: the macOS TinyGPU.app DriverKit socket
 transport from the upstream file is replaced here by direct BAR0/BAR1 mmap via
@@ -481,10 +481,23 @@ def cubin_register_count(blob, kernel):
 # ============================================================================
 PAGESIZE = 0x1000
 
-# GK104 PCI device id (Palit GTX 770) — used by probe() to pick the right BDF
-# when NV_PCIBDF is not set.  Kepler desktop ids: 0x1180 (GK104), 0x1184/0x1185
-# (GK104 respin), 0x1188 (GK104), 0x1189 (GK104), 0x118e (GK104).
-GK104_PCI_IDS = {0x1180, 0x1184, 0x1185, 0x1187, 0x1188, 0x1189, 0x118e}
+# GK104 PCI device ids — used by probe() to pick the right BDF when NV_PCIBDF
+# is not set.  0x1183 is the GTX 660 Ti present in the reference system;
+# 0x1184 is the GTX 770 used by the original bring-up.
+GK104_PCI_IDS = {0x1180, 0x1183, 0x1184, 0x1185, 0x1187, 0x1188, 0x1189, 0x118e}
+GK104_PCI_NAMES = {
+  0x1180: "GK104",
+  0x1183: "GeForce GTX 660 Ti",
+  0x1184: "GeForce GTX 770",
+  0x1185: "GK104",
+  0x1187: "GK104",
+  0x1188: "GK104",
+  0x1189: "GK104",
+  0x118e: "GK104",
+}
+
+def gk104_name(device_id: int) -> str:
+  return GK104_PCI_NAMES.get(device_id, f"GK104 (10de:{device_id:04x})")
 
 
 class RemotePCIDevice:
@@ -552,6 +565,11 @@ class LinuxPCIDevice(RemotePCIDevice):
     self.sysfs = f"{self._sysfs_root}/{self.bdf}"
     if not pathlib.Path(self.sysfs).is_dir():
       raise RuntimeError(f"PCI device {self.bdf} not present at {self.sysfs}")
+    try:
+      self.pci_device_id = int(pathlib.Path(self.sysfs, "device").read_text().strip(), 16)
+    except (OSError, ValueError):
+      self.pci_device_id = dev_id
+    self.gpu_name = gk104_name(self.pci_device_id)
     self._bars = {}          # bar -> (fd, mmap_ptr, size, memoryview)
     self._config_fd = None
     self._fini_done = False
@@ -1150,6 +1168,16 @@ class NVDevice:
     # can re-gate power domains).
     if not _posted and os.environ.get("KEPLER_VBIOS_DEVINIT", "1") != "0":
       vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
+      # The checked-in image is a Palit GTX 770 ROM.  A 660 Ti has a
+      # different board power/clock table, so never silently execute the 770
+      # devinit scripts on a cold 660 Ti.  A POSTed card skips this block and
+      # can still be probed without a ROM; a cold card requires an explicit
+      # dump supplied by the operator.
+      if (getattr(dev.hw, "pci_device_id", 0) == 0x1183 and
+          "KEPLER_VBIOS" not in os.environ):
+        raise RuntimeError(
+          "cold GTX 660 Ti (10de:1183) requires KEPLER_VBIOS=<660Ti ROM>; "
+          "the default Palit.GTX770 ROM is not safe to execute")
       image, _, scripts = vbios_init_info(vbios_path)
       print(f"[kepler] VBIOS direct devinit script0={scripts[0]:#x}")
       for script in scripts:
@@ -2308,9 +2336,9 @@ def inspect_vbios(path):
     pos += 4
   if not pcirs:
     raise ValueError("VBIOS has no PCIR structure")
-  matches = [x for x in pcirs if x[1:3] == (0x10de, 0x1184)]
+  matches = [x for x in pcirs if x[1] == 0x10de and x[2] in GK104_PCI_IDS]
   if not matches:
-    raise ValueError("VBIOS does not contain a GK104/GTX 770 (10DE:1184) image")
+    raise ValueError("VBIOS does not contain a supported NVIDIA GK104 image")
 
   # BIT is the modern Kepler table directory.  Nouveau searches for the
   # extended signature ff b8 "BIT"; the header fields are documented by
@@ -2329,7 +2357,7 @@ def inspect_vbios(path):
   print(f"vbios: path={path} bytes={len(data)} sha256={hashlib.sha256(data).hexdigest()}")
   for p, vendor, device, image_len in matches:
     rom_base = data.rfind(b"\x55\xaa", max(0, p - 0x1000), p + 1)
-    print(f"vbios: PCIR@{p:#x} id={vendor:04X}:{device:04X} "
+    print(f"vbios: PCIR@{p:#x} id={vendor:04X}:{device:04X} ({gk104_name(device)}) "
           f"image_base={(rom_base if rom_base >= 0 else 'unknown')} "
           f"image_bytes={image_len}")
   if bit < 0:
@@ -2347,12 +2375,13 @@ def inspect_vbios(path):
             f"raw={(raw_offset if raw_offset is not None else 'unknown')}")
   return data
 
-def _vbios_first_image(data, device=0x1184):
+def _vbios_first_image(data, device=None):
   """Return the clean PCI ROM image for a matching GK104 image in an NVGI dump."""
+  allowed = GK104_PCI_IDS if device is None else {device}
   for pcir in range(len(data)):
     if data[pcir:pcir + 4] != b"PCIR" or pcir + 0x12 > len(data): continue
     vendor, dev = struct.unpack_from("<HH", data, pcir + 4)
-    if vendor != 0x10de or dev != device: continue
+    if vendor != 0x10de or dev not in allowed: continue
     size = struct.unpack_from("<H", data, pcir + 0x10)[0] * 512
     base = data.rfind(b"\x55\xaa", max(0, pcir - 0x1000), pcir + 1)
     if base >= 0 and base + size <= len(data): return data[base:base + size]
@@ -8054,7 +8083,9 @@ def main():
       sys.exit(1)
     d.bar_info(0)  # mmap the register BAR before any MMIO
     boot0 = d.mmio_read32(0, 0x0)  # PMC_BOOT_0: chip id + stepping
-    print(f"probe: PMC_BOOT_0=0x{boot0:08x} (chip_id={(boot0>>20)&0xfff}, "
+    pci_id = getattr(d, "pci_device_id", 0)
+    print(f"probe: {gk104_name(pci_id)} PCI=10de:{pci_id:04x} "
+          f"PMC_BOOT_0=0x{boot0:08x} (chip_id={(boot0>>20)&0xfff}, "
           f"revision=0x{(boot0>>4)&0xff}, fab=0x{(boot0>>4)&0xf})")
     d.fini()
     return
