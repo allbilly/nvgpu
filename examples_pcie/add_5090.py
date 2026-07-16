@@ -19,6 +19,27 @@ import os, sys, ctypes, ctypes.util, time, mmap, struct, array as _array_mod, so
 from typing import cast, Any, ClassVar, Generic, TypeVar
 from dataclasses import dataclass, replace
 
+# The generated autogen wrapper only searches a few conventional CUDA paths.
+# Find an installed libnvrtc before importing it, so a versioned CUDA install
+# such as /usr/local/cuda-12.8 works without requiring an NVRTC_PATH export.
+def _prepare_nvrtc_path():
+  if pathlib.Path(os.environ.get("NVRTC_PATH", "")).is_file(): return
+  roots = [os.environ[k] for k in ("CUDA_HOME", "CUDA_PATH", "CUDA_ROOT") if os.environ.get(k)]
+  roots += ["/usr/local/cuda", "/opt/cuda"]
+  roots += [str(p) for p in sorted(pathlib.Path("/usr/local").glob("cuda-*"), reverse=True)]
+  roots += ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"]
+  seen = set()
+  for root in roots:
+    root = pathlib.Path(root)
+    for directory in (root, root / "lib64", root / "lib", root / "targets/x86_64-linux/lib"):
+      if directory in seen or not directory.is_dir(): continue
+      seen.add(directory)
+      matches = sorted(directory.glob("libnvrtc.so*"))
+      if matches:
+        os.environ["NVRTC_PATH"] = str(matches[0])
+        return
+_prepare_nvrtc_path()
+
 # --- autogen ctypes (allowed by goal: "ctypes constants only") ---
 from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci, nvrtc
 from tinygrad.runtime.autogen import nv_regs
