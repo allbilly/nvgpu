@@ -795,12 +795,16 @@ def test_12_macos_replug_preflight() -> None:
       "macOS live path must skip PRAMIN literal fallback on XOR virgin"
   assert 'setdefault("KEPLER_PRAMIN_MEMX", "1")' in src, \
       "macOS live path must PRAMIN-store via MEMX after bit0 (host 0x1700 kills)"
+  assert 'setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "1")' in src, \
+      "macOS live path must opt into pre-bit0 BAR1 root staging"
   assert 'setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")' in src, \
       "macOS offline path must allow host ram_program for golden mmiotrace"
   assert "--mmiotrace-selftest" in src, \
       "macOS wrapper must treat --mmiotrace-selftest as an offline flag"
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
   pcie_src = pcie.read_text(encoding="utf-8")
+  assert 'setdefault("KEPLER_TINYGPU_ATOMIC_BAR1"' not in pcie_src, \
+      "shared/Linux entrypoint must not enable TinyGPU BAR1 root staging"
   assert "_gk104_post_ram_fb_ltc" in pcie_src, \
       "live cold path must call shared _gk104_post_ram_fb_ltc"
 
