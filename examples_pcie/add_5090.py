@@ -11,7 +11,7 @@ selected unbound PCI device's BARs directly from sysfs; macOS keeps the
 existing TinyGPU transport.
 
 The only unconditional external dependencies are:
-  - tinygrad.runtime.autogen.{nv, nv_570, nv_regs, pci, libc, nvrtc} (ctypes constants)
+  - tinygrad.runtime.autogen.{nv, nv_570, nv_regs, pci, libc} (ctypes constants)
   - Python standard library
 """
 from __future__ import annotations
@@ -19,29 +19,16 @@ import os, sys, ctypes, ctypes.util, time, mmap, struct, array as _array_mod, so
 from typing import cast, Any, ClassVar, Generic, TypeVar
 from dataclasses import dataclass, replace
 
-# The generated autogen wrapper only searches a few conventional CUDA paths.
-# Find an installed libnvrtc before importing it, so a versioned CUDA install
-# such as /usr/local/cuda-12.8 works without requiring an NVRTC_PATH export.
-def _prepare_nvrtc_path():
-  if pathlib.Path(os.environ.get("NVRTC_PATH", "")).is_file(): return
-  roots = [os.environ[k] for k in ("CUDA_HOME", "CUDA_PATH", "CUDA_ROOT") if os.environ.get(k)]
-  roots += ["/usr/local/cuda", "/opt/cuda"]
-  roots += [str(p) for p in sorted(pathlib.Path("/usr/local").glob("cuda-*"), reverse=True)]
-  roots += ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib"]
-  seen = set()
-  for root in roots:
-    root = pathlib.Path(root)
-    for directory in (root, root / "lib64", root / "lib", root / "targets/x86_64-linux/lib"):
-      if directory in seen or not directory.is_dir(): continue
-      seen.add(directory)
-      matches = sorted(directory.glob("libnvrtc.so*"))
-      if matches:
-        os.environ["NVRTC_PATH"] = str(matches[0])
-        return
-_prepare_nvrtc_path()
+# Resolve the checked-in tinygrad source only for its generated register and
+# ctypes definitions.  This keeps the example runnable as `python3
+# examples_pcie/add_5090.py` from a clean checkout without importing the
+# high-level tinygrad runtime.
+_REF_TINYGRAD = pathlib.Path(__file__).resolve().parents[1] / "ref" / "tinygrad"
+if _REF_TINYGRAD.is_dir() and str(_REF_TINYGRAD) not in sys.path:
+  sys.path.insert(0, str(_REF_TINYGRAD))
 
 # --- autogen ctypes (allowed by goal: "ctypes constants only") ---
-from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci, nvrtc
+from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
 from tinygrad.runtime.autogen import nv_regs
 from tinygrad.runtime.autogen import libc
 
@@ -678,8 +665,9 @@ class NVDev:
     self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
     self.fw_name = {"GB2": "gb202", "AD1": "ad102", "GA1": "ga102"}[self.chip_name[:3]]
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
-    # Construct the falcon/GSP IPs; the GB202 path is selected by NV_GSP below.
-    self.flcn = NV_FLCN(self)
+    # GB202/Blackwell uses the FMC chain-of-trust boot path; GA102/AD102
+    # retain the older Falcon secure-boot path.
+    self.flcn = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
     self.gsp = NV_GSP(self)
     if needs_reset: self.flcn.wait_for_reset()
 
@@ -718,8 +706,8 @@ class NVDev:
 
 # ============================================================================
 # nv/ip.py (vendored from ref/tinygrad/tinygrad/runtime/support/nv/ip.py)
-# Slimmed: NV_FLCN (skip NV_FLCN_COT — we run GA102 not GB2xx), NV_GSP,
-#          NVRpcQueue (with run_cpu_seq handling).
+# Slimmed: NV_FLCN/NV_FLCN_COT, NV_GSP, NVRpcQueue
+#          (with run_cpu_seq handling).
 # ============================================================================
 @dataclasses.dataclass(frozen=True)
 class GRBufDesc:
@@ -952,6 +940,66 @@ class NV_FLCN(NV_IP):
       self.nvdev.NV_PFALCON_FALCON_RM.with_base(base).write(self.nvdev.chip_id)
 
 
+class NV_FLCN_COT(NV_IP):
+  def wait_for_reset(self):
+    self.nvdev.include("dev_therm", "gb202")
+    wait_cond(lambda _: self.nvdev.NV_THERM_I2CS_SCRATCH.read() == 0xff, "waiting for reset")
+
+  def init_sw(self):
+    self.nvdev.include("dev_gsp", "ga102")
+    self.nvdev.include("dev_falcon_v4", "gh100")
+    self.nvdev.include("dev_vm", "gh100")
+    self.nvdev.include("dev_fsp_pri", "gh100")
+    self.nvdev.include("dev_bus", "tu102")
+
+    self.fmc_boot_args_view, _, fmc_boot_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(nv.GSP_FMC_BOOT_PARAMS),
+      data=bytes(nv.GSP_FMC_BOOT_PARAMS()))
+    self.fmc_boot_args_sysmem = fmc_boot_addrs[0]
+    self.init_fmc_image()
+
+  def init_fmc_image(self):
+    _, sections, _ = elf_loader(fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", "fmc-570.144.bin",
+                                         "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece"))
+    def _section(s): return next((sh.content for sh in sections if sh.name == s))
+    self.fmc_booter_image, self.fmc_booter_hash = _section("image"), memoryview(_section("hash")).cast('I')
+    self.fmc_booter_sig, self.fmc_booter_pkey = memoryview(_section("signature")).cast('I'), memoryview(_section("publickey") + b"\x00" * 3).cast('I')
+    _, _, fmc_booter_addrs = self.nvdev._alloc_boot_mem(len(self.fmc_booter_image), data=self.fmc_booter_image)
+    self.fmc_booter_bar1 = fmc_booter_addrs[0]
+
+  def init_hw(self):
+    self.falcon = 0x00110000
+
+    boot_args = nv.GSP_ACR_BOOT_GSP_RM_PARAMS(gspRmDescOffset=self.nvdev.gsp.wpr_meta_sysmem,
+      gspRmDescSize=ctypes.sizeof(nv.GspFwWprMeta), target=nv.GSP_DMA_TARGET_COHERENT_SYSTEM, bIsGspRmBoot=True)
+    rm_args = nv.GSP_RM_PARAMS(bootArgsOffset=self.nvdev.gsp.libos_args_sysmem, target=nv.GSP_DMA_TARGET_COHERENT_SYSTEM)
+    self.fmc_boot_args_view[:ctypes.sizeof(nv.GSP_FMC_BOOT_PARAMS)] = bytes(nv.GSP_FMC_BOOT_PARAMS(bootGspRmParams=boot_args, gspRmParams=rm_args))
+
+    cot_payload = nv.NVDM_PAYLOAD_COT(version=0x2, size=ctypes.sizeof(nv.NVDM_PAYLOAD_COT), frtsVidmemOffset=0x1c00000, frtsVidmemSize=0x100000,
+      gspBootArgsSysmemOffset=self.fmc_boot_args_sysmem, gspFmcSysmemOffset=self.fmc_booter_bar1)
+    for i,x in enumerate(self.fmc_booter_hash): cot_payload.hash384[i] = x
+    for i,x in enumerate(self.fmc_booter_sig): cot_payload.signature[i] = x
+    for i,x in enumerate(self.fmc_booter_pkey): cot_payload.publicKey[i] = x
+
+    self.kfsp_send_msg(nv.NVDM_TYPE_COT, bytes(cot_payload))
+    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read_bitfields()['riscv_br_priv_lockdown'], value=0)
+
+  def kfsp_send_msg(self, nvmd:int, buf:bytes):
+    # All single-packets go to seid 0
+    headers = int.to_bytes((1 << 31) | (1 << 30), 4, 'little') + int.to_bytes((0x7e << 0) | (0x10de << 8) | (nvmd << 24), 4, 'little')
+    buf = headers + buf + (4 - (len(buf) % 4)) * b'\x00'
+    assert len(buf) < 0x400, f"FSP message too long: {len(buf)} bytes, max 1024 bytes"
+
+    self.nvdev.NV_PFSP_EMEMC[0].write(offs=0, blk=0, aincw=1, aincr=0)
+    for i in range(0, len(buf), 4): self.nvdev.NV_PFSP_EMEMD[0].write(int.from_bytes(buf[i:i+4], 'little'))
+
+    self.nvdev.NV_PFSP_QUEUE_TAIL[0].write(len(buf) - 4)
+    self.nvdev.NV_PFSP_QUEUE_HEAD[0].write(0)
+
+    # Waiting for a response
+    wait_cond(lambda: self.nvdev.NV_PFSP_MSGQ_HEAD[0].read() != self.nvdev.NV_PFSP_MSGQ_TAIL[0].read(), msg="FSP didn't respond to message")
+
+    self.nvdev.NV_PFSP_EMEMC[0].write(offs=0, blk=0, aincw=0, aincr=1)
+    self.nvdev.NV_PFSP_MSGQ_TAIL[0].write(self.nvdev.NV_PFSP_MSGQ_HEAD[0].read())
 class NV_GSP(NV_IP):
   def init_sw(self):
     self.handle_gen = itertools.count(0xcf000000)
@@ -1768,51 +1816,269 @@ def describe_args(method, args):
     return [f"pcas2_action=0x{args[0]:x}"]
   return [f"arg{i}=0x{arg:08x}" for i, arg in enumerate(args)]
 
-# The SM86 hand-built image above belongs to add.py and is intentionally not
-# used by this file.  Blackwell SASS is generated by NVRTC on the target host;
-# nvcc is not needed at runtime.  NVRTC's CUBIN output is an ELF image that
-# the same standalone NVProgram/elf_loader path consumes below.
-_BLACKWELL_CUDA_SOURCE = r'''extern "C" __global__ void E_4(const float *a, const float *b, float *out) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    out[0] = a[0] + b[0];
-    out[1] = a[1] + b[1];
-    out[2] = a[2] + b[2];
-    out[3] = a[3] + b[3];
-  }
-}'''
+class CubinHelper:
+  class Reg:
+    RZ = 255
+    R0 = 0; R1 = 1; R2 = 2; R3 = 3; R4 = 4; R5 = 5; R6 = 6; R7 = 7
+    R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15
 
-def _nvrtc_check(status, prog=None):
-  if status == nvrtc.NVRTC_SUCCESS: return
-  log = ""
-  if prog:
-    log_sz = ctypes.c_uint64()
-    if nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(log_sz)) == nvrtc.NVRTC_SUCCESS and log_sz.value:
-      log_buf = ctypes.create_string_buffer(log_sz.value)
-      nvrtc.nvrtcGetProgramLog(prog, log_buf)
-      log = log_buf.value.decode(errors="replace")
-  err = ctypes.string_at(nvrtc.nvrtcGetErrorString(status)).decode(errors="replace")
-  raise RuntimeError(f"NVRTC {err}{(': ' + log.strip()) if log.strip() else ''}")
+  class UReg:
+    URZ = 255  # SM100+ has eight-bit uniform-register fields
+    UR4 = 4  # only UR4 is used in our cubin
+
+  SECTION_NAMES = (
+    ".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.E_4", ".nv.info.E_4", ".nv.shared.E_4",
+    ".nv.constant0.E_4", ".rel.nv.constant0.E_4", ".debug_frame", ".rel.debug_frame", ".rela.debug_frame", ".nv.callgraph",
+    ".nv.prototype", ".nv.rel.action"
+  )
+  SYMBOL_NAMES = (
+    ".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.E_4", ".nv.info.E_4", ".nv.shared.E_4",
+    ".rel.nv.constant0.E_4", ".nv.constant0.E_4", ".debug_frame", ".rel.debug_frame", ".rela.debug_frame", ".nv.callgraph",
+    ".nv.prototype", ".nv.rel.action", "E_4"
+  )
+  SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB, SHT_REL = 1, 2, 3, 9
+  SHT_CUDA_INFO, SHT_CUDA_CALLGRAPH, SHT_CUDA_RELOCINFO = 0x70000000, 0x70000001, 0x7000000b
+  SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHF_INFO_LINK = 1, 2, 4, 0x40
+  STB_GLOBAL, STT_SECTION, STT_FUNC = 1, 3, 2
+  PT_LOAD, PT_PHDR = 1, 6
+  PF_X, PF_R = 1, 4
+  ET_EXEC, EM_CUDA = 2, 190
+  EV_CURRENT, ELF_ABIVERSION, ELF_VERSION = 1, 7, 128
+  ELFOSABI_CUDA = 0x33
+  ELFCLASS64, ELFDATA2LSB = 2, 1
+  # CUDA ELF flags: real SM120 + virtual SM120 + unified texture and 64-bit
+  # addressing flags.  This is the SM120 equivalent of add.py's 0x560556.
+  EF_CUDA_SM120 = 0x78
+  EF_CUDA_VIRTUAL_SM120 = 0x780000
+  EF_CUDA_FLAGS = EF_CUDA_VIRTUAL_SM120 | 0x500 | EF_CUDA_SM120
+  ELF_HEADER_SIZE = 64
+  SECTION_HEADER_SIZE = 64
+  PROGRAM_HEADER_SIZE = 56
+  SECTION_HEADERS_OFF = 1920
+  PROGRAM_HEADERS_OFF = 2688
+  SHSTRTAB_OFF = 64
+  STRTAB_OFF = 283
+  SYMTAB_OFF = 512
+  DEBUG_FRAME_OFF = 680
+  NV_INFO_OFF = 792
+  NV_INFO_E4_OFF = 828
+  NV_CALLGRAPH_OFF = 932
+  NV_REL_ACTION_OFF = 968
+  REL_DEBUG_FRAME_OFF = 984
+  NV_CONSTANT0_OFF = 1000
+  NV_CONSTANT0_SIZE = 376
+  TEXT_OFF = 1408
+  @staticmethod
+  def string_table(names):
+    table, offsets = bytearray(b"\0"), {}
+    for name in names:
+      offsets[name] = len(table)
+      table += name.encode() + b"\0"
+    return bytes(table), offsets
+
+  @staticmethod
+  def words_blob(words): return b"".join(struct.pack("<I", w) for w in (words if isinstance(words, (list, tuple)) else (words,)))
+
+  @staticmethod
+  def header(phoff, shoff, phnum, shnum, shstrndx):
+    ident = b"\x7fELF" + bytes((CubinHelper.ELFCLASS64, CubinHelper.ELFDATA2LSB, CubinHelper.EV_CURRENT, CubinHelper.ELFOSABI_CUDA, CubinHelper.ELF_ABIVERSION)) + bytes(7)
+    return struct.pack("<16sHHIQQQIHHHHHH", ident, CubinHelper.ET_EXEC, CubinHelper.EM_CUDA, CubinHelper.ELF_VERSION, 0, phoff, shoff, CubinHelper.EF_CUDA_FLAGS, 64, 56, phnum, 64, shnum, shstrndx)
+
+  @staticmethod
+  def symtab_entry(name, bind, typ, other, shndx, value=0, size=0): return struct.pack("<IBBHQQ", name, (bind << 4) | typ, other, shndx, value, size)
+
+  @staticmethod
+  def dwarf64_record(payload): return struct.pack("<IQ", 0xffffffff, len(payload)) + payload
+
+  def cie_record(self):
+    cie_id, version, augmentation, address_size, segment_size = 0xffffffffffffffff, 3, 0, 4, 0x7c
+    code_align, data_align, return_register = 0xffffffff, 0x0f, 0x0c
+    frame_instructions = bytes((0x81, 0x80, 0x80, 0x28, 0x00, 0x08, 0xff, 0x81, 0x80, 0x28, 0x08, 0x81, 0x80, 0x80, 0x28, 0, 0, 0))
+    return self.dwarf64_record(struct.pack("<QBBBBIBB", cie_id, version, augmentation, address_size, segment_size, code_align, data_align, return_register) + frame_instructions)
+
+  def fde_record(self):
+    cie_pointer, initial_location, address_range = 0, 0, 512
+    frame_instructions = self.words_blob((0x404, 0x3c0400, 0x810c0000, 0x288080, 0xfffffc04, 0x3f, 0))
+    return self.dwarf64_record(struct.pack("<QQQ", cie_pointer, initial_location, address_range) + frame_instructions)
+
+  def nv_info_attr(self, kind, selector, payload_words, format_byte=4): return self.words_blob(((kind << 12) | (selector << 8) | format_byte, *payload_words))
+
+  def section_header(self, name, typ, flags, addr, offset, size, link=0, info=0, align=1, entsize=0): return (self.SHN[name] if name else 0, typ, flags, addr, offset, size, link, info, align, entsize)
+
+  def program_header(self, typ, flags, offset, filesz, memsz=None, vaddr=0, paddr=0, align=8): return (typ, flags, offset, vaddr, paddr, filesz, filesz if memsz is None else memsz, align)
+
+  def __init__(self):
+    self.SHSTRTAB, self.SHN = self.string_table(self.SECTION_NAMES)
+    self.STRTAB, self.STN = self.string_table(self.SYMBOL_NAMES)
+    self.SYMTAB = b"".join((
+      self.symtab_entry(0, 0, 0, 0, 0),
+      self.symtab_entry(self.STN[".text.E_4"], 0, self.STT_SECTION, 0, 11),
+      self.symtab_entry(self.STN[".nv.constant0.E_4"], 0, self.STT_SECTION, 0, 10),
+      self.symtab_entry(self.STN[".debug_frame"], 0, self.STT_SECTION, 0, 4),
+      self.symtab_entry(self.STN[".nv.callgraph"], 0, self.STT_SECTION, 0, 7),
+      self.symtab_entry(self.STN[".nv.rel.action"], 0, self.STT_SECTION, 0, 8),
+      self.symtab_entry(self.STN["E_4"], self.STB_GLOBAL, self.STT_FUNC, 0x10, 11, size=512),
+    ))
+    self.DEBUG_FRAME = self.cie_record() + self.fde_record()
+    self.NV_INFO = b"".join((
+      self.nv_info_attr(0x82, 0xf, (6, 14)),
+      self.nv_info_attr(0x81, 0x1, (6, 0)),
+      self.nv_info_attr(0x81, 0x2, (6, 0)),
+    ))
+    self.NV_INFO_E4 = b"".join((
+      self.nv_info_attr(0x43, 0x7, (128, 0x3501)),
+      self.nv_info_attr(0x80, 0xa, (2, 0x180160, 0x181903)),
+      self.nv_info_attr(0xc1, 0x7, (0, 0x100002, 0x21f000)),
+      self.nv_info_attr(0xc1, 0x7, (0, 0x80001, 0x21f000)),
+      self.nv_info_attr(0xc1, 0x7, (0, 0, 0x21f000)),
+      self.nv_info_attr(0xff1, 0xb, ((0x41 << 12) | (0xc << 8) | 4, 240), format_byte=3),
+      self.nv_info_attr(0xc0, 0x5, (1, 1, 1)),
+    ))
+    self.NV_CALLGRAPH = b"".join(struct.pack("<II", 0, target) for target in (0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc))
+    self.NV_REL_ACTION = struct.pack("<IIHHHH", 115, 0, 0, 0x1100, 0x0025, 0x3605)
+    self.REL_DEBUG_FRAME = struct.pack("<QQ", 68, (6 << 32) | 2)
+    self.SECTION_HEADERS = (
+      self.section_header("", 0, 0, 0, 0, 0, align=0),
+      self.section_header(".shstrtab", self.SHT_STRTAB, 0, 0, self.SHSTRTAB_OFF, len(self.SHSTRTAB)),
+      self.section_header(".strtab", self.SHT_STRTAB, 0, 0, self.STRTAB_OFF, len(self.STRTAB)),
+      self.section_header(".symtab", self.SHT_SYMTAB, 0, 0, self.SYMTAB_OFF, len(self.SYMTAB), link=2, info=6, align=8, entsize=24),
+      self.section_header(".debug_frame", self.SHT_PROGBITS, 0, 0, self.DEBUG_FRAME_OFF, len(self.DEBUG_FRAME)),
+      self.section_header(".nv.info", self.SHT_CUDA_INFO, 0, 0, self.NV_INFO_OFF, len(self.NV_INFO), link=3, align=4),
+      self.section_header(".nv.info.E_4", self.SHT_CUDA_INFO, self.SHF_INFO_LINK, 0, self.NV_INFO_E4_OFF, len(self.NV_INFO_E4), link=3, info=11, align=4),
+      self.section_header(".nv.callgraph", self.SHT_CUDA_CALLGRAPH, 0, 0, self.NV_CALLGRAPH_OFF, len(self.NV_CALLGRAPH), link=3, align=4, entsize=8),
+      self.section_header(".nv.rel.action", self.SHT_CUDA_RELOCINFO, 0, 0, self.NV_REL_ACTION_OFF, len(self.NV_REL_ACTION), align=8, entsize=8),
+      self.section_header(".rel.debug_frame", self.SHT_REL, self.SHF_INFO_LINK, 0, self.REL_DEBUG_FRAME_OFF, len(self.REL_DEBUG_FRAME), link=3, info=4, align=8, entsize=16),
+      self.section_header(".nv.constant0.E_4", self.SHT_PROGBITS, self.SHF_ALLOC | self.SHF_INFO_LINK, 0, self.NV_CONSTANT0_OFF, self.NV_CONSTANT0_SIZE, info=11, align=4),
+      self.section_header(".text.E_4", self.SHT_PROGBITS, self.SHF_ALLOC | self.SHF_EXECINSTR, 0, self.TEXT_OFF, 512, link=3, info=0x0e000006, align=128),
+    )
+    self.PROGRAM_HEADERS = (
+      self.program_header(self.PT_PHDR, self.PF_R | self.PF_X, self.PROGRAM_HEADERS_OFF, 168),
+      self.program_header(self.PT_LOAD, self.PF_R | self.PF_X, self.NV_CONSTANT0_OFF, 920),
+      self.program_header(self.PT_LOAD, self.PF_R | self.PF_X, self.PROGRAM_HEADERS_OFF, 168),
+    )
+
+ch = CubinHelper()
+
+def _bw_field(inst, lo, width, value):
+  mask = ((1 << width) - 1) << lo
+  return (inst & ~mask) | ((value << lo) & mask)
+
+def _bw_sched(word):
+  # SM120 removed the SM80 YIELD and reuse-control fields.
+  return word & ~(1 << 13) & ~(((1 << 5) - 1) << 26)
+
+def _bw_inst(opcode, sched):
+  return (0x7 << 12) | opcode | (_bw_sched(sched) << 96)
+
+def _bw_words(inst):
+  return struct.unpack("<4I", struct.pack("<QQ", inst & ((1 << 64) - 1), inst >> 64))
+
+def _bw_ldc(dst, offset, sched):
+  inst = _bw_inst(0xb82, sched)
+  inst = _bw_field(inst, 16, 8, dst)
+  inst = _bw_field(inst, 24, 8, ch.Reg.RZ)
+  inst = _bw_field(inst, 38, 16, offset)
+  inst = _bw_field(inst, 54, 5, 0)
+  inst = _bw_field(inst, 73, 3, 4)  # B32
+  inst = _bw_field(inst, 78, 2, 0)  # indexed
+  inst = _bw_field(inst, 80, 2, 0)  # SM120 tex/hdr unpack
+  return _bw_words(inst)
+
+def _bw_ldcu64(dst, offset, sched):
+  inst = _bw_inst(0x7ac, sched)
+  inst = _bw_field(inst, 16, 8, dst)
+  inst = _bw_field(inst, 24, 8, ch.UReg.URZ)
+  inst = _bw_field(inst, 37, 17, offset)
+  inst = _bw_field(inst, 54, 5, 0)
+  inst = _bw_field(inst, 73, 3, 5)  # B64
+  inst = _bw_field(inst, 80, 2, 0)
+  return _bw_words(_bw_field(inst, 91, 1, 1))
+
+def _bw_ldg(dst, addr, offset, sched):
+  inst = _bw_inst(0x981, sched)
+  inst = _bw_field(inst, 16, 8, dst)
+  inst = _bw_field(inst, 24, 8, addr)
+  inst = _bw_field(inst, 32, 8, ch.UReg.UR4)
+  inst = _bw_field(inst, 40, 24, offset)
+  inst = _bw_field(inst, 72, 1, 1)  # uniform address is 64-bit
+  inst = _bw_field(inst, 73, 3, 6)  # B128
+  inst = _bw_field(inst, 81, 3, 7)  # predicate destination: true
+  inst = _bw_field(inst, 84, 3, 1)  # normal eviction priority
+  inst = _bw_field(inst, 90, 1, 1)  # register address is 64-bit
+  inst = _bw_field(inst, 91, 1, 1)  # extended address form
+  return _bw_words(inst)
+
+def _bw_fadd(dst, src0, src1, sched):
+  inst = _bw_inst(0x021, sched)
+  inst = _bw_field(inst, 9, 3, 1)  # register/register ALU form
+  inst = _bw_field(inst, 16, 8, dst)
+  inst = _bw_field(inst, 24, 8, src0)
+  inst = _bw_field(inst, 32, 8, src1)
+  return _bw_words(inst)
+
+def _bw_stg(addr, data, offset, sched):
+  inst = _bw_inst(0x986, sched)
+  inst = _bw_field(inst, 24, 8, addr)
+  inst = _bw_field(inst, 32, 8, data)
+  inst = _bw_field(inst, 40, 24, offset)
+  inst = _bw_field(inst, 64, 8, ch.UReg.UR4)
+  inst = _bw_field(inst, 72, 1, 1)
+  inst = _bw_field(inst, 73, 3, 6)  # B128
+  inst = _bw_field(inst, 84, 3, 1)  # normal eviction priority
+  inst = _bw_field(inst, 91, 1, 1)
+  return _bw_words(inst)
+
+def _bw_exit(sched):
+  inst = _bw_inst(0x94d, sched)
+  inst = _bw_field(inst, 87, 3, 7)
+  return _bw_words(inst)
+
+def _bw_bra_self(sched):
+  inst = _bw_inst(0x947, sched)
+  inst = _bw_field(inst, 16, 8, 0xfc)  # low byte of rel32(-4)
+  inst = _bw_field(inst, 34, 48, (1 << 48) - 1)  # upper bits of rel32(-4)
+  inst = _bw_field(inst, 87, 3, 7)
+  return _bw_words(inst)
 
 def build_cubin():
-  """Compile the tiny add kernel to a native SM120 cubin using NVRTC."""
-  arch = os.environ.get("NV5090_CUDA_ARCH", "sm_120")
-  if arch != "sm_120": raise ValueError(f"NV5090_CUDA_ARCH must be sm_120, got {arch!r}")
-  prog = nvrtc.nvrtcProgram()
-  src = ctypes.create_string_buffer(_BLACKWELL_CUDA_SOURCE.encode())
-  name = ctypes.create_string_buffer(b"add_5090.cu")
-  _nvrtc_check(nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src, name, 0, None, None))
-  try:
-    option_bytes = [ctypes.create_string_buffer(x.encode()) for x in (f"--gpu-architecture={arch}", "--std=c++11")]
-    options = (ctypes.POINTER(ctypes.c_char) * len(option_bytes))(*[ctypes.cast(x, ctypes.POINTER(ctypes.c_char)) for x in option_bytes])
-    _nvrtc_check(nvrtc.nvrtcCompileProgram(prog, len(option_bytes), options), prog)
-    cubin_size = ctypes.c_uint64()
-    _nvrtc_check(nvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(cubin_size)), prog)
-    if cubin_size.value == 0: raise RuntimeError("NVRTC returned an empty SM120 cubin")
-    cubin = ctypes.create_string_buffer(cubin_size.value)
-    _nvrtc_check(nvrtc.nvrtcGetCUBIN(prog, cubin), prog)
-    return cubin.raw
-  finally:
-    _nvrtc_check(nvrtc.nvrtcDestroyProgram(ctypes.byref(prog)))
+  bundles = [
+    _bw_ldc(1, 0x028, 0x000fe400),
+    _bw_ldc(4, 0x170, 0x000fe200),
+    _bw_ldcu64(ch.UReg.UR4, 0x118, 0x000fe200),
+    _bw_ldc(5, 0x174, 0x000fe400),
+    _bw_ldc(2, 0x168, 0x000fe400),
+    _bw_ldc(3, 0x16c, 0x000fe400),
+    _bw_ldg(4, 4, 0, 0x000ea800),
+    _bw_ldg(8, 2, 0, 0x000ea400),
+    _bw_fadd(11, 11, 7, 0x004fe200),
+    _bw_fadd(10, 10, 6, 0x000fe200),
+    _bw_fadd(9, 9, 5, 0x000fe200),
+    _bw_fadd(8, 8, 4, 0x000fe200),
+    _bw_ldc(6, 0x160, 0x000fc400),
+    _bw_ldc(7, 0x164, 0x000fca00),
+    _bw_stg(6, 8, 0, 0x000fe200),
+    _bw_exit(0x000fea00),
+    _bw_bra_self(0x000fc000),
+  ]
+  text = b"".join(ch.words_blob(bundle) for bundle in bundles)
+
+  SECTIONS = {
+    ch.SHSTRTAB_OFF: ch.SHSTRTAB, ch.STRTAB_OFF: ch.STRTAB, ch.SYMTAB_OFF: ch.SYMTAB,
+    ch.DEBUG_FRAME_OFF: ch.DEBUG_FRAME,
+    ch.NV_INFO_OFF: ch.NV_INFO, ch.NV_INFO_E4_OFF: ch.NV_INFO_E4, ch.NV_CALLGRAPH_OFF: ch.NV_CALLGRAPH, ch.NV_REL_ACTION_OFF: ch.NV_REL_ACTION,
+    ch.REL_DEBUG_FRAME_OFF: ch.REL_DEBUG_FRAME,
+    ch.NV_CONSTANT0_OFF: bytes(ch.NV_CONSTANT0_SIZE), ch.TEXT_OFF: text,
+  }
+
+  cubin = bytearray(2856)
+  cubin[:ch.ELF_HEADER_SIZE] = ch.header(phoff=ch.PROGRAM_HEADERS_OFF, shoff=ch.SECTION_HEADERS_OFF, phnum=len(ch.PROGRAM_HEADERS), shnum=len(ch.SECTION_HEADERS), shstrndx=1)
+  for offset, data in SECTIONS.items():
+    cubin[offset:offset+len(data)] = data
+  for index, header in enumerate(ch.SECTION_HEADERS):
+    cubin[ch.SECTION_HEADERS_OFF + index * ch.SECTION_HEADER_SIZE:ch.SECTION_HEADERS_OFF + (index + 1) * ch.SECTION_HEADER_SIZE] = struct.pack("<IIQQQQIIQQ", *header)
+  for index, header in enumerate(ch.PROGRAM_HEADERS):
+    cubin[ch.PROGRAM_HEADERS_OFF + index * ch.PROGRAM_HEADER_SIZE:ch.PROGRAM_HEADERS_OFF + (index + 1) * ch.PROGRAM_HEADER_SIZE] = struct.pack("<IIQQQQQQ", *header)
+  return bytes(cubin)
 
 def manual_launch(dev, program, out, a, b):
   kernargs = dev.kernargs_buf.offset(dev.kernargs_offset_allocator.alloc(program.kernargs_alloc_size, 8), program.kernargs_alloc_size)
@@ -1838,11 +2104,18 @@ def manual_launch(dev, program, out, a, b):
   wait_signal(dev.timeline_signal, done_value)
 
 MIDDLE_LAUNCH_WORDS = 20
+MIDDLE_CUBIN_BYTES = 2856
+MIDDLE_CUBIN_SHA256 = "fae3e7ba0c841d07dfa8863be1c91efa945d82aea0f23a70d45899d103d8b2bf"
 
 def middle_selftest():
-  """Tier 1 offline gate: SM120 source + launch words + helper sanity."""
-  assert "__global__ void E_4" in _BLACKWELL_CUDA_SOURCE
-  assert "sm_120" == os.environ.get("NV5090_CUDA_ARCH", "sm_120")
+  """Tier 1 offline gate: hand-built SM120 CUBIN + launch words."""
+  cubin = build_cubin()
+  assert len(cubin) == MIDDLE_CUBIN_BYTES
+  assert struct.unpack_from("<I", cubin, 48)[0] == ch.EF_CUDA_FLAGS
+  assert hashlib.sha256(cubin).hexdigest() == MIDDLE_CUBIN_SHA256
+  image, sections, relocs = elf_loader(cubin, force_section_align=128)
+  assert image.nbytes >= 512 and any(s.name == ".text.E_4" for s in sections)
+  assert len(relocs) == 1 and relocs[0][2] == 2
   words = build_launch_words(0xdeadbeef00001000, 3, 7, 0x2000)
   assert len(words) == MIDDLE_LAUNCH_WORDS, f"launch words {len(words)} != {MIDDLE_LAUNCH_WORDS}"
   decoded = list(decode_words(words))
@@ -1870,7 +2143,7 @@ def middle_selftest():
   for off in range(0, len(data), 8): cs ^= struct.unpack_from("Q", data, off)[0]
   cs = hi32(cs) ^ lo32(cs)
   assert isinstance(cs, int) and 0 <= cs <= 0xffffffff
-  print(f"middle_selftest=ok arch=sm_120 launch_words={len(words)} rpc_checksum=0x{cs:x}")
+  print(f"middle_selftest=ok arch=sm_120 cubin_bytes={len(cubin)} launch_words={len(words)} rpc_checksum=0x{cs:x}")
 class LinuxPCIDevice:
   """Direct BAR/config/sysmem transport for an unbound NVIDIA PCI function."""
   def __init__(self, _devpref="NV", _pcibus=""):
