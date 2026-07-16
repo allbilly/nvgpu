@@ -1,0 +1,10 @@
+=== 2026-07-16T11:19:51+08:00 capture_nvk_mmiotrace ===
+keep_driver=nvidia
+buffer_size_kb=262147
+09=nouveau
+=== NVK add under mmiotrace ===
+vkQueueSubmit(queue, 1, &si, fence) failed: -4
+physdev[0]: GeForce GTX 660 Ti (NVK GK104) vendor=0x10de device=0x1183
+using: GeForce GTX 660 Ti (NVK GK104)
+vk_rc=1
+/home/a/nvgpu/examples_kepler_pcie/capture_nvk_mmiotrace.sh: 98: echo: echo: I/O error

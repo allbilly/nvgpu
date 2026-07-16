@@ -1,0 +1,18 @@
+[Unit]
+Description=Capture mmiotrace of successful NVK add on GTX 660 Ti
+DefaultDependencies=no
+After=multi-user.target
+Wants=multi-user.target
+ConditionPathExists=/home/a/nvgpu/examples_kepler_pcie/.capture_nvk_mmio_once
+
+[Service]
+Type=oneshot
+# Delay so nvidia can bind 3080 before we load nouveau.
+ExecStartPre=/bin/sleep 25
+ExecStart=/bin/sh /home/a/nvgpu/examples_kepler_pcie/capture_nvk_mmiotrace.sh
+ExecStartPost=/bin/rm -f /home/a/nvgpu/examples_kepler_pcie/.capture_nvk_mmio_once
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

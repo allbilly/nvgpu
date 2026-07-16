@@ -1,54 +1,97 @@
 # examples_kepler_pcie
 
-Linux raw-MMIO userspace driver for GTX 770 (Kepler GK104, sm_30) over PCIe.
+Linux raw-MMIO userspace driver for Kepler GK104 cards (GTX 660 Ti/770,
+sm_30) over PCIe.  The PCI scanner accepts both `10de:1183` (660 Ti) and
+`10de:1184` (770), plus the other desktop GK104 IDs.
 Port of `examples_kepler/add.py` (macOS TinyGPU socket transport) to direct
 BAR0/BAR1 mmap via sysfs (`/sys/bus/pci/devices/<bdf>/resourceN`).
 
-## Running the OpenCL add (reference working path)
+## Kepler simple-add status (this box)
 
-A minimal OpenCL vector add is at `../examples_pcie/add_opencl.c`. It runs on
-the RTX 3080 Ti (Ampere GA102) via the NVIDIA proprietary ICD and serves as the
-**known-good reference** for what a successful compute kernel launch looks like.
+| Path | GTX 660 Ti (`10de:1183`) | Notes |
+|------|--------------------------|--------|
+| Rusticl OpenCL (`nouveau`) | FAIL | `HOST0` PDE @ `0x11000` even headless + `iommu=pt` |
+| EGL/GL compute (`compute_add_egl`) | FAIL | PGRAPH context `-16` / GR idle timeout |
+| **NVK Vulkan compute** (`vk_add_compute`) | **works if GPU not wedged** | Confirmed PASS once; fails after raw-MMIO / bad Nouveau state until **reboot** |
+| Raw `add.py --probe` / `--probe-falcon` | OK | Chip ID + FECS/GPCCS start |
+| Raw `add.py` full add | FAIL | GR ctx page did not stabilise |
 
-### Prerequisites
+**GTX 770** previously had a reliable Rusticl OpenCL PASS on this machine; that remains the OpenCL health baseline when that card is installed.
+
+Boot with `iommu=pt` (this kernel ignores `amd_iommu=pt`).  Keep default target `multi-user` (headless) while testing Kepler.  Bind Nouveau only after the 3080 Ti is on `nvidia`.  Do not `rmmod` Kepler (`nve0_bo_move_copy` oops).  PCI FLR alone often **does not** clear a wedged GK104 — use a reboot.
+
+## How to stably run simple add on GTX 660 Ti (NVK)
+
+**Use NVK Vulkan compute, not OpenCL.**  Instability we hit was almost always **GPU channel/GR wedge** from a prior Nouveau OpenCL/GL/`add.py` session — not a random NVK bug on a clean card.
+
+### Prerequisites (once per boot)
+
+1. Kernel cmdline includes `iommu=pt`.
+2. Headless: `systemctl get-default` → `multi-user.target` (no GNOME on boot-VGA Kepler).
+3. `0000:04:00.0` (3080 Ti) already bound to **nvidia**.
+4. `0000:09:00.0` (660 Ti) **unbound** at boot (nouveau blacklisted by nvidia-installer is fine).
+
+### Build (once)
 
 ```sh
-# GCC + OpenCL ICD loader + NVIDIA OpenCL runtime (already on this box)
-sudo apt install gcc ocl-icd-opencl-dev mesa-opencl-icd
-# nvidia-opencl-dev + libnvidia-opencl.so.1 come from the NVIDIA driver package
+cd examples_kepler_pcie
+sudo apt install -y libvulkan-dev glslang-tools
+glslangValidator -V -S comp -o add.spv add.comp
+gcc -O2 -o vk_add_compute vk_add_compute.c -lvulkan
 ```
 
-Verify the ICD is visible:
-```sh
-cat /etc/OpenCL/vendors/nvidia.icd   # -> libnvidia-opencl.so.1
-ls /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1
-```
-
-### Build and run
+### Run (clean Nouveau → NVK add)
 
 ```sh
-cd examples_pcie
-gcc -O2 -o add_opencl add_opencl.c -lOpenCL
-./add_opencl
+# Only after 3080 is on nvidia — never load nouveau earlier in the boot.
+sudo modprobe nouveau modeset=2 runpm=0
+# If not auto-bound:
+#   echo 10de 1183 | sudo tee /sys/bus/pci/drivers/nouveau/new_id
+#   echo 0000:09:00.0 | sudo tee /sys/bus/pci/drivers/nouveau/bind
+
+sudo sh ./nvk_add_health.sh
+# or manually:
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nouveau_icd.json ./vk_add_compute ./add.spv
 ```
 
-Expected output:
+Expected:
+
 ```
-device: NVIDIA GeForce RTX 3080 Ti
+physdev[0]: GeForce GTX 660 Ti (NVK GK104) vendor=0x10de device=0x1183
+using: GeForce GTX 660 Ti (NVK GK104)
 first 5: 0 3 6 9 12
 PASS
 ```
 
-### GTX 770 health check
+### Stability rules
 
-After binding `09:00.0` to Nouveau, run the Kepler-specific wrapper from this
-directory:
+| Do | Don't |
+|----|--------|
+| Run NVK add on a **fresh** Nouveau bind after boot | Run OpenCL / `compute_add_egl` / raw `add.py` **before** NVK on the same bind |
+| Keep headless | Let GNOME/Xorg open Kepler `card*` |
+| If submit returns `-4` / channel kill / job timeout → **reboot**, then bind+NVK again | Expect PCI `reset`/unbind alone to heal a wedged GK104 |
+| Leave Nouveau bound after a PASS (optional) | `rmmod nouveau` (oops risk) |
+
+`nvk_add_health.sh` will try one FLR+rebind retry; if that still fails, reboot is required.
+
+### Why it looked “flaky”
+
+1. First PASS was on a clean headless Nouveau bind.
+2. Later `add.py` raw MMIO + unbind/rebind left GR/FIFO wedged (`PGRAPH` busy, PDE/PTE faults).
+3. Retests then saw all-zero `FAIL` or `VK_ERROR_DEVICE_LOST` — same silicon, bad driver state.
+4. Barriers/fence in `vk_add_compute.c` help host↔shader sync; they do **not** unwedge a dead channel.
+
+## Running the OpenCL add (reference / 770 health)
+
+A minimal OpenCL vector add is at `../examples_pcie/add_opencl.c`. On the
+RTX 3080 Ti it uses the NVIDIA ICD.  For Kepler, use the wrapper below with
+Rusticl after binding `09:00.0` to Nouveau:
 
 ```sh
 ./opencl_add_health.sh
 ```
 
-Expected device/output on this box:
+Expected on a **GTX 770** (prior PASS):
 
 ```
 device: NVE4
@@ -56,13 +99,16 @@ first 5: 0 3 6 9 12
 PASS
 ```
 
-The wrapper requires the GTX 770 to be bound to Nouveau and restricts OpenCL
-to Rusticl.  It also puts Ubuntu's ICD loader before CUDA 12.6's bundled
-`libOpenCL.so.1`; the CUDA copy returns `CL_PLATFORM_NOT_FOUND_KHR` when used
-with the Rusticl-only ICD on this installation.
+**GTX 660 Ti** OpenCL does **not** PASS today (PDE fault).  See `progress.md`.
 
-The `pci id for fd ... driver (null)` lines are Mesa's rusticl ICD probing the
-fd before the NVIDIA ICD wins device selection — cosmetic, not an error.
+```sh
+# Build OpenCL binary if needed
+cd ../examples_pcie && gcc -O2 -o add_opencl add_opencl.c -lOpenCL
+```
+
+The wrapper restricts ICDs to Rusticl and puts distro `libOpenCL` before CUDA's
+bundled copy.  `pci id for fd ... driver (null)` lines from Mesa probing the
+3080 DRM node are cosmetic.
 
 ### Capturing a trace
 
