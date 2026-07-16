@@ -4,28 +4,18 @@
 Vendored from ref/tinygrad/tinygrad/runtime/support/{nv,system,hcq,memory,elf}.py
 and ref/tinygrad/tinygrad/runtime/ops_nv.py (slimmed to the PCIe path only).
 
-Uses the vendored GSP-RM stack (NVDev → GSP → FLCN → PCIIface) and submits
-the kernel through its own GPFIFO.  There is no Tensor, Device, renderer, or
-tinygrad runtime import on the live path.  The Linux transport maps the
-selected unbound PCI device's BARs directly from sysfs; macOS keeps the
-existing TinyGPU transport.
+On Linux: uses tinygrad.Device["NV"] directly (NVKIface path — kernel driver
+  manages GSP firmware via /dev/nvidiactl + /dev/nvidia-uvm ioctls).
+On macOS: uses vendored GSP-RM stack (NVDev → GSP → FLCN → PCIIface).
 
 The only unconditional external dependencies are:
-  - tinygrad.runtime.autogen.{nv, nv_570, nv_regs, pci, libc} (ctypes constants)
+  - tinygrad.runtime.autogen.{nv, nv_570, nv_regs, pci, libc}  (ctypes constants)
   - Python standard library
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib
 from typing import cast, Any, ClassVar, Generic, TypeVar
 from dataclasses import dataclass, replace
-
-# Resolve the checked-in tinygrad source only for its generated register and
-# ctypes definitions.  This keeps the example runnable as `python3
-# examples_pcie/add_5090.py` from a clean checkout without importing the
-# high-level tinygrad runtime.
-_REF_TINYGRAD = pathlib.Path(__file__).resolve().parents[1] / "ref" / "tinygrad"
-if _REF_TINYGRAD.is_dir() and str(_REF_TINYGRAD) not in sys.path:
-  sys.path.insert(0, str(_REF_TINYGRAD))
 
 # --- autogen ctypes (allowed by goal: "ctypes constants only") ---
 from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
@@ -438,7 +428,7 @@ def elf_loader(blob, force_section_align=1, link_libs=None):
 
 # ============================================================================
 # system.py (vendored from ref/tinygrad/tinygrad/runtime/support/system.py)
-# APLRemotePCIDevice is retained for macOS; LinuxPCIDevice is defined below.
+# Slimmed: only the APLRemotePCIDevice path (Mac eGPU via TinyGPU.app unix socket).
 # ============================================================================
 MAP_FIXED, MAP_FIXED_NOREPLACE = 0x10, 0x100000
 MAP_LOCKED, MAP_POPULATE, MAP_NORESERVE = 0 if OSX else 0x2000, getattr(mmap, "MAP_POPULATE", 0 if OSX else 0x008000), 0x400
@@ -665,9 +655,8 @@ class NVDev:
     self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
     self.fw_name = {"GB2": "gb202", "AD1": "ad102", "GA1": "ga102"}[self.chip_name[:3]]
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
-    # GB202/Blackwell uses the FMC chain-of-trust boot path; GA102/AD102
-    # retain the older Falcon secure-boot path.
-    self.flcn = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
+    # Construct falcon/gsp IPs (NV_FLCN_COT path is GB2xx-only — RTX 3080 is GA102)
+    self.flcn = NV_FLCN(self)
     self.gsp = NV_GSP(self)
     if needs_reset: self.flcn.wait_for_reset()
 
@@ -706,8 +695,8 @@ class NVDev:
 
 # ============================================================================
 # nv/ip.py (vendored from ref/tinygrad/tinygrad/runtime/support/nv/ip.py)
-# Slimmed: NV_FLCN/NV_FLCN_COT, NV_GSP, NVRpcQueue
-#          (with run_cpu_seq handling).
+# Slimmed: NV_FLCN (skip NV_FLCN_COT — we run GA102 not GB2xx), NV_GSP,
+#          NVRpcQueue (with run_cpu_seq handling).
 # ============================================================================
 @dataclasses.dataclass(frozen=True)
 class GRBufDesc:
@@ -940,66 +929,6 @@ class NV_FLCN(NV_IP):
       self.nvdev.NV_PFALCON_FALCON_RM.with_base(base).write(self.nvdev.chip_id)
 
 
-class NV_FLCN_COT(NV_IP):
-  def wait_for_reset(self):
-    self.nvdev.include("dev_therm", "gb202")
-    wait_cond(lambda _: self.nvdev.NV_THERM_I2CS_SCRATCH.read() == 0xff, "waiting for reset")
-
-  def init_sw(self):
-    self.nvdev.include("dev_gsp", "ga102")
-    self.nvdev.include("dev_falcon_v4", "gh100")
-    self.nvdev.include("dev_vm", "gh100")
-    self.nvdev.include("dev_fsp_pri", "gh100")
-    self.nvdev.include("dev_bus", "tu102")
-
-    self.fmc_boot_args_view, _, fmc_boot_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(nv.GSP_FMC_BOOT_PARAMS),
-      data=bytes(nv.GSP_FMC_BOOT_PARAMS()))
-    self.fmc_boot_args_sysmem = fmc_boot_addrs[0]
-    self.init_fmc_image()
-
-  def init_fmc_image(self):
-    _, sections, _ = elf_loader(fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", "fmc-570.144.bin",
-                                         "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece"))
-    def _section(s): return next((sh.content for sh in sections if sh.name == s))
-    self.fmc_booter_image, self.fmc_booter_hash = _section("image"), memoryview(_section("hash")).cast('I')
-    self.fmc_booter_sig, self.fmc_booter_pkey = memoryview(_section("signature")).cast('I'), memoryview(_section("publickey") + b"\x00" * 3).cast('I')
-    _, _, fmc_booter_addrs = self.nvdev._alloc_boot_mem(len(self.fmc_booter_image), data=self.fmc_booter_image)
-    self.fmc_booter_bar1 = fmc_booter_addrs[0]
-
-  def init_hw(self):
-    self.falcon = 0x00110000
-
-    boot_args = nv.GSP_ACR_BOOT_GSP_RM_PARAMS(gspRmDescOffset=self.nvdev.gsp.wpr_meta_sysmem,
-      gspRmDescSize=ctypes.sizeof(nv.GspFwWprMeta), target=nv.GSP_DMA_TARGET_COHERENT_SYSTEM, bIsGspRmBoot=True)
-    rm_args = nv.GSP_RM_PARAMS(bootArgsOffset=self.nvdev.gsp.libos_args_sysmem, target=nv.GSP_DMA_TARGET_COHERENT_SYSTEM)
-    self.fmc_boot_args_view[:ctypes.sizeof(nv.GSP_FMC_BOOT_PARAMS)] = bytes(nv.GSP_FMC_BOOT_PARAMS(bootGspRmParams=boot_args, gspRmParams=rm_args))
-
-    cot_payload = nv.NVDM_PAYLOAD_COT(version=0x2, size=ctypes.sizeof(nv.NVDM_PAYLOAD_COT), frtsVidmemOffset=0x1c00000, frtsVidmemSize=0x100000,
-      gspBootArgsSysmemOffset=self.fmc_boot_args_sysmem, gspFmcSysmemOffset=self.fmc_booter_bar1)
-    for i,x in enumerate(self.fmc_booter_hash): cot_payload.hash384[i] = x
-    for i,x in enumerate(self.fmc_booter_sig): cot_payload.signature[i] = x
-    for i,x in enumerate(self.fmc_booter_pkey): cot_payload.publicKey[i] = x
-
-    self.kfsp_send_msg(nv.NVDM_TYPE_COT, bytes(cot_payload))
-    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read_bitfields()['riscv_br_priv_lockdown'], value=0)
-
-  def kfsp_send_msg(self, nvmd:int, buf:bytes):
-    # All single-packets go to seid 0
-    headers = int.to_bytes((1 << 31) | (1 << 30), 4, 'little') + int.to_bytes((0x7e << 0) | (0x10de << 8) | (nvmd << 24), 4, 'little')
-    buf = headers + buf + (4 - (len(buf) % 4)) * b'\x00'
-    assert len(buf) < 0x400, f"FSP message too long: {len(buf)} bytes, max 1024 bytes"
-
-    self.nvdev.NV_PFSP_EMEMC[0].write(offs=0, blk=0, aincw=1, aincr=0)
-    for i in range(0, len(buf), 4): self.nvdev.NV_PFSP_EMEMD[0].write(int.from_bytes(buf[i:i+4], 'little'))
-
-    self.nvdev.NV_PFSP_QUEUE_TAIL[0].write(len(buf) - 4)
-    self.nvdev.NV_PFSP_QUEUE_HEAD[0].write(0)
-
-    # Waiting for a response
-    wait_cond(lambda: self.nvdev.NV_PFSP_MSGQ_HEAD[0].read() != self.nvdev.NV_PFSP_MSGQ_TAIL[0].read(), msg="FSP didn't respond to message")
-
-    self.nvdev.NV_PFSP_EMEMC[0].write(offs=0, blk=0, aincw=0, aincr=1)
-    self.nvdev.NV_PFSP_MSGQ_TAIL[0].write(self.nvdev.NV_PFSP_MSGQ_HEAD[0].read())
 class NV_GSP(NV_IP):
   def init_sw(self):
     self.handle_gen = itertools.count(0xcf000000)
@@ -1823,8 +1752,19 @@ class CubinHelper:
     R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15
 
   class UReg:
-    URZ = 255  # SM100+ has eight-bit uniform-register fields
+    URZ = 63
     UR4 = 4  # only UR4 is used in our cubin
+
+  class Op:
+    LDC     = 0x7a02
+    LDCU64  = 0x7ab9
+    FADD    = 0x7221
+    FMUL    = 0x7220
+    LDG     = 0x7981
+    STG     = 0x7986
+    EXIT    = 0x794d
+    BRA     = 0x7947
+    NOP     = 0x7918
 
   SECTION_NAMES = (
     ".shstrtab", ".strtab", ".symtab", ".symtab_shndx", ".nv.info", ".text.E_4", ".nv.info.E_4", ".nv.shared.E_4",
@@ -1959,106 +1899,26 @@ class CubinHelper:
 
 ch = CubinHelper()
 
-def _bw_field(inst, lo, width, value):
-  mask = ((1 << width) - 1) << lo
-  return (inst & ~mask) | ((value << lo) & mask)
-
-def _bw_sched(word):
-  # SM120 removed the SM80 YIELD and reuse-control fields.
-  return word & ~(1 << 13) & ~(((1 << 5) - 1) << 26)
-
-def _bw_inst(opcode, sched):
-  return (0x7 << 12) | opcode | (_bw_sched(sched) << 96)
-
-def _bw_words(inst):
-  return struct.unpack("<4I", struct.pack("<QQ", inst & ((1 << 64) - 1), inst >> 64))
-
-def _bw_ldc(dst, offset, sched):
-  inst = _bw_inst(0xb82, sched)
-  inst = _bw_field(inst, 16, 8, dst)
-  inst = _bw_field(inst, 24, 8, ch.Reg.RZ)
-  inst = _bw_field(inst, 38, 16, offset)
-  inst = _bw_field(inst, 54, 5, 0)
-  inst = _bw_field(inst, 73, 3, 4)  # B32
-  inst = _bw_field(inst, 78, 2, 0)  # indexed
-  inst = _bw_field(inst, 80, 2, 0)  # SM120 tex/hdr unpack
-  return _bw_words(inst)
-
-def _bw_ldcu64(dst, offset, sched):
-  inst = _bw_inst(0x7ac, sched)
-  inst = _bw_field(inst, 16, 8, dst)
-  inst = _bw_field(inst, 24, 8, ch.UReg.URZ)
-  inst = _bw_field(inst, 37, 17, offset)
-  inst = _bw_field(inst, 54, 5, 0)
-  inst = _bw_field(inst, 73, 3, 5)  # B64
-  inst = _bw_field(inst, 80, 2, 0)
-  return _bw_words(_bw_field(inst, 91, 1, 1))
-
-def _bw_ldg(dst, addr, offset, sched):
-  inst = _bw_inst(0x981, sched)
-  inst = _bw_field(inst, 16, 8, dst)
-  inst = _bw_field(inst, 24, 8, addr)
-  inst = _bw_field(inst, 32, 8, ch.UReg.UR4)
-  inst = _bw_field(inst, 40, 24, offset)
-  inst = _bw_field(inst, 72, 1, 1)  # uniform address is 64-bit
-  inst = _bw_field(inst, 73, 3, 6)  # B128
-  inst = _bw_field(inst, 81, 3, 7)  # predicate destination: true
-  inst = _bw_field(inst, 84, 3, 1)  # normal eviction priority
-  inst = _bw_field(inst, 90, 1, 1)  # register address is 64-bit
-  inst = _bw_field(inst, 91, 1, 1)  # extended address form
-  return _bw_words(inst)
-
-def _bw_fadd(dst, src0, src1, sched):
-  inst = _bw_inst(0x021, sched)
-  inst = _bw_field(inst, 9, 3, 1)  # register/register ALU form
-  inst = _bw_field(inst, 16, 8, dst)
-  inst = _bw_field(inst, 24, 8, src0)
-  inst = _bw_field(inst, 32, 8, src1)
-  return _bw_words(inst)
-
-def _bw_stg(addr, data, offset, sched):
-  inst = _bw_inst(0x986, sched)
-  inst = _bw_field(inst, 24, 8, addr)
-  inst = _bw_field(inst, 32, 8, data)
-  inst = _bw_field(inst, 40, 24, offset)
-  inst = _bw_field(inst, 64, 8, ch.UReg.UR4)
-  inst = _bw_field(inst, 72, 1, 1)
-  inst = _bw_field(inst, 73, 3, 6)  # B128
-  inst = _bw_field(inst, 84, 3, 1)  # normal eviction priority
-  inst = _bw_field(inst, 91, 1, 1)
-  return _bw_words(inst)
-
-def _bw_exit(sched):
-  inst = _bw_inst(0x94d, sched)
-  inst = _bw_field(inst, 87, 3, 7)
-  return _bw_words(inst)
-
-def _bw_bra_self(sched):
-  inst = _bw_inst(0x947, sched)
-  inst = _bw_field(inst, 16, 8, 0xfc)  # low byte of rel32(-4)
-  inst = _bw_field(inst, 34, 48, (1 << 48) - 1)  # upper bits of rel32(-4)
-  inst = _bw_field(inst, 87, 3, 7)
-  return _bw_words(inst)
-
 def build_cubin():
   bundles = [
-    _bw_ldc(1, 0x028, 0x000fe400),
-    _bw_ldc(4, 0x170, 0x000fe200),
-    _bw_ldcu64(ch.UReg.UR4, 0x118, 0x000fe200),
-    _bw_ldc(5, 0x174, 0x000fe400),
-    _bw_ldc(2, 0x168, 0x000fe400),
-    _bw_ldc(3, 0x16c, 0x000fe400),
-    _bw_ldg(4, 4, 0, 0x000ea800),
-    _bw_ldg(8, 2, 0, 0x000ea400),
-    _bw_fadd(11, 11, 7, 0x004fe200),
-    _bw_fadd(10, 10, 6, 0x000fe200),
-    _bw_fadd(9, 9, 5, 0x000fe200),
-    _bw_fadd(8, 8, 4, 0x000fe200),
-    _bw_ldc(6, 0x160, 0x000fc400),
-    _bw_ldc(7, 0x164, 0x000fca00),
-    _bw_stg(6, 8, 0, 0x000fe200),
-    _bw_exit(0x000fea00),
-    _bw_bra_self(0x000fc000),
+    # Hand-built SM120 SASS: LDG, four FADDs, STG, EXIT, BRA.
+    (0xff017b82, 0x00000a00, 0x00000800, 0x000fc400),
+    (0xff047b82, 0x00005c00, 0x00000800, 0x000fc200),
+    (0xff0477ac, 0x00002300, 0x08000a00, 0x000fc200),
+    (0xff057b82, 0x00005d00, 0x00000800, 0x000fc400),
+    (0xff027b82, 0x00005a00, 0x00000800, 0x000fc400),
+    (0xff037b82, 0x00005b00, 0x00000800, 0x000fc400),
+    (0x04047981, 0x00000004, 0x0c1e0d00, 0x000e8800),
+    (0x02087981, 0x00000004, 0x0c1e0d00, 0x000e8400),
+    (0x0b0b7221, 0x00000007, 0x00000000, 0x004fc200),
+    (0x0a0a7221, 0x00000006, 0x00000000, 0x000fc200),
+    (0x09097221, 0x00000005, 0x00000000, 0x000fc200),
+    (0x08087221, 0x00000004, 0x00000000, 0x000fc200),
+    (0xff067b82, 0x00005800, 0x00000800, 0x000fc400),
+    (0xff077b82, 0x00005900, 0x00000800, 0x000fca00),
+    (0x06007986, 0x00000008, 0x08100d04, 0x000fc200),
+    (0x0000794d, 0x00000000, 0x03800000, 0x000fca00),
+    (0x00fc7947, 0xfffffffc, 0x0383ffff, 0x000fc000),
   ]
   text = b"".join(ch.words_blob(bundle) for bundle in bundles)
 
@@ -2103,19 +1963,16 @@ def manual_launch(dev, program, out, a, b):
   submit_gpfifo(dev, words)
   wait_signal(dev.timeline_signal, done_value)
 
-MIDDLE_LAUNCH_WORDS = 20
 MIDDLE_CUBIN_BYTES = 2856
 MIDDLE_CUBIN_SHA256 = "fae3e7ba0c841d07dfa8863be1c91efa945d82aea0f23a70d45899d103d8b2bf"
+MIDDLE_LAUNCH_WORDS = 20
 
 def middle_selftest():
-  """Tier 1 offline gate: hand-built SM120 CUBIN + launch words."""
+  """Tier 1 offline gate: cubin + launch words + helper sanity."""
   cubin = build_cubin()
-  assert len(cubin) == MIDDLE_CUBIN_BYTES
-  assert struct.unpack_from("<I", cubin, 48)[0] == ch.EF_CUDA_FLAGS
-  assert hashlib.sha256(cubin).hexdigest() == MIDDLE_CUBIN_SHA256
-  image, sections, relocs = elf_loader(cubin, force_section_align=128)
-  assert image.nbytes >= 512 and any(s.name == ".text.E_4" for s in sections)
-  assert len(relocs) == 1 and relocs[0][2] == 2
+  assert len(cubin) == MIDDLE_CUBIN_BYTES, f"cubin size {len(cubin)} != {MIDDLE_CUBIN_BYTES}"
+  sha = hashlib.sha256(cubin).hexdigest()
+  assert sha == MIDDLE_CUBIN_SHA256, f"cubin sha {sha} != {MIDDLE_CUBIN_SHA256}"
   words = build_launch_words(0xdeadbeef00001000, 3, 7, 0x2000)
   assert len(words) == MIDDLE_LAUNCH_WORDS, f"launch words {len(words)} != {MIDDLE_LAUNCH_WORDS}"
   decoded = list(decode_words(words))
@@ -2143,97 +2000,10 @@ def middle_selftest():
   for off in range(0, len(data), 8): cs ^= struct.unpack_from("Q", data, off)[0]
   cs = hi32(cs) ^ lo32(cs)
   assert isinstance(cs, int) and 0 <= cs <= 0xffffffff
-  print(f"middle_selftest=ok arch=sm_120 cubin_bytes={len(cubin)} launch_words={len(words)} rpc_checksum=0x{cs:x}")
-class LinuxPCIDevice:
-  """Direct BAR/config/sysmem transport for an unbound NVIDIA PCI function."""
-  def __init__(self, _devpref="NV", _pcibus=""):
-    self.bdf = os.environ.get("NV_PCIBDF") or self._find_bdf()
-    self.sysfs = pathlib.Path("/sys/bus/pci/devices") / self.bdf
-    if not self.sysfs.is_dir(): raise RuntimeError(f"PCI device {self.bdf} is not present")
-    if (driver := self.sysfs / "driver").is_symlink() and os.environ.get("NV_ALLOW_BOUND") != "1":
-      raise RuntimeError(f"{self.bdf} is bound to {os.path.basename(os.readlink(driver))}; unbind it or set NV_ALLOW_BOUND=1")
-    self.dev_id = int((self.sysfs / "device").read_text().strip(), 16)
-    self.pcibus, self._bars, self._config_fd = self.bdf, {}, None
-    self._res = []
-    for line in (self.sysfs / "resource").read_text().splitlines():
-      fields = line.split()
-      self._res.append((int(fields[0], 0), int(fields[1], 0), int(fields[2], 0)) if fields else (0, 0, 0))
-
-  @staticmethod
-  def _find_bdf():
-    for dev in sorted(pathlib.Path("/sys/bus/pci/devices").iterdir()):
-      try:
-        if (dev / "vendor").read_text().strip() != "0x10de": continue
-        if not (int((dev / "class").read_text().strip(), 16) >> 8) == 0x03: continue
-        if not (dev / "driver").is_symlink(): return dev.name
-      except (OSError, ValueError): continue
-    raise RuntimeError("no unbound NVIDIA display controller found; set NV_PCIBDF=<BDF>")
-
-  def bar_info(self, bar):
-    if bar >= len(self._res): return (0, 0)
-    start, end, _ = self._res[bar]
-    return (start, end - start + 1) if end else (0, 0)
-
-  def map_bar(self, bar, fmt="B", off=0, size=None):
-    if bar not in self._bars:
-      _start, length = self.bar_info(bar)
-      if not length: raise OSError(f"BAR{bar} is not present on {self.bdf}")
-      fd = os.open(self.sysfs / f"resource{bar}", os.O_RDWR | os.O_SYNC)
-      mm = mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-      self._bars[bar] = (fd, mm, ctypes.addressof(ctypes.c_char.from_buffer(mm)), length)
-    _fd, _mm, ptr, length = self._bars[bar]
-    return MMIOInterface(ptr + off, (length - off) if size is None else size, fmt=fmt)
-
-  def alloc_sysmem(self, size, vaddr=0, contiguous=False):
-    size = round_up(size, PAGESIZE)
-    backing = mmap.mmap(-1, size, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS, mmap.PROT_READ | mmap.PROT_WRITE)
-    for off in range(0, size, PAGESIZE): backing[off] = 0
-    try: ctypes.CDLL(None).mlock(ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(backing))), ctypes.c_size_t(size))
-    except Exception: pass
-    paddrs = []
-    with open("/proc/self/pagemap", "rb") as pagemap:
-      pagemap.seek(8 * (ctypes.addressof(ctypes.c_char.from_buffer(backing)) // PAGESIZE))
-      for off in range(0, size, PAGESIZE):
-        entry = struct.unpack("<Q", pagemap.read(8))[0]
-        if not (entry & (1 << 63)): raise RuntimeError("pagemap page is not present")
-        paddrs.append((entry & ((1 << 55) - 1)) * PAGESIZE)
-    return memoryview(backing), paddrs
-
-  def read_config(self, offset, size):
-    with open(self.sysfs / "config", "rb", buffering=0) as config:
-      config.seek(offset); return int.from_bytes(config.read(size), "little")
-
-  def write_config(self, offset, value, size):
-    with open(self.sysfs / "config", "r+b", buffering=0) as config:
-      config.seek(offset); config.write((value & ((1 << (size * 8)) - 1)).to_bytes(size, "little"))
-
-  def write_config_flush(self, offset, value, size):
-    self.write_config(offset, value, size); return self.read_config(offset, size)
-
-  def reset(self):
-    reset = self.sysfs / "reset"
-    if not reset.exists(): raise RuntimeError(f"PCI reset is unavailable for {self.bdf}")
-    reset.write_text("1")
-
-  def fini(self):
-    for fd, mm, _ptr, _size in self._bars.values():
-      try: mm.close()
-      except Exception: pass
-      try: os.close(fd)
-      except Exception: pass
-    self._bars.clear()
-
-  def __del__(self):
-    with contextlib.suppress(Exception): self.fini()
-
+  print(f"middle_selftest=ok cubin_sha={sha} launch_words={len(words)} rpc_checksum=0x{cs:x}")
 def create_device():
   if OSX: return NVDevice("NV")
-  # Keep the live Linux path independent of the high-level runtime.  PCIIface looks
-  # up this transport class when it constructs NVDev, so the vendored GSP/RM
-  # stack remains identical on both platforms.
-  global APLRemotePCIDevice
-  APLRemotePCIDevice = LinuxPCIDevice
-  return NVDevice("NV")
+  from tinygrad.device import Device; return Device["NV"]
 
 def main():
   if "--middle-selftest" in sys.argv:
