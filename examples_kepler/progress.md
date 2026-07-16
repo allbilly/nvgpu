@@ -2593,3 +2593,85 @@ aborts that escalate to a host panic.
 - `py_compile`, `--middle-selftest`, the software backend demo, and scoped
   `git diff --check` pass.  No live invocation has been started after this
   patch.
+
+## Session 2026-07-16 — cold GDDR5 / PRAMIN / `KEPLER_N=8`
+
+Operator notes also live in `examples_kepler/reset_egpu.md` (night–night16).
+Goal this arc: cold bring-up far enough for `hardware_demo=ok N=8`.
+**Not yet achieved** — furthest point: **FECS ready** on true cold; PRAMIN
+still blocked (host `0x1700` hostile; PMU wedged for MEMX-PRAMIN).
+
+### Proven on silicon
+
+- **Host / MEMX-WR32 of `0x1620`/`0x26f0` kills TinyGPU BAR0** when clearing the
+  full Nouveau pause masks (`0xaa2`).  MEMX ENTER is equally hostile.
+- **bit0-only clear of `0x1620[0]`** keeps BAR0 alive on clean cold; turns
+  PRAMIN `0xbad0fb` → virgin `0xffffffff` (night5).  No `0x26f0`, no unpause.
+- **all-MEMX** reaches `MEMX WR32 totals: 78 execs, 210 words`.
+- **Defer bit0** until after PGRAPH/FECS (`KEPLER_RAM_BIT0_DEFER=1`): full
+  PGRAPH pack + **FECS IMEM match + FECS ready** (`FE_PWR=0x2`,
+  `gpc=4 tpc=[2,2,2,2]`) on true cold (night13–16).
+- **After deferred bit0, host `0x1700` alone kills BAR0** (night14) — cannot
+  use host PRAMIN window setup.  **MEMX WR32** is the intended PRAMIN path
+  (`KEPLER_PRAMIN_MEMX=1`), assuming virgin XOR (`0xffffffff ^ wanted`).
+- **After FECS path, PMU MEMX is often wedged** (`0x10a580=0xffffffff` on
+  acquire, nights15–16).  Night16 proved an internal Falcon CPUCTL reset cannot
+  recover an inaccessible PMU aperture.  Local Nouveau's GK104 path instead
+  pulses PMU MC reset through `PMC_ENABLE[13]` (`0x2000`); the recovery helper
+  now does that, waits for `0x10a10c[2:1]` scrub completion, reloads firmware,
+  and rediscovers MEMX.  This fix is offline-tested but not yet cold-validated.
+- Also avoid: early LTC/ZBC after RAM; BLCG `0x4041f0`; PRAMIN literal `0`
+  fallback; dirty GPC-awake+PRAMIN-stub without `ALLOW_DIRTY`.
+- **VRAM bit19 alias**: `KEPLER_VRAM_BIT19_SAFE=1`.
+
+### Furthest live cold (night13–16)
+
+1. all-MEMX 78/210 → bit0 deferred → skip LTC/BLCG
+2. full PGRAPH pack OK → **FECS ready** (topology 4×2)
+3. deferred bit0 OK (`PMC_BOOT_0` live)
+4. **Blocker:** PRAMIN — host `0x1700` fatal (night14); internal-CPUCTL PMU
+   reload did not restore MEMX (night16).  MC-level PMU reset is patched and
+   awaits the next true-cold run.
+
+### Code defaults / guards (macOS live)
+
+| Env | Live default | Why |
+| --- | --- | --- |
+| `KEPLER_RAM_BLOCK` | `bit0` | `[0]`-only clear |
+| `KEPLER_RAM_BIT0_DEFER` | `1` | PGRAPH/FECS before unstub |
+| `KEPLER_PRAMIN_MEMX` | `1` | MEMX WR32; host `0x1700` kills |
+| `KEPLER_PRAMIN_LITERAL` | `0` | XOR-only |
+| `KEPLER_BAR1_MAP_SIZE` | `0x1000000` | 16 MiB covers bit19 layout |
+| `KEPLER_POST_RAM_LTC` | `0` | Skip early LTC/ZBC |
+| `KEPLER_PGRAPH_BLCG` | `0` | Skip `0x4041f0` |
+| `KEPLER_REFUSE_DIRTY` | `1` | Refuse half-POST |
+| `KEPLER_COLD_FLR` | `0` | FLR → residual topo=0 |
+
+Also: `_gk104_ensure_pmu_memx_ready()` now performs the GK104 MC-level PMU
+reset before MEMX-PRAMIN; `_gk104_require_bar0_live()` checkpoints.
+
+Offline: `--middle-selftest` passes on macOS/software and
+`--mmiotrace-selftest` is **24/24**.
+
+### Still missing for `hardware_demo=ok N=8`
+
+1. **MEMX-PRAMIN stores succeed** after PMU MC reset + reload (BAR0 stays live)
+2. BAR1 identity + channel RAMIN / GPFIFO (bit19-safe layout coded)
+3. Launch + signal → `hardware_demo=ok N=8`
+4. Later: optional LTC/ZBC, fuller GDDR train
+
+### Current hardware state / next step
+
+- Card left MMIO-hung after night16 — **enclosure power cycle**, then one
+  cold run (no probe, no FLR):
+
+```bash
+/Applications/TinyGPU.app/Contents/MacOS/TinyGPU server \
+  "$PWD/logs/tinygpu-night17.sock" &
+APL_REMOTE_SOCK="$PWD/logs/tinygpu-night17.sock" \
+  KEPLER_LIVE_ACK=completion-abort-risk KEPLER_RPC_TRACE=logs/rpc-n8-night17.log \
+  KEPLER_N=8 KEPLER_COLD_FLR=0 python3 -u examples_kepler/add.py
+```
+
+Expect: … → FECS ready → deferred bit0 → **PMU MC reset + reload** →
+MEMX-PRAMIN → channel → `hardware_demo=ok N=8`.

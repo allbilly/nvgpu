@@ -18,7 +18,7 @@ locally when CUDA 10.2 ptxas is installed, with the checked-in cubin as fallback
 No package installation or tinygrad import is needed beyond the shared checkout.
 """
 from __future__ import annotations
-import os, sys, ctypes, mmap, struct, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, pathlib, threading
+import os, sys, ctypes, mmap, struct, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, pathlib, threading, time, hashlib
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 for _path in (REPO_ROOT, os.path.join(REPO_ROOT, "ref")):
@@ -366,18 +366,66 @@ def _probe():
   if dev is None:
     print("probe: TinyGPU.app socket is not reachable (is the eGPU connected?)")
     raise SystemExit(1)
-  dev.bar_info(0)
-  boot0 = dev.mmio_read32(0, 0x0)
-  print(f"probe: PMC_BOOT_0=0x{boot0:08x} (chip_id={(boot0 >> 20) & 0xfff})")
-  dev.fini()
+  try:
+    boot0, meta = shared._gk104_ensure_bar0_mmio(dev)
+    print(f"probe: PCI_ID={meta['id32']:#010x} "
+          f"COMMAND={meta['command_before']:#06x}->{meta['command_after']:#06x} "
+          f"mse_was={meta['mse_before']} reset={meta['did_reset']}")
+    print(f"probe: PMC_BOOT_0=0x{boot0:08x} (chip_id={(boot0 >> 20) & 0xfff})")
+  finally:
+    dev.fini()
 
 def main():
   shared.set_pci_transport_factory(_MacPCIDeviceFactory())
   os.environ.setdefault("KEPLER_NO_AUTO_SUDO", "1")
+  # Nouveau golden mmiotrace for this Palit GTX 770 reads 0x101000=0x8040509a
+  # (RAMCFG strap 6).  Cold eGPU bring-up sometimes returns 0 from that
+  # register and then programs the wrong M0205/M0209 training tables; pin the
+  # known strap unless the caller overrides it.
+  os.environ.setdefault("KEPLER_RAMCFG_STRAP", "6")
+  os.environ.setdefault("KEPLER_PMU_MEMX", "1")
+  os.environ.setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")
+  os.environ.setdefault("KEPLER_RAM_MEMX_WR", "1")
   if "--probe" in sys.argv:
     _probe(); return
   backend = os.environ.get("NV_BACKEND", "kepler")
-  offline = any(x in sys.argv for x in ("--middle-selftest", "--vbios-info", "--vbios-init-info", "--compare-cubin"))
+  offline = any(x in sys.argv for x in (
+      "--middle-selftest", "--mmiotrace-selftest",
+      "--vbios-info", "--vbios-init-info", "--compare-cubin"))
+  # Live TinyGPU only: post-MEMX bit0 unstub (full 0xaa2 / mid-MEMX bit0
+  # kill BAR0).  Keep offline golden selftests on KEPLER_RAM_BLOCK=0.
+  if not offline:
+    os.environ.setdefault("KEPLER_RAM_BLOCK", "bit0")
+    # Never host-program GDDR5 without MEMX (kills BAR0). Soft PRAMIN live
+    # skips the PRAMIN window poke that collapses BAR0 after bit0 unstub.
+    os.environ.setdefault("KEPLER_RAM_REQUIRE_MEMX", "1")
+    os.environ.setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")
+    # Refuse GPC-awake+PRAMIN-stub half-POST (dirty) — that path hung USB4 /
+    # WindowServer.  Enclosure power-cycle required; KEPLER_ALLOW_DIRTY=1 opts in.
+    os.environ.setdefault("KEPLER_REFUSE_DIRTY", "1")
+    # post-MEMX bit0 then LTC/ZBC (0x100c80/0x17ea*) collapses TinyGPU BAR0.
+    os.environ.setdefault("KEPLER_POST_RAM_LTC", "0")
+    # Host write to 0x4041f0 after bit0 collapses BAR0 (even no-op).
+    os.environ.setdefault("KEPLER_PGRAPH_BLCG", "0")
+    # bit0 before full PGRAPH pack collapses BAR0; defer unstub to first PRAMIN.
+    os.environ.setdefault("KEPLER_RAM_BIT0_DEFER", "1")
+    # Full pack is OK *before* bit0 (night13 FECS ready); keep default on.
+    os.environ.setdefault("KEPLER_PGRAPH_PACK", "1")
+    # Literal PRAMIN 0 on XOR virgin cannot stick and hung TinyGPU (night13).
+    os.environ.setdefault("KEPLER_PRAMIN_LITERAL", "0")
+    # Host 0x1700 after bit0 kills BAR0 (night14); store PRAMIN via MEMX WR32.
+    os.environ.setdefault("KEPLER_PRAMIN_MEMX", "1")
+    # 16 MiB BAR1 covers bit19-safe GR/attrib; keeps MEMX PRAMIN tractable.
+    os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")
+    # Default all-MEMX (host-then-MEMX timed out on cold); opt-in host prog0.
+    os.environ.setdefault("KEPLER_RAM_HOST_PROG0", "0")
+    # Experimental early bit0 path: skip RAMMAP unless continuing into MEMX.
+    if os.environ.get("KEPLER_RAM_PROGRAM") == "bit0-only":
+      if os.environ.get("KEPLER_RAM_AFTER_BIT0") != "memx":
+        os.environ.setdefault("KEPLER_RAM_INIT", "0")
+  else:
+    os.environ.setdefault("KEPLER_RAM_BLOCK", "0")
+    os.environ.setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")
   if backend != "software" and not offline:
     if os.environ.get("KEPLER_LIVE_ACK") != "completion-abort-risk":
       raise SystemExit("hardware launch refused: set KEPLER_LIVE_ACK=completion-abort-risk for an authorized TinyGPU test")
