@@ -34,10 +34,12 @@ NO imports from tinygrad.runtime.support / ops / device / renderer / uop / helpe
 are permitted on the live path — those have been vendored inline below.
 
 `python3 examples_kepler_pcie/add.py --middle-selftest` exercises the offline
-builders without touching the card.  `NV_BACKEND=software` runs the complete
-allocator and launch-word path against host memory.  A normal live invocation
-selects the unbound GK104 from sysfs, requests sudo when necessary, assembles
-the checked-in PTX with CUDA 10.2 ptxas, and only then opens BAR0/BAR1.
+builders without touching the card.  `--mmiotrace-selftest` is the golden
+Nouveau mmiotrace gate (11 cold-path checkpoints; no hardware/pagemap) — run
+it on macOS before the next eGPU replug.  `NV_BACKEND=software` runs the
+complete allocator and launch-word path against host memory.  A normal live
+invocation selects the unbound GK104 from sysfs, requests sudo when necessary,
+assembles the checked-in PTX with CUDA 10.2 ptxas, and only then opens BAR0/BAR1.
 `KEPLER_OPERATION=mul` selects the multiply image and expected vector result;
 The macOS TinyGPU wrapper imports this module and swaps only the PCI transport;
 Linux and macOS therefore use identical RM sequencing, firmware loading, GMMU
@@ -120,8 +122,10 @@ def from_mv(mv: memoryview, to_type=ctypes.c_char):
 
 def wait_cond(cb, *args, value=True, timeout_ms=10000, msg=""):
   start_time = int(time.perf_counter() * 1000)
+  val = None
   while int(time.perf_counter() * 1000) - start_time < timeout_ms:
     if (val := cb(*args)) == value: return val
+    time.sleep(0.0001)
   raise TimeoutError(f"{msg}. Timed out after {timeout_ms} ms, condition not met: {val} != {value}")
 
 def _ensure_downloads_dir() -> pathlib.Path:
@@ -953,6 +957,8 @@ class NVDevice:
     self.backend = backend
     self.iface = None
     self.dev_impl = None
+    self._pmu_memx_data = None
+    self._pmu_memx_nowait = False
     try:
       self.iface = PCIIface(self, self.device_id, software=(backend == "software"))
       self.dev_impl = NVDev(self.iface.pci_dev)
@@ -972,6 +978,55 @@ class NVDevice:
     self.dev_impl.vram = memoryview(bytearray(self.VRAM_SIZE))
     self.dev_impl.mm = GK104MemoryManager(self.dev_impl, self.VRAM_SIZE, self.BOOT_SIZE)
     self.dev_impl.is_booting = False
+
+  def _init_pmu_memx(self):
+    """Discover the PMU MEMX data segment after the PMU Falcon starts."""
+    if self.backend == "software":
+      return False
+    # gt215_pmu_init() waits for both ring descriptors after starting the
+    # Falcon.  Do the same here; an immediate zero is normal while the PMU
+    # boot code is still publishing its queue layout.
+    deadline = time.monotonic() + 2.0
+    while not (self.read32(0x10a4d0) and self.read32(0x10a4dc)):
+      if time.monotonic() >= deadline:
+        return False
+      time.sleep(0.00001)
+    data_base, data_size = pmu_send(
+        self, PMU_PROC_MEMX, PMU_MEMX_INFO, PMU_MEMX_INFO_DATA, 0)
+    if not data_base or not data_size:
+      raise RuntimeError(f"invalid GK104 MEMX data segment {data_base:#x}/{data_size:#x}")
+    self._pmu_memx_data = (data_base, data_size)
+    return True
+
+  def pmu_memx_block(self):
+    """FB pause via real MEMX ENTER (requires FB_PAUSE wait patched out).
+
+    Host and MEMX-WR32 stores to 0x1620/0x26f0 kill TinyGPU BAR0.  Stock ENTER
+    hangs forever on FB_PAUSE.  With ``KEPLER_PMU_ENTER_NOWAIT``, ENTER applies
+    the falcon-side 0x1620 masks and returns.
+    """
+    if self._pmu_memx_data is None:
+      raise RuntimeError("PMU MEMX is unavailable")
+    if not getattr(self, "_pmu_memx_nowait", False):
+      raise RuntimeError(
+          "MEMX ENTER requires KEPLER_PMU_ENTER_NOWAIT (stock FB_PAUSE hang)")
+    self.pmu_memx_exec_commands([(PMU_MEMX_ENTER, ())], timeout_s=3.0)
+
+  def pmu_memx_unblock(self):
+    """FB unpause via real MEMX LEAVE (requires FB_PAUSE wait patched out)."""
+    if self._pmu_memx_data is None:
+      raise RuntimeError("PMU MEMX is unavailable")
+    if not getattr(self, "_pmu_memx_nowait", False):
+      raise RuntimeError(
+          "MEMX LEAVE requires KEPLER_PMU_ENTER_NOWAIT (stock FB_PAUSE hang)")
+    self.pmu_memx_exec_commands([(PMU_MEMX_LEAVE, ())], timeout_s=3.0)
+
+  def pmu_memx_exec_commands(self, commands, timeout_s=5.0):
+    """Run a MEMX script (WR32/DELAY/WAIT/…).  Do not use ENTER on cold eGPU."""
+    if self._pmu_memx_data is None:
+      raise RuntimeError("PMU MEMX is unavailable")
+    return pmu_memx_exec(self, self._pmu_memx_data[0], commands,
+                         timeout_s=timeout_s)
 
   def _dump_fecs_tlb(self):
     """Dump the FECS code TLB and the physical instruction at virtual PC 0xd804."""
@@ -1018,10 +1073,20 @@ class NVDevice:
     dev = self.dev_impl
     dev.hw = self.iface.pci_dev
     dev.hw.set_phase("map-bars")
-    # PCI config space is accessible through the sysfs `config` file.  Keep
-    # legacy INTx disabled because this userspace driver polls, while explicitly
-    # enabling memory decoding and bus mastering only for the lifetime of this
-    # NVDevice.
+    # Do NOT treat PMC_BOOT_0=0xffffffff as an immediate physical-replug
+    # requirement.  After TinyGPU/DEXT Close(), macOS clears PCI COMMAND
+    # Memory Space Enable; a new server that maps BAR0 before restoring MSE
+    # will read all-ones even though config space (and the UT3G link) is fine.
+    boot0, bar0_meta = _gk104_ensure_bar0_mmio(dev.hw)
+    print(
+        f"[kepler] BAR0 recover: id={bar0_meta['id32']:#010x} "
+        f"cmd={bar0_meta['command_before']:#06x}->{bar0_meta['command_after']:#06x} "
+        f"mse_was={bar0_meta['mse_before']} reset={bar0_meta['did_reset']} "
+        f"PMC_BOOT_0={boot0:#010x}",
+        flush=True)
+    # Session lifetime: memory decode + bus master (DMA) + INTx disabled
+    # (this userspace path polls).  Recovery above deliberately left MASTER
+    # clear until BAR0 MMIO was proven live.
     _pci_command = dev.hw.read_config(pci.PCI_COMMAND, 2)
     _pci_command = ((_pci_command | pci.PCI_COMMAND_MEMORY |
                      pci.PCI_COMMAND_MASTER | pci.PCI_COMMAND_INTX_DISABLE) &
@@ -1031,8 +1096,8 @@ class NVDevice:
     if (_pci_observed & _pci_required) != _pci_required:
       raise RuntimeError(
           f"PCI memory/bus-master enable did not stick: PCI_COMMAND={_pci_observed:#06x}")
-    dev.hw.bar_info(0)  # mmap the register BAR before any MMIO
-    dev.bar1_addr, dev.bar1_size = dev.hw.bar_info(1)  # real BAR1 USERD aperture
+    # Refresh BAR1 after COMMAND is fully armed for the session.
+    dev.bar1_addr, dev.bar1_size = dev.hw.bar_info(1)
     dev.hw.set_phase("vbios-devinit")
     # This userspace RM polls every GPU event; no Linux IRQ handler is installed
     # for the GPU.  Match nv04_mc_intr_unarm() and gt215_mc_intr_block() before
@@ -1041,8 +1106,7 @@ class NVDevice:
     self.write32(0x000140, 0x00000000)  # PMC_INTR_EN_0: unarm external IRQ
     self.write32(0x000640, 0x00000000)  # GK104 MC leaf-0 source mask
     self.read32(0x000140)               # posting read, as Nouveau does
-    # 1. Identify + enable engines.
-    boot0 = self.read32(0x0)  # PMC_BOOT_0 (dev_id/step)
+    # 1. Identify + enable engines (boot0 already validated by ensure_bar0).
     if DEBUG: print(f"[kepler] PMC_BOOT_0={boot0:#x}")
     # DMEM probe helper: write+read a test pattern to FECS DMEM[0x100].
     def _dmem_probe(label):
@@ -1066,9 +1130,54 @@ class NVDevice:
     # mask with 0xffff0000 so any 0xbadf???? value is detected as power-gated,
     # not POSTed.  The old 0xfffff000 mask let 0xbadf1200 through as "POSTed",
     # causing the entire cold-card init (devinit, PGOB, FECS load) to be skipped.
-    _posted = _gpc_topo != 0 and (_gpc_topo & 0xffff0000) != 0xbadf0000
-    _posted_str = "POSTed" if _posted else "cold (un-POSTed)"
-    print(f"[kepler] GPC topology(0x409604)={_gpc_topo:#x} — card is {_posted_str}", flush=True)
+    # Also reject all-ones / 0xbad0…. bus-error sentinels seen when the eGPU
+    # link is down or BAR0 is not yet decoded — those must not skip cold init.
+    #
+    # PGOB alone publishes a live GPC topology (e.g. 0x40004) while PRAMIN still
+    # returns the 0xbad0fb stub on a cold eGPU that never ran EFI GDDR training.
+    # Treat that as un-POSTed for RAM/devinit so we do not skip VRAM bring-up.
+    _gpc_awake = _gk104_topo_is_posted(_gpc_topo)
+    _pramin_live = _gk104_pramin_looks_live(self, soft=False)
+    _posted = _gpc_awake and _pramin_live
+    if _gpc_awake and not _pramin_live:
+      _posted_str = "GPC-awake but PRAMIN stub (forcing cold RAM)"
+    elif _posted:
+      _posted_str = "POSTed"
+    else:
+      _posted_str = "cold (un-POSTed)"
+    print(f"[kepler] GPC topology(0x409604)={_gpc_topo:#x} "
+          f"PRAMIN_live={_pramin_live} — card is {_posted_str}", flush=True)
+    # TinyGPU: half-POSTed (GPC awake, PRAMIN stub) after a failed RAM attempt
+    # is hostile — cold RAM on that state has hung USB4 / WindowServer.
+    # Refuse unless the operator opts in after a real enclosure power cycle.
+    if (_gpc_awake and not _pramin_live and
+        os.environ.get("KEPLER_REFUSE_DIRTY", "0") == "1" and
+        os.environ.get("KEPLER_ALLOW_DIRTY", "0") != "1"):
+      raise RuntimeError(
+          "GK104 is GPC-awake with dead/stub PRAMIN (dirty after prior MMIO). "
+          "Power-cycle the eGPU enclosure (not just USB replug), restart "
+          "TinyGPU server, then cold-run add.py once with no probe.  "
+          "Set KEPLER_ALLOW_DIRTY=1 only to force cold RAM on this state.")
+    # After soft BAR recovery / incomplete power-cycle the topology often
+    # reads 0 (not the cold 0xbadf… gate).  One FLR clears a wedged PMU ring
+    # so MEMX INFO works again — cheaper than another enclosure cycle.
+    if (not _posted and _gpc_topo == 0 and
+        os.environ.get("KEPLER_COLD_FLR", "0") != "0" and
+        hasattr(dev.hw, "reset")):
+      print("[kepler] residual cold (GPC topo=0); PCI FLR before bring-up",
+            flush=True)
+      try:
+        dev.hw.reset()
+        time.sleep(1.0)
+        boot0, _meta = _gk104_ensure_bar0_mmio(dev.hw)
+        self.write32(0x000140, 0x00000000)
+        self.write32(0x000640, 0x00000000)
+        _gpc_topo = self.read32(0x409604)
+        _dmem_probe("after cold FLR")
+        print(f"[kepler] after FLR: PMC_BOOT_0={boot0:#x} "
+              f"GPC(0x409604)={_gpc_topo:#x}", flush=True)
+      except Exception as e:
+        print(f"[kepler] cold FLR skipped: {e}", flush=True)
     # On a POSTed card, nouveau already loaded FECS/GPCCS firmware and the
     # falcons are running.  Check if FECS already posted ready (bit31 of 0x409800).
     # If so, we can skip the entire firmware reload + PGRAPH init and just use
@@ -1148,9 +1257,24 @@ class NVDevice:
     # gated and FECS waits forever for topology.  Run devinit on a cold card;
     # skip it on a POSTed card (nouveau/EFI already ran it, and re-running
     # can re-gate power domains).
-    if not _posted and os.environ.get("KEPLER_VBIOS_DEVINIT", "1") != "0":
+    _ram_init_mode = os.environ.get("KEPLER_RAM_INIT", "1")
+    if _ram_init_mode not in ("0", "1", "force"):
+      raise ValueError("invalid KEPLER_RAM_INIT; expected 0, 1, or force")
+    _run_devinit = (not _posted and
+                    os.environ.get("KEPLER_VBIOS_DEVINIT", "1") != "0")
+    # `force` is an explicit recovery path for a card left in a partially
+    # POSTed state by an earlier userspace attempt.  It loads the ROM only for
+    # RAMMAP/training; it does not rerun the power-domain devinit or GPC PLL.
+    _ram_program_mode = os.environ.get("KEPLER_RAM_PROGRAM", "1")
+    _bit0_only = _ram_program_mode == "bit0-only"
+    _need_vbios_image = (
+        _run_devinit or _ram_init_mode == "force" or _bit0_only or
+        (_ram_program_mode != "0" and not _posted))
+    image = None
+    if _need_vbios_image:
       vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
       image, _, scripts = vbios_init_info(vbios_path)
+    if _run_devinit:
       print(f"[kepler] VBIOS direct devinit script0={scripts[0]:#x}")
       for script in scripts:
         execute_vbios_target_ops(self, image, script)
@@ -1173,9 +1297,29 @@ class NVDevice:
     # re-running PGOB destroys the loaded FECS firmware, so skip it.
     if not _posted:
       _dmem_probe("before PMU")
+      _pmu_started = False
       try:
         pmu_code = _rd("gk104_pmu_code.bin"); pmu_data = _rd("gk104_pmu_data.bin")
+        # Cold TinyGPU never raises FB_PAUSE; stock ENTER/LEAVE hang forever.
+        # Default: patch the wait loops so real MEMX ENTER can apply 0x1620
+        # pause from the falcon (host/MEMX-WR32 of those regs kill the link).
+        if os.environ.get("KEPLER_PMU_ENTER_NOWAIT", "1") != "0":
+          pmu_code = _patch_pmu_memx_nowait(pmu_code)
+          self._pmu_memx_nowait = True
+          print("[kepler] PMU MEMX ENTER/LEAVE FB_PAUSE wait patched out",
+                flush=True)
+        else:
+          self._pmu_memx_nowait = False
+        # Only hard-reset the falcon when bringing up a residual/wedged PMU.
+        # On true-cold (0xbadf…) a fresh load after power-cycle does not need
+        # it; resetting first has been correlated with flaky MEMX INFO.
+        if (_gpc_topo == 0 or
+            os.environ.get("KEPLER_PMU_FORCE_RESET", "0") != "0"):
+          falcon_reset(self, PMU_FALCON_BASE)
         falcon_load(self, PMU_FALCON_BASE, pmu_code, pmu_data, entry=0, start=True)
+        _pmu_started = True
+        # Cold PMU host rings need a moment after START before MEMX INFO.
+        time.sleep(0.05)
         if DEBUG: print("[kepler] PMU firmware loaded + started")
       except Exception as e:
         if DEBUG: print(f"[kepler] PMU load skipped: {e}")
@@ -1186,8 +1330,130 @@ class NVDevice:
         print(f"[kepler] after pgob: gpc/rop(0x409604)={self.read32(0x409604):#x} "
               f"GPC0 CTRL(0x502100)={self.read32(0x502100):#x} "
               f"GPCCS CTRL(0x41a100)={self.read32(0x41a100):#x}")
+      if _pmu_started and os.environ.get("KEPLER_PMU_MEMX", "1") != "0":
+        try:
+          if self._init_pmu_memx():
+            print("[kepler] PMU MEMX transport ready", flush=True)
+        except Exception as e:
+          print(f"[kepler] PMU MEMX unavailable after load: {e}; retrying once",
+                flush=True)
+          time.sleep(0.1)
+          try:
+            self._pmu_memx_data = None
+            if self._init_pmu_memx():
+              print("[kepler] PMU MEMX transport ready (retry)", flush=True)
+            else:
+              print("[kepler] PMU MEMX still unavailable after retry", flush=True)
+          except Exception as e2:
+            print(f"[kepler] PMU MEMX unavailable after load: {e2}", flush=True)
     else:
       print("[kepler] skipping PMU/PGOB (card already POSTed)", flush=True)
+    # Nouveau's gk104_ram_init() and first memory-clock transition run only
+    # after PMU/PGOB has made the framebuffer domains usable.  On a cold eGPU
+    # this ordering is essential: programming 0x10f*/0x132* while the PMU is
+    # still absent can acknowledge the RPC yet leave GDDR5 electrically
+    # untrained.  Keep the phase before FECS/PGRAPH allocations, but after the
+    # PMU power-domain bring-up.
+    _ram_program_mode = os.environ.get("KEPLER_RAM_PROGRAM", "1")
+    _bit0_only = _ram_program_mode == "bit0-only"
+    _want_ram = (
+        image is not None and (
+            _bit0_only or
+            (_ram_init_mode != "0" and (_run_devinit or _ram_init_mode == "force"))))
+    if _want_ram:
+      _ram_debug = bool(DEBUG and getenv("KEPLER_VBIOS_TRACE", 0))
+      # getenv() int-parses numeric env values, so compare as strings via
+      # os.environ — otherwise KEPLER_RAM_PROGRAM=0 becomes int 0 and
+      # ``0 != "0"`` is True, silently forcing ram_program back on.
+      _ram_program = _ram_program_mode != "0"
+      # Nouveau's known-good cold baseline for this Palit ROM is 648 MHz
+      # memory (see nouveau_gk104_trace.txt); stay in RAMMAP entry 2 until a
+      # durable BAR1 read proves a higher-frequency transition.
+      _ram_freq = int(os.environ.get("KEPLER_RAM_FREQ", "648"))
+      _skip_ram_init = (
+          _bit0_only and os.environ.get("KEPLER_RAM_AFTER_BIT0") != "memx")
+      if _ram_init_mode != "0" and not _skip_ram_init:
+        print("[kepler] running GK104 VBIOS RAMMAP/GDDR5 initialization",
+              flush=True)
+        nvbios_init.run_vbios_ram_init(self, image, debug=_ram_debug)
+        # Re-discover MEMX after RAMMAP: heavy 0x10f* traffic can leave the
+        # host-command path needing a fresh INFO before WR32 buffering.
+        if os.environ.get("KEPLER_PMU_MEMX", "1") != "0":
+          try:
+            self._pmu_memx_data = None
+            if self._init_pmu_memx():
+              print("[kepler] PMU MEMX re-ready before ram_program", flush=True)
+          except Exception as e:
+            print(f"[kepler] PMU MEMX re-init failed: {e}; trying PMU reload",
+                  flush=True)
+            try:
+              pmu_code = _rd("gk104_pmu_code.bin")
+              pmu_data = _rd("gk104_pmu_data.bin")
+              if os.environ.get("KEPLER_PMU_ENTER_NOWAIT", "1") != "0":
+                pmu_code = _patch_pmu_memx_nowait(pmu_code)
+                self._pmu_memx_nowait = True
+              falcon_reset(self, PMU_FALCON_BASE)
+              falcon_load(self, PMU_FALCON_BASE, pmu_code, pmu_data,
+                          entry=0, start=True)
+              self._pmu_memx_data = None
+              if self._init_pmu_memx():
+                print("[kepler] PMU MEMX recovered after reload", flush=True)
+            except Exception as e2:
+              print(f"[kepler] PMU MEMX recovery failed: {e2}", flush=True)
+      if _ram_program:
+        print(f"[kepler] programming GK104 cold GDDR5 controller at {_ram_freq} MHz",
+              flush=True)
+        nvbios_init.run_vbios_ram_program(
+          self, image, freq_mhz=_ram_freq, debug=_ram_debug)
+      if not _gk104_pramin_looks_live(self):
+        # Soft live never pokes PRAMIN; only report boot0 here (a 0x1700
+        # window read after bit0 has killed TinyGPU BAR0).
+        try:
+          boot0 = self.read32(0) & 0xffffffff
+          boot0_s = f"{boot0:#x}"
+        except Exception as e:
+          boot0_s = f"<read err {e}>"
+        sample = "<skipped>"
+        if os.environ.get("KEPLER_PRAMIN_SOFT_LIVE", "1") == "0":
+          try:
+            sample = hex(_gk104_pramin_read32(self, 0x100000) & 0xffffffff)
+          except Exception as e:
+            sample = f"<pramin err {e}>"
+        # Offline FakeMMIO recorders used by mmiotrace_selftest have no FB.
+        if hasattr(self, "ops"):
+          print(f"[kepler] PRAMIN stub after cold RAM on recorder "
+                f"(sample={sample}); continuing offline", flush=True)
+        else:
+          raise RuntimeError(
+              f"PRAMIN not usable after cold RAM (sample={sample} "
+              f"boot0={boot0_s} soft_live="
+              f"{os.environ.get('KEPLER_PRAMIN_SOFT_LIVE', '1')!r}); "
+              "VRAM aperture is not usable for channel instance stores.  "
+              "Replug for a clean cold POST with working PMU MEMX; "
+              "refusing to continue into FECS/channel bring-up")
+      else:
+        soft = os.environ.get("KEPLER_PRAMIN_SOFT_LIVE", "1") != "0"
+        if soft:
+          if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
+            print("[kepler] PRAMIN soft-accept after cold RAM "
+                  "(boot0 live; bit0 deferred until first PRAMIN store)",
+                  flush=True)
+          else:
+            print("[kepler] PRAMIN soft-accept after cold RAM "
+                  "(boot0 live; skipped PRAMIN window poke)", flush=True)
+        else:
+          print("[kepler] PRAMIN live after cold RAM (writeback ok)", flush=True)
+    # Golden mmiotrace: after RAMMAP/training, Nouveau does fb_init_page
+    # (0x100c80) then LTC/ZBC (0x17ea*/0x17e8*), ~20s before FECS.  On TinyGPU
+    # after post-MEMX bit0, that LTC/ZBC storm collapses BAR0 to all-ones
+    # (2026-07-16 cold N=8).  Default skip; KEPLER_POST_RAM_LTC=1 restores.
+    if os.environ.get("KEPLER_POST_RAM_LTC", "1") != "0":
+      _gk104_post_ram_fb_ltc(self)
+      _gk104_require_bar0_live(self, "after post-RAM LTC/ZBC")
+    else:
+      print("[kepler] skipping post-RAM fb_init_page/LTC/ZBC "
+            "(KEPLER_POST_RAM_LTC=0; TinyGPU-hostile after bit0)", flush=True)
+      _gk104_require_bar0_live(self, "after cold RAM (LTC skipped)")
     fecs_code = bytearray(_rd("gk104_fecs_code.bin")); fecs_data = _rd("gk104_fecs_data.bin")
     gpccs_code = _rd("gk104_gpccs_code.bin"); gpccs_data = _rd("gk104_gpccs_data.bin")
     # Historical diagnostic: patch ctx_4170s from `or $r15 0x10` to
@@ -1228,6 +1494,7 @@ class NVDevice:
     # destroys it; we need to reload firmware to restore FECS functionality).
     self._fecs_code = fecs_code
     self._fecs_data = fecs_data
+    _gk104_require_bar0_live(self, "before clock/PGRAPH diag")
     # Clock/power diagnostics: why is PGRAPH_STATUS=0xbadf1000?
     if DEBUG or True:
       _rop_pll = self.read32(0x137020)
@@ -1257,35 +1524,45 @@ class NVDevice:
       _accessible = (_v & 0xfffff000) != 0xbadf0000
       _subdom_tests.append(f"0x{_addr:x}={_v:#x}{'(OK)' if _accessible else '(GATED)'}")
     print(f"[kepler] PGRAPH sub-domains: {' '.join(_subdom_tests)}", flush=True)
-    # Try writing BLCG registers to disable clock gating for main block.
-    # BLCG value 0x00004046 has bit 6 set (clock gate enabled).
-    # Clear bit 6 to disable: 0x00000046.
-    # Only write if the register is accessible.
+    # TinyGPU (2026-07-16 careful N=8): after post-MEMX bit0, *any* host
+    # write to 0x4041f0 (even a no-op clear of bit6 when already 0) collapses
+    # BAR0 to all-ones.  Skip BLCG poke unless KEPLER_PGRAPH_BLCG=1.
     _blcg_main = self.read32(0x4041f0)
-    if (_blcg_main & 0xfffff000) != 0xbadf0000:
+    if os.environ.get("KEPLER_PGRAPH_BLCG", "1") == "0":
+      print(f"[kepler] BLCG main: skipping 0x4041f0 write "
+            f"(was {_blcg_main:#x}; KEPLER_PGRAPH_BLCG=0)", flush=True)
+    elif (_blcg_main & 0xfffff000) != 0xbadf0000:
       self.write32(0x4041f0, _blcg_main & ~0x40)  # clear bit 6
+      _gk104_require_bar0_live(self, "after BLCG main 0x4041f0 write")
       print(f"[kepler] BLCG main: 0x4041f0 was {_blcg_main:#x} now {self.read32(0x4041f0):#x}",
             flush=True)
     else:
       print(f"[kepler] BLCG main: 0x4041f0 GATED ({_blcg_main:#x})", flush=True)
-    # On a POSTed card, skip the PGRAPH master disable/re-enable cycle — it
-    # corrupts the FECS instruction TLB (multihit faults).  But still write
-    # the PGRAPH MMIO pack and FECS clock-gating regs, which the FECS firmware
-    # depends on.  Nouveau already wrote these during POST, but previous test
-    # runs may have clobbered them.
+    _gk104_require_bar0_live(self, "before PGRAPH pack MMIO")
+    # TinyGPU: full GK104_PGRAPH_PACK_MMIO after bit0 collapses BAR0.  Even
+    # without bit0 the pack is heavy; KEPLER_PGRAPH_PACK=0 keeps only the
+    # FECS clock-gate + master enable that this cold path needs.
+    _do_pack = os.environ.get("KEPLER_PGRAPH_PACK", "1") != "0"
     if not _posted:
       _before = self.read32(0x400500)
       self.write32(0x400500, _before & ~0x00010001)
-      for addr, val in GK104_PGRAPH_PACK_MMIO:
-        self.write32(addr, val)
+      if _do_pack:
+        for addr, val in GK104_PGRAPH_PACK_MMIO:
+          self.write32(addr, val)
+      else:
+        print("[kepler] PGRAPH pack: minimal (KEPLER_PGRAPH_PACK=0)", flush=True)
       self.write32(0x409890, 0x00000045)
       self.write32(0x4098b0, 0x0000007f)
       self.write32(0x400500, 0x00010001)
     else:
-      for addr, val in GK104_PGRAPH_PACK_MMIO:
-        self.write32(addr, val)
+      if _do_pack:
+        for addr, val in GK104_PGRAPH_PACK_MMIO:
+          self.write32(addr, val)
+      else:
+        print("[kepler] PGRAPH pack: minimal (KEPLER_PGRAPH_PACK=0)", flush=True)
       self.write32(0x409890, 0x00000045)
       self.write32(0x4098b0, 0x0000007f)
+    _gk104_require_bar0_live(self, "after PGRAPH pack MMIO")
     # Check PGRAPH accessibility after init (before second pgob).
     print(f"[kepler] after PGRAPH init: PGRAPH_STATUS={self.read32(0x400000):#x} "
           f"PGRAPH_CTRL={self.read32(0x400500):#x} "
@@ -1335,16 +1612,22 @@ class NVDevice:
     tpc_nr = [self.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f
               for g in range(gpc_nr)]
     rop_nr = (self.read32(0x409604) >> 16) & 0x1f
-    row, tile = _gk104_grctx_tiles(tpc_nr)
     tpc_total = sum(tpc_nr)
+    if gpc_nr == 0 or tpc_total == 0:
+      raise RuntimeError(
+          f"GK104 GR topology unusable after init: gpc_nr={gpc_nr} tpc_nr={tpc_nr} "
+          f"topo={self.read32(0x409604):#x}")
+    row, tile = _gk104_grctx_tiles(tpc_nr)
     # VSC stream master + GF117 zcull setup.
     self.write32(0x503018, 1)
     bank = [0] * gpc_nr
     zdata = 0
     for i, gpc in enumerate(tile[:tpc_total]):
-      zdata |= bank[gpc] << ((i & 7) * 4); bank[gpc] += 1
+      if not (0 <= gpc < gpc_nr):
+        raise RuntimeError(f"invalid GK104 zcull tile gpc={gpc} gpc_nr={gpc_nr}")
+      zdata |= (bank[gpc] & 0xf) << ((i & 7) * 4); bank[gpc] += 1
       if (i & 7) == 7 or i == tpc_total - 1:
-        self.write32(0x418980 + (i // 8) * 4, zdata); zdata = 0
+        self.write32(0x418980 + (i // 8) * 4, zdata & 0xffffffff); zdata = 0
     magic918 = ceildiv(0x00800000, tpc_total)
     for gpc, nr in enumerate(tpc_nr):
       self.write32(0x500914 + gpc * 0x8000, (row << 8) | nr)
@@ -1402,8 +1685,13 @@ class NVDevice:
     # execution, causing mpc=0xbadf1000 and mp_warp=0x3fffff traps.
     # Also clear NV_PMC_ENABLE_BLG (bit 27 of 0x200) to disable the BLG
     # controller entirely.
-    nvkm_mask(self, 0x000200, 0x08000000, 0x00000000)
-    _blcg_regs = [
+    # TinyGPU: host writes to 0x4041f0 (and the bulk BLCG list) after bit0
+    # collapse BAR0 — skip unless KEPLER_PGRAPH_BLCG=1.
+    if os.environ.get("KEPLER_PGRAPH_BLCG", "1") == "0":
+      print("[kepler] BLCG disabled: skipped (KEPLER_PGRAPH_BLCG=0)", flush=True)
+    else:
+      nvkm_mask(self, 0x000200, 0x08000000, 0x00000000)
+      _blcg_regs = [
       0x4041f0,                          # main
       0x409890, 0x4098b0,                # FECS ctxctl
       0x4078c0,                          # rstr2d
@@ -1434,18 +1722,20 @@ class NVDevice:
       0x408aa0, 0x408aa8,
       0x4089a8, 0x4089b0, 0x4089b8,      # rop_crop
       0x13c820, 0x13cbe0,                # pxbar
-    ]
-    _blcg_ok = 0
-    _blcg_gated = 0
-    for _r in _blcg_regs:
-      _v = self.read32(_r)
-      if (_v & 0xfffff000) != 0xbadf0000:
-        self.write32(_r, 0x00000000)
-        _blcg_ok += 1
-      else:
-        _blcg_gated += 1
-    print(f"[kepler] BLCG disabled: {_blcg_ok} regs cleared, "
-          f"{_blcg_gated} gated (skipped)", flush=True)
+      ]
+      _blcg_ok = 0
+      _blcg_gated = 0
+      for _r in _blcg_regs:
+        _v = self.read32(_r)
+        if (_v & 0xfffff000) != 0xbadf0000:
+          self.write32(_r, 0x00000000)
+          _blcg_ok += 1
+        else:
+          _blcg_gated += 1
+      print(f"[kepler] BLCG disabled: {_blcg_ok} regs cleared, "
+            f"{_blcg_gated} gated (skipped)", flush=True)
+      _gk104_require_bar0_live(self, "after BLCG bulk clear")
+    _gk104_require_bar0_live(self, "before falcon load")
     print(f"[kepler] before falcon load: FECS_CTRL={self.read32(0x409100):#x} GPCCS_CTRL={self.read32(0x41a100):#x} PGRAPH_CTRL={self.read32(0x400500):#x} PGRAPH_STATUS={self.read32(0x400000):#x} RED_SWITCH={self.read32(0x409614):#x}")
     # ponytail: If the FECS is stuck in an EFI overlay from a previous failed
     # run, reset the falcon via CPUCTL RESET bit (bit 7).  The GR reset (PMC
@@ -1845,9 +2135,9 @@ class NVDevice:
     # The un-POSTed card has none of these, so CPU framebuffer writes are not
     # visible to GPU internal clients (PBDMA reads zero GP entries).
     #
-    # LTC init and FB init_page need no sysmem, so run them first.
-    _gk104_ltc_init(self)
-    _gk104_fb_init_page(self)
+    # Late safety: if a POSTed path skipped cold RAM (and therefore the early
+    # LTC call above), still bring up L2 before sysmem/BAR1 work.
+    _gk104_post_ram_fb_ltc(self)
     # Clear any bootstrap BAR1 mapping left by an earlier diagnostic process
     # so the direct PCI BAR mapping is used until we set up the VMM aperture.
     if (self.read32(0x001704) & 0x3fffffff) == 0x100:
@@ -2233,6 +2523,139 @@ PMU_FALCON_BASE  = 0x10a000
 FECS_FALCON_BASE = 0x409000
 GPCCS_FALCON_BASE = 0x41a000
 PMC_ENABLE       = 0x200
+
+# GK104 PMU host-command / MEMX protocol (ref/linux/.../pmu/gt215.c and
+# pmu/memx.c).  The PMU is not a GSP: these are the ordinary Falcon rings
+# initialized by the PMU firmware itself.
+PMU_PROC_MEMX = 0x584d454d
+PMU_MEMX_INFO = 0
+PMU_MEMX_EXEC = 1
+PMU_MEMX_INFO_DATA = 0
+PMU_MEMX_ENTER = 1
+PMU_MEMX_LEAVE = 2
+PMU_MEMX_WR32 = 3
+PMU_MEMX_WAIT = 4
+PMU_MEMX_DELAY = 5
+PMU_MEMX_TRAIN = 7
+
+# gf119.fuc4.h: memx_func_enter_wait @ 0x0534 / leave_wait @ 0x0561.
+# Both spin on PMU OUTPUT FB_PAUSE; cold eGPU never acks → EXEC hangs.
+# bra z/nz imm8 at these offsets; rewrite to unconditional bra +3 (fall through).
+_PMU_ENTER_WAIT_BRA = 0x53e
+_PMU_LEAVE_WAIT_BRA = 0x56b
+_PMU_BRA_Z_BACK = bytes((0xf4, 0x0b, 0xf6))   # bra z, -10
+_PMU_BRA_NZ_BACK = bytes((0xf4, 0x1b, 0xf6))  # bra nz, -10
+_PMU_BRA_FALLTHROUGH = bytes((0xf4, 0x0e, 0x03))  # bra (always), +3
+
+
+def _patch_pmu_memx_nowait(code: bytearray | bytes) -> bytearray:
+  """Skip FB_PAUSE spin in MEMX ENTER/LEAVE (keep 0x1620/0x26f0 side effects)."""
+  out = bytearray(code)
+  if out[_PMU_ENTER_WAIT_BRA:_PMU_ENTER_WAIT_BRA + 3] != _PMU_BRA_Z_BACK:
+    raise RuntimeError(
+        f"unexpected PMU ENTER wait bra at {_PMU_ENTER_WAIT_BRA:#x}: "
+        f"{out[_PMU_ENTER_WAIT_BRA:_PMU_ENTER_WAIT_BRA + 3].hex()}")
+  if out[_PMU_LEAVE_WAIT_BRA:_PMU_LEAVE_WAIT_BRA + 3] != _PMU_BRA_NZ_BACK:
+    raise RuntimeError(
+        f"unexpected PMU LEAVE wait bra at {_PMU_LEAVE_WAIT_BRA:#x}: "
+        f"{out[_PMU_LEAVE_WAIT_BRA:_PMU_LEAVE_WAIT_BRA + 3].hex()}")
+  out[_PMU_ENTER_WAIT_BRA:_PMU_ENTER_WAIT_BRA + 3] = _PMU_BRA_FALLTHROUGH
+  out[_PMU_LEAVE_WAIT_BRA:_PMU_LEAVE_WAIT_BRA + 3] = _PMU_BRA_FALLTHROUGH
+  return out
+
+
+def _pmu_wait_data_access(dev, value, timeout_s=0.25):
+  """Acquire the PMU data-segment semaphore used by gt215_pmu_send/memx."""
+  deadline = time.monotonic() + timeout_s
+  # A previous aborted MEMX/host op can leave 0x10a580 stuck non-zero; clear
+  # before requesting the new lock value (nouveau always writes then spins).
+  cur = dev.read32(0x10a580) & 0xffffffff
+  if cur not in (0, value & 0xffffffff):
+    dev.write32(0x10a580, 0)
+  dev.write32(0x10a580, value)
+  while dev.read32(0x10a580) != value:
+    if time.monotonic() >= deadline:
+      # One recovery attempt: force unlock, re-request.
+      dev.write32(0x10a580, 0)
+      time.sleep(0.0001)
+      dev.write32(0x10a580, value)
+      if (dev.read32(0x10a580) & 0xffffffff) == (value & 0xffffffff):
+        return
+      raise TimeoutError(f"PMU data-segment acquire timeout value={value:#x} "
+                         f"stuck={dev.read32(0x10a580):#x}")
+    time.sleep(0.00001)
+
+
+def pmu_send(dev, process, message, data0, data1, timeout_s=2.0):
+  """Send one synchronous GK104 PMU command and return its two-word reply."""
+  deadline = time.monotonic() + timeout_s
+  ring = dev.read32(0x10a4d0)
+  if not ring:
+    raise RuntimeError("GK104 PMU host-command ring is not initialized")
+  send_base = ring & 0x0000ffff
+  addr = dev.read32(0x10a4a0) & 0x0f
+  while dev.read32(0x10a4b0) == (addr ^ 0x08):
+    if time.monotonic() >= deadline:
+      raise TimeoutError("GK104 PMU host-command ring is full")
+    time.sleep(0.00001)
+
+  _pmu_wait_data_access(dev, 0x00000001)
+  try:
+    dev.write32(0x10a1c0,
+                0x01000000 | (((addr & 0x07) << 4) + send_base))
+    for word in (process, message, data0, data1):
+      dev.write32(0x10a1c4, word & 0xffffffff)
+    dev.write32(0x10a4a0, (addr + 1) & 0x0f)
+  finally:
+    dev.write32(0x10a580, 0)
+
+  recv_ring = dev.read32(0x10a4dc)
+  if not recv_ring:
+    raise RuntimeError("GK104 PMU host-reply ring is not initialized")
+  recv_base = recv_ring & 0x0000ffff
+  while time.monotonic() < deadline:
+    get = dev.read32(0x10a4cc) & 0x0f
+    put = dev.read32(0x10a4c8) & 0x0f
+    if get != put:
+      _pmu_wait_data_access(dev, 0x00000002)
+      try:
+        dev.write32(0x10a1c0,
+                    0x02000000 | (((get & 0x07) << 4) + recv_base))
+        reply = tuple(dev.read32(0x10a1c4) & 0xffffffff for _ in range(4))
+        dev.write32(0x10a4cc, (get + 1) & 0x0f)
+      finally:
+        dev.write32(0x10a580, 0)
+      if reply[0] == (process & 0xffffffff) and reply[1] == (message & 0xffffffff):
+        return reply[2], reply[3]
+      # An unrelated asynchronous PMU message is not expected on this path;
+      # keep draining until the synchronous response arrives.
+      continue
+    time.sleep(0.00001)
+  raise TimeoutError(f"GK104 PMU reply timeout process={process:#x} message={message:#x}")
+
+
+def pmu_memx_exec(dev, data_base, commands, timeout_s=5.0):
+  """Execute a compact PMU MEMX script.
+
+  ``commands`` contains ``(opcode, words)`` tuples.  Each command is encoded
+  exactly as memx.c's ``memx_out``: a 16-bit payload length in the high half
+  and the MEMX opcode in the low half, followed by its payload words.
+  """
+  words = []
+  for opcode, payload in commands:
+    payload = tuple(int(x) & 0xffffffff for x in payload)
+    words.append(((len(payload) << 16) | (int(opcode) & 0xffff)) & 0xffffffff)
+    words.extend(payload)
+  _pmu_wait_data_access(dev, 0x00000003)
+  try:
+    dev.write32(0x10a1c0, 0x01000000 | (data_base & 0x00ffffff))
+    for word in words:
+      dev.write32(0x10a1c4, word)
+    finish = dev.read32(0x10a1c0) & 0x00ffffff
+  finally:
+    dev.write32(0x10a580, 0)
+  return pmu_send(dev, PMU_PROC_MEMX, PMU_MEMX_EXEC,
+                  data_base, finish, timeout_s=timeout_s)
 
 def falcon_write_dmem(dev, base, data):
   """nouveau nvkm_falcon_v1_load_dmem: DATA_INDEX = start|WRITE, then DATA words."""
@@ -2792,6 +3215,51 @@ def probe_gpc_fixed_100mhz(dev):
     print(f"write 0x137000={val:#010x} -> readback={rd(0x137000):#010x}")
 
 
+def falcon_reset(dev, base, settle_s=0.05):
+  """Reset a Falcon so hung firmware can be reloaded cleanly.
+
+  A prior MEMX WR32 timeout can leave the PMU Falcon alive-looking (rings
+  still programmed) but deaf to host commands.  GK104's PMU is special:
+  Nouveau's ``gf100_pmu_reset()`` resets the whole PMU subdevice through
+  ``PMC_ENABLE[13]``.  Pulsing the internal CPUCTL cannot recover an already
+  inaccessible PMU aperture (night16 returned 0xffffffff at 0x10a580).
+  Other Falcons retain the internal CPUCTL reset used by the FECS path.
+  """
+  if (base & 0xffffffff) == (PMU_FALCON_BASE & 0xffffffff):
+    pmc = dev.read32(PMC_ENABLE) & 0xffffffff
+    # gk104_mc_reset[] maps NVKM_SUBDEV_PMU to bit 0x00002000 and
+    # gf100_pmu_reset() calls nvkm_mc_disable()/nvkm_mc_enable().  Do not
+    # reject 0xffffffff here: full PMC_ENABLE is a valid cold-GK104 state.
+    # A dead BAR is diagnosed by the scrub/liveness checks, not by this value.
+    dev.write32(PMC_ENABLE, pmc & ~0x00002000)
+    dev.read32(PMC_ENABLE)  # flush the disable before re-enabling the engine
+    time.sleep(settle_s)
+    dev.write32(PMC_ENABLE, pmc | 0x00002000)
+    dev.read32(PMC_ENABLE)
+    time.sleep(settle_s)
+    # gt215_pmu_init(): do not touch IMEM/DMEM until HW scrubbing completes.
+    deadline = time.monotonic() + 2.0
+    while True:
+      scrub = dev.read32(PMU_FALCON_BASE + 0x10c) & 0xffffffff
+      if scrub != 0xffffffff and not (scrub & 0x00000006):
+        break
+      if time.monotonic() >= deadline:
+        raise TimeoutError(
+            f"PMU MC reset did not restore/scrub aperture: 0x10a10c={scrub:#x}")
+      time.sleep(0.001)
+    dev.write32(0x10a580, 0)
+    return
+  try:
+    falcon_stop(dev, base, timeout_ms=100)
+  except Exception:
+    # Already wedged / power-gated — still pulse RESET.
+    pass
+  dev.write32(base + FALCON_UC_CTRL, 0x00000080)
+  time.sleep(settle_s)
+  dev.write32(base + FALCON_UC_CTRL, 0x00000000)
+  time.sleep(settle_s)
+
+
 def falcon_load(dev, base, imem, dmem, entry=0, start=True):
   """Load `imem`/`dmem` into the FALCON at MMIO `base` (raw, no bin-header) and
   optionally start it.  For GK104 GR we load FECS+GPCCS first, then start FECS."""
@@ -3103,6 +3571,160 @@ def kepler_selftest():
   arr = array.array('I', [0, 1, 2, 3]); arr[1] = 0x42
   assert arr[1] == 0x42 and arr[2] == 2
 
+  # The cold GDDR5 controller port must retain Nouveau's fractional reference
+  # PLL accumulator and the Palit strap-6 RAMCFG selection.  Seed 0x101000 with
+  # the golden mmiotrace value (0x8040509a → strap 6).
+  class _FakeRamRegs:
+    def __init__(self):
+      self.regs = {0x101000: 0x8040509a, 0x022438: 0, 0x022554: 0,
+                   0x100710: 0x80000000, 0x137390: 0x00020000,
+                   0x10f65c: 0, 0x10f584: 0x15004000, 0x10f160: 0x3}
+      self.writes = []
+    def read32(self, reg): return self.regs.get(reg, 0)
+    def write32(self, reg, value):
+      value &= 0xffffffff
+      self.regs[reg] = value
+      self.writes.append((reg, value))
+  _ram_image = nvbios_init.find_vbios_image(pathlib.Path(DEFAULT_VBIOS).read_bytes())
+  _ram_regs = _FakeRamRegs()
+  # RAMMAP/training prefix must match the Nouveau golden mmiotrace.
+  nvbios_init.run_vbios_ram_init(_ram_regs, _ram_image)
+  _early = [(r, v) for r, v in _ram_regs.writes
+            if r in (0x10f65c, 0x11e67c, 0x11e708, 0x11e6a0, 0x11e6a4,
+                     0x11e6a8, 0x11e6ac, 0x11e6b0, 0x11e6b4)]
+  assert _early[:9] == [
+    (0x10f65c, 0x00000010), (0x11e67c, 0xfff10000), (0x11e708, 0x00030222),
+    (0x11e6a0, 0x04040404), (0x11e6a4, 0x04040404), (0x11e6a8, 0x0f0f0f0f),
+    (0x11e6ac, 0x0f0f0f0f), (0x11e6b0, 0x06060606), (0x11e6b4, 0x06060606),
+  ], f"RAMMAP prefix mismatch vs golden: {_early[:9]}"
+  assert any(r == 0x10f918 and v == 0x55555555 for r, v in _ram_regs.writes), \
+      "strap-6 training type00[0] must be 0x55555555"
+  _ram_regs.writes.clear()
+  _cfg = nvbios_init.run_vbios_ram_program(_ram_regs, _ram_image, freq_mhz=648)
+  assert _cfg["ramcfg_index"] == 6 and _cfg["timing_index"] == 0
+  assert _ram_regs.regs[0x132024] == 0x00011701, \
+      f"unexpected GK104 648MHz PLL coefficient {_ram_regs.regs.get(0x132024, 0):#x}"
+  assert _ram_regs.regs[0x132030] == 0x10000000
+  assert _ram_regs.regs[0x132034] == 0x00001000
+  # Strap-6 GDDR5 path: !01_04 and !07_80 → data 0x32a00000 on top of the
+  # early 0x40000000 enter bit, matching gk104_ram_calc_gddr5().
+  assert _ram_regs.regs[0x10f808] == 0x72a00000, \
+      f"unexpected GK104 0x10f808 {_ram_regs.regs.get(0x10f808, 0):#x}"
+  # Default KEPLER_RAM_BLOCK=enter without PMU falls back to skip (no host 0x1620).
+  assert not any(r == 0x1620 for r, _ in _ram_regs.writes), \
+      "default cold RAM program must not emit host 0x1620 pause masks"
+  _direct = _FakeRamRegs()
+  os.environ["KEPLER_RAM_BLOCK"] = "direct"
+  try:
+    nvbios_init.run_vbios_ram_program(_direct, _ram_image, freq_mhz=648)
+  finally:
+    os.environ.pop("KEPLER_RAM_BLOCK", None)
+  assert any(r == 0x1620 for r, _ in _direct.writes), \
+      "KEPLER_RAM_BLOCK=direct must emit host 0x1620 pause masks"
+
+  # Full golden-mmiotrace checkpoint suite (also available as
+  # --mmiotrace-selftest; must pass on macOS before the next eGPU replug).
+  import mmiotrace_selftest as _mmio_st
+  _hooks = _mmio_st.build_hooks_from_add_module(sys.modules[__name__])
+  assert _mmio_st.run_mmiotrace_selftest(_hooks, verbose=False) == 0
+  assert not _gk104_topo_is_posted(0xffffffff)
+  assert not _gk104_topo_is_posted(0xbadf1200)
+  assert not _gk104_topo_is_posted(0)
+  assert _gk104_topo_is_posted(0x00010004)
+  assert _gk104_topo_is_posted(0x00040004)  # golden FECS-era topology
+  assert not _gk104_pramin_word_is_stub(0xffffffff)  # virgin VRAM, not a stub
+  assert not _gk104_pramin_word_is_stub(0)
+  assert _gk104_pramin_word_is_stub(0xbad0fb14)
+  assert _gk104_pramin_word_is_stub(0xbadf3010)
+  assert not _gk104_pramin_word_is_stub(0x0000beef)
+  assert not _gk104_pramin_word_is_stub(0xa5a5a5a5)
+
+  # GK104 PMU recovery must use the MC-level PMC_ENABLE bit, not CPUCTL inside
+  # the PMU aperture.  The latter was the night15/16 reload bug: the transport
+  # stayed at 0xffffffff because an inaccessible engine cannot self-reset.
+  class _FakePmuResetRegs:
+    def __init__(self):
+      self.regs = {PMC_ENABLE: 0xe011312d,
+                   PMU_FALCON_BASE + 0x10c: 0}
+      self.writes = []
+    def read32(self, reg):
+      return self.regs.get(reg, 0)
+    def write32(self, reg, value):
+      value &= 0xffffffff
+      self.regs[reg] = value
+      self.writes.append((reg, value))
+  _pmu_reset_regs = _FakePmuResetRegs()
+  falcon_reset(_pmu_reset_regs, PMU_FALCON_BASE, settle_s=0)
+  _pmc_writes = [v for r, v in _pmu_reset_regs.writes if r == PMC_ENABLE]
+  assert _pmc_writes == [0xe011112d, 0xe011312d], _pmc_writes
+  assert not any(r == PMU_FALCON_BASE + FALCON_UC_CTRL
+                 for r, _ in _pmu_reset_regs.writes)
+  assert _pmu_reset_regs.writes[-1] == (0x10a580, 0)
+  _pmu_reset_full = _FakePmuResetRegs()
+  _pmu_reset_full.regs[PMC_ENABLE] = 0xffffffff
+  falcon_reset(_pmu_reset_full, PMU_FALCON_BASE, settle_s=0)
+  assert [v for r, v in _pmu_reset_full.writes if r == PMC_ENABLE] == [
+      0xffffdfff, 0xffffffff]
+
+  # BAR0 MSE recovery: PMC_BOOT_0=0xffffffff must not imply physical replug
+  # when config space is alive and COMMAND.MSE was cleared (DEXT Close()).
+  class _FakeBarHw:
+    def __init__(self, command=0x0000, boot0=0x0e4040a2, id32=0x118410de):
+      self.command = command & 0xffff
+      self.boot0 = boot0 & 0xffffffff
+      self.id32 = id32 & 0xffffffff
+      self.mapped = 0
+      self.resets = 0
+    def read_config(self, offset, size):
+      if offset == 0 and size == 4: return self.id32
+      if offset == pci.PCI_VENDOR_ID and size == 4: return self.id32
+      if offset == pci.PCI_COMMAND and size == 2: return self.command
+      raise AssertionError(f"unexpected config read {offset:#x}/{size}")
+    def write_config(self, offset, value, size):
+      if offset == pci.PCI_COMMAND and size == 2:
+        self.command = value & 0xffff
+        return
+      raise AssertionError(f"unexpected config write {offset:#x}")
+    def write_config_flush(self, offset, value, size):
+      self.write_config(offset, value, size)
+      return self.read_config(offset, size)
+    def bar_info(self, bar):
+      assert bar == 0
+      self.mapped += 1
+      return (0xf0000000, 16 << 20)
+    def mmio_read32(self, bar, offset):
+      assert bar == 0 and offset == 0
+      # BAR MMIO only decodes when MSE is set (Apple Close() clears it).
+      if not (self.command & pci.PCI_COMMAND_MEMORY):
+        return 0xffffffff
+      return self.boot0
+    def reset(self):
+      self.resets += 1
+      self.command = 0  # Close()-like clear after reset
+      self.boot0 = 0x0e4040a2
+  # MSE was off → restore → live boot0; MASTER stays clear during probe.
+  _hw = _FakeBarHw(command=0x0000)
+  _boot, _meta = _gk104_ensure_bar0_mmio(_hw)
+  assert _boot == 0x0e4040a2 and _meta["mse_before"] is False
+  assert (_hw.command & pci.PCI_COMMAND_MEMORY) and not (_hw.command & pci.PCI_COMMAND_MASTER)
+  assert _hw.mapped >= 1 and _hw.resets == 0
+  # Config lost → physical cycle message (not "BAR0 looks dead" alone).
+  try:
+    _gk104_ensure_bar0_mmio(_FakeBarHw(id32=0xffffffff))
+    raise AssertionError("expected config-lost error")
+  except RuntimeError as _e:
+    assert "config space lost" in str(_e).lower() or "endpoint/link" in str(_e).lower()
+  # MSE already on but BAR dead → reset path recovers.
+  class _FakeBarHwReset(_FakeBarHw):
+    def mmio_read32(self, bar, offset):
+      assert bar == 0 and offset == 0
+      if not (self.command & pci.PCI_COMMAND_MEMORY):
+        return 0xffffffff
+      return 0xffffffff if self.resets == 0 else self.boot0
+  _hw3 = _FakeBarHwReset(command=pci.PCI_COMMAND_MEMORY, boot0=0x0e4040a2)
+  _boot3, _meta3 = _gk104_ensure_bar0_mmio(_hw3)
+  assert _boot3 == 0x0e4040a2 and _meta3["did_reset"] and _hw3.resets == 1
+
   # GK104 GMMU helper sanity: PTE bit construction (no device needed)
   pte = GK104PageTableEntry(None, 0, 0)
   # Writable VRAM leaf: PRESENT set, READ_ONLY (bit 3) clear, TARGET=VRAM.
@@ -3205,13 +3827,19 @@ def kepler_selftest():
     # write_config_flush: set PCI_COMMAND bit0 and read it back.
     _obs = hw.write_config_flush(4, 0x0007, 2)
     assert _obs == 0x0007, f"config writeback {_obs:#x}"
-    # alloc_sysmem returns a host buffer + page bus paddrs.
-    _mv, _paddrs = hw.alloc_sysmem(0x3000, contiguous=True)
-    assert len(_mv) == 0x3000 and len(_paddrs) == 3, f"alloc_sysmem {len(_paddrs)} pages"
-    _mv[0:4] = struct.pack("<I", 0xcafef00d)
-    assert hw.sysmem_read(_paddrs[0], 4) == b"\x0d\xf0\xfe\xca", "sysmem_read round-trip"
-    hw.sysmem_write(_paddrs[1], b"\xaa\xbb\xcc\xdd")
-    assert _mv[0x1000:0x1004] == b"\xaa\xbb\xcc\xdd", "sysmem_write round-trip"
+    # alloc_sysmem resolves Linux PFNs through /proc/self/pagemap.  Keep the
+    # rest of this fake-sysfs transport test portable on macOS, where /proc is
+    # absent and the TinyGPU wrapper is the real transport.
+    if os.path.exists("/proc/self/pagemap"):
+      _mv, _paddrs = hw.alloc_sysmem(0x3000, contiguous=True)
+      assert len(_mv) == 0x3000 and len(_paddrs) == 3, \
+          f"alloc_sysmem {len(_paddrs)} pages"
+      _mv[0:4] = struct.pack("<I", 0xcafef00d)
+      assert hw.sysmem_read(_paddrs[0], 4) == b"\x0d\xf0\xfe\xca", \
+          "sysmem_read round-trip"
+      hw.sysmem_write(_paddrs[1], b"\xaa\xbb\xcc\xdd")
+      assert _mv[0x1000:0x1004] == b"\xaa\xbb\xcc\xdd", \
+          "sysmem_write round-trip"
     # arm_final_output_read allows exactly one matching BAR read, then consumed.
     _out = bytes(range(16))
     hw.mmio_write(1, 0, _out)
@@ -4084,6 +4712,104 @@ def _gk104_vmm_flush(dev):
     time.sleep(0.001)
   return False
 
+def _gk104_ensure_pmu_memx_ready(dev) -> None:
+  """Re-discover or reload PMU MEMX after FECS/bit0 (semaphore often wedged)."""
+  _gk104_require_bar0_live(dev, "before PMU MEMX ensure")
+  def _smoke() -> bool:
+    try:
+      if getattr(dev, "_pmu_memx_data", None) is None:
+        return False
+      sem = dev.read32(0x10a580) & 0xffffffff
+      if sem == 0xffffffff:
+        return False
+      if sem != 0:
+        dev.write32(0x10a580, 0)
+      dev.pmu_memx_exec_commands([(PMU_MEMX_DELAY, (1000,))], timeout_s=2.0)
+      return True
+    except Exception:
+      return False
+  if _smoke():
+    return
+  print("[kepler] PMU MEMX not ready for PRAMIN; reloading PMU falcon",
+        flush=True)
+  fw = find_kepler_firmware()
+  if not fw:
+    raise RuntimeError("PMU MEMX dead and no GK104 firmware tree for reload")
+  pmu_code = open(os.path.join(fw, "gk104_pmu_code.bin"), "rb").read()
+  pmu_data = open(os.path.join(fw, "gk104_pmu_data.bin"), "rb").read()
+  if os.environ.get("KEPLER_PMU_ENTER_NOWAIT", "1") != "0":
+    pmu_code = _patch_pmu_memx_nowait(pmu_code)
+    try:
+      setattr(dev, "_pmu_memx_nowait", True)
+    except Exception:
+      pass
+  print(f"[kepler] PMU MC reset pre: PMC_ENABLE={dev.read32(PMC_ENABLE) & 0xffffffff:#x} "
+        f"SCRUB={dev.read32(PMU_FALCON_BASE + 0x10c) & 0xffffffff:#x} "
+        f"RING={dev.read32(0x10a4d0) & 0xffffffff:#x}", flush=True)
+  falcon_reset(dev, PMU_FALCON_BASE)
+  print(f"[kepler] PMU MC reset post: PMC_ENABLE={dev.read32(PMC_ENABLE) & 0xffffffff:#x} "
+        f"SCRUB={dev.read32(PMU_FALCON_BASE + 0x10c) & 0xffffffff:#x}",
+        flush=True)
+  falcon_load(dev, PMU_FALCON_BASE, pmu_code, pmu_data, entry=0, start=True)
+  try:
+    setattr(dev, "_pmu_memx_data", None)
+  except Exception:
+    pass
+  init = getattr(dev, "_init_pmu_memx", None)
+  if init is None or not init():
+    raise RuntimeError("PMU MEMX rediscovery failed after falcon reload")
+  if not _smoke():
+    raise RuntimeError("PMU MEMX DELAY smoke failed after falcon reload")
+  print("[kepler] PMU MEMX ready after reload", flush=True)
+
+
+def _gk104_pramin_write_memx(dev, pa, data) -> None:
+  """Store PRAMIN words via PMU MEMX WR32 (host 0x1700 after bit0 kills TinyGPU).
+
+  After deferred bit0, night14 showed host ``write32(0x1700, …)`` alone drops
+  BAR0.  MEMX already programs ``0x10f*`` safely; use it for the PRAMIN
+  window + XOR aperture stores.  Assume virgin ``0xffffffff`` after bit0
+  (night5) so each store is ``0xffffffff ^ wanted`` without a host readback.
+  """
+  _gk104_ensure_pmu_memx_ready(dev)
+  data = memoryview(data).cast("B")
+  if len(data) & 3:
+    raise ValueError("PRAMIN write must be 4-byte aligned")
+  pairs: list[tuple[int, int]] = []
+  window = None
+  for off in range(0, len(data), 4):
+    addr = pa + off
+    base = addr & 0xffffff00000
+    if base != window:
+      pairs.append((0x001700, (base >> 16) & 0xffffffff))
+      window = base
+    reg = 0x700000 + (addr & 0xfffff)
+    wanted = struct.unpack_from("<I", data, off)[0]
+    # Virgin XOR aperture after bit0 unstub.
+    pairs.append((reg, (0xffffffff ^ wanted) & 0xffffffff))
+  # Same small chunks as nvbios _MemxBus.flush (cold PMU timeouts on large).
+  chunk_n = 4
+  execs = 0
+  for i in range(0, len(pairs), chunk_n):
+    chunk = pairs[i:i + chunk_n]
+    payload: list[int] = []
+    for addr, val in chunk:
+      payload.extend([addr & 0xffffffff, val & 0xffffffff])
+    try:
+      if (dev.read32(0x10a580) & 0xffffffff) != 0:
+        dev.write32(0x10a580, 0)
+    except Exception:
+      pass
+    dev.pmu_memx_exec_commands([(PMU_MEMX_WR32, tuple(payload))], timeout_s=8.0)
+    execs += 1
+    if execs == 1 or execs % 64 == 0:
+      _gk104_require_bar0_live(dev, f"during MEMX PRAMIN exec={execs}")
+  _gk104_require_bar0_live(dev, f"after MEMX PRAMIN @{pa:#x}")
+  if not hasattr(dev, "ops"):
+    print(f"[kepler] PRAMIN via MEMX: pa={pa:#x} bytes={len(data)} "
+          f"execs={execs}", flush=True)
+
+
 def _gk104_pramin_write(dev, pa, data):
   """Store framebuffer words through BAR0 PRAMIN and verify each result.
 
@@ -4093,29 +4819,48 @@ def _gk104_pramin_write(dev, pa, data):
   for that path, then fall back to a literal store if the aperture is behaving
   normally.  Never return with silently inverted channel data.
   """
+  # TinyGPU: once BAR0 is all-ones, 0x1700/0x700000 pokes hang the USB4 path.
+  # Deferred bit0 (after PGRAPH/FECS) must run before the first PRAMIN store.
+  if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
+    _gk104_bit0_unstub(dev)
+  _gk104_require_bar0_live(dev, f"before PRAMIN store @{pa:#x}")
+  # Host 0x1700 after bit0 kills TinyGPU (night14); prefer MEMX WR32.
+  if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and
+      hasattr(dev, "pmu_memx_exec_commands")):
+    _gk104_pramin_write_memx(dev, pa, data)
+    return
   data = memoryview(data).cast("B")
   if len(data) & 3:
     raise ValueError("PRAMIN write must be 4-byte aligned")
   window = None
+  allow_literal = os.environ.get("KEPLER_PRAMIN_LITERAL", "1") != "0"
   for off in range(0, len(data), 4):
     addr = pa + off
     base = addr & 0xffffff00000
     if base != window:
       dev.write32(0x001700, base >> 16)
       window = base
+      _gk104_require_bar0_live(dev, f"after PRAMIN window @{base:#x}")
     reg = 0x700000 + (addr & 0xfffff)
     wanted = struct.unpack_from("<I", data, off)[0]
-    current = dev.read32(reg)
+    current = dev.read32(reg) & 0xffffffff
+    _gk104_require_bar0_live(dev, f"after PRAMIN read @{addr:#x}")
     if current == wanted:
       continue
-    dev.write32(reg, current ^ wanted)
-    actual = dev.read32(reg)
-    if actual != wanted:
+    # XOR aperture: virgin 0xffffffff + wanted 0 needs write of 0xffffffff,
+    # not a literal 0 (literal 0 on XOR leaves all-ones and has killed TinyGPU).
+    dev.write32(reg, (current ^ wanted) & 0xffffffff)
+    actual = dev.read32(reg) & 0xffffffff
+    _gk104_require_bar0_live(dev, f"after PRAMIN XOR @{addr:#x}")
+    if actual != wanted and allow_literal:
       dev.write32(reg, wanted)
-      actual = dev.read32(reg)
+      actual = dev.read32(reg) & 0xffffffff
+      _gk104_require_bar0_live(dev, f"after PRAMIN literal @{addr:#x}")
     if actual != wanted:
+      stub = (" (FB aperture stub/untrained — cold RAM/MEMX did not enable "
+              "PRAMIN)" if _gk104_pramin_word_is_stub(actual) else "")
       raise RuntimeError(f"PRAMIN store failed at {addr:#x}: "
-                         f"wanted={wanted:#x} actual={actual:#x}")
+                         f"wanted={wanted:#x} actual={actual:#x}{stub}")
 
 def _gk104_pramin_read32(dev, pa):
   base = pa & 0xffffff00000
@@ -4124,6 +4869,13 @@ def _gk104_pramin_read32(dev, pa):
 
 def _gk104_pramin_write_literal(dev, pa, data):
   """Write raw dwords without the readback/XOR compensation."""
+  if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
+    _gk104_bit0_unstub(dev)
+  if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and
+      hasattr(dev, "pmu_memx_exec_commands")):
+    # Still use virgin-XOR encoding via MEMX — literal host path is TinyGPU-hostile.
+    _gk104_pramin_write_memx(dev, pa, data)
+    return
   data = memoryview(data).cast("B")
   if len(data) & 3:
     raise ValueError("literal PRAMIN write must be 4-byte aligned")
@@ -4144,28 +4896,288 @@ def _gk104_bar_flush(dev):
       time.sleep(0.001)
   return True
 
+def _gk104_topo_is_posted(gpc_topo: int) -> bool:
+  """True when 0x409604 looks like a live POSTed GPC topology, not a sentinel."""
+  topo_hi = gpc_topo & 0xffff0000
+  return (gpc_topo != 0 and
+          gpc_topo != 0xffffffff and
+          topo_hi != 0xbadf0000 and
+          topo_hi != 0xbad00000 and
+          topo_hi != 0xbad0d000)
+
+
+def _gk104_pramin_word_is_stub(word: int) -> bool:
+  """True when a PRAMIN dword is a dead/stub sentinel, not framebuffer data.
+
+  Cold eGPUs that have not completed EFI/Nouveau memory training return the
+  ``0xbad0fbXX`` aperture stub (low byte counts host touches).  ``0xbadf…``
+  power-gate patterns are also unusable.  Do **not** treat ``0`` / ``0xffffffff``
+  as stubs: virgin GDDR often reads all-ones, and the PRAMIN store path already
+  compensates XOR-vs-``0xffffffff`` updates.
+  """
+  if (word & 0xffffff00) == 0xbad0fb00:
+    return True
+  if (word & 0xffff0000) in (0xbadf0000, 0xbad00000, 0xbad0d000):
+    return True
+  return False
+
+
+def _gk104_pramin_looks_live(dev, pa=0x100000, soft=None) -> bool:
+  """True when PRAMIN looks usable for channel instance stores.
+
+  On TinyGPU, even a soft ``0x1700``/``0x700000`` PRAMIN *read* after
+  post-MEMX ``0x1620[0]`` clear has collapsed BAR0 to all-ones and hung the
+  USB4 path long enough for WindowServer watchdog (2026-07-16).  Default
+  ``KEPLER_PRAMIN_SOFT_LIVE=1`` therefore accepts a live ``PMC_BOOT_0``
+  without touching the aperture; channel-build stores remain the hard proof.
+
+  ``soft=False`` forces the writeback probe (boot POSTed detection only —
+  virgin/all-ones must not be mistaken for a POSTed card).
+  """
+  if soft is None:
+    soft = os.environ.get("KEPLER_PRAMIN_SOFT_LIVE", "1") != "0"
+  try:
+    boot0 = dev.read32(0) & 0xffffffff
+    if not _gk104_boot0_looks_live(boot0):
+      return False
+  except Exception:
+    return False
+  if soft:
+    # Do not poke PRAMIN window — proven TinyGPU-hostile after bit0 unstub.
+    return True
+  try:
+    word = _gk104_pramin_read32(dev, pa) & 0xffffffff
+  except Exception:
+    return False
+  if _gk104_pramin_word_is_stub(word):
+    return False
+  pat = 0xa5a55a5a
+  try:
+    # Match _gk104_pramin_write: try XOR compensation first, then literal.
+    base = pa & 0xffffff00000
+    reg = 0x700000 + (pa & 0xfffff)
+    dev.write32(0x001700, base >> 16)
+    current = dev.read32(reg) & 0xffffffff
+    if _gk104_pramin_word_is_stub(current):
+      return False
+    if current == pat:
+      return True
+    # Single XOR attempt; if BAR0 dies mid-probe, abort as not-live.
+    dev.write32(reg, current ^ pat)
+    actual = dev.read32(reg) & 0xffffffff
+    boot0 = dev.read32(0) & 0xffffffff
+    if not _gk104_boot0_looks_live(boot0):
+      return False
+    if actual != pat:
+      dev.write32(reg, pat)
+      actual = dev.read32(reg) & 0xffffffff
+      boot0 = dev.read32(0) & 0xffffffff
+      if not _gk104_boot0_looks_live(boot0):
+        return False
+    if actual != pat:
+      return False
+    # Best-effort restore (instance region is rewritten later anyway).
+    now = dev.read32(reg) & 0xffffffff
+    if now != current:
+      dev.write32(reg, current)  # literal
+      if (dev.read32(reg) & 0xffffffff) != current:
+        dev.write32(reg, now ^ current)  # XOR aperture
+    return True
+  except Exception:
+    return False
+
+# Palit GTX 770 (GK104): NVIDIA 0x10de / 0x1184.  chip_id in PMC_BOOT_0 is 0xe4.
+GK104_PCI_VENDOR_DEVICE = 0x118410DE
+GK104_PMC_BOOT0_CHIP = 0xE4
+
+
+def _gk104_boot0_looks_live(boot0: int) -> bool:
+  if boot0 in (0, 0xffffffff):
+    return False
+  if (boot0 & 0xfffff000) == 0xbad00000:
+    return False
+  return ((boot0 >> 20) & 0xfff) == GK104_PMC_BOOT0_CHIP
+
+
+def _gk104_require_bar0_live(dev, label: str) -> int:
+  """Abort before spewing all-ones MMIO once TinyGPU BAR0 has collapsed."""
+  try:
+    boot0 = dev.read32(0) & 0xffffffff
+  except Exception as e:
+    raise RuntimeError(f"BAR0 unreadable {label}: {e}") from e
+  if not _gk104_boot0_looks_live(boot0):
+    raise RuntimeError(
+        f"BAR0 dead {label} (PMC_BOOT_0={boot0:#x}); refusing further MMIO.  "
+        "Power-cycle the eGPU enclosure and cold-run once.")
+  return boot0
+
+
+def _gk104_bit0_unstub(dev) -> None:
+  """Clear only ``0x1620[0]`` to unstub PRAMIN (night5); once per device.
+
+  Must run *after* PGRAPH pack / FECS MMIO on TinyGPU — doing it earlier makes
+  the PGRAPH pack collapse BAR0 (2026-07-16 night11).
+  """
+  if getattr(dev, "_bit0_unstub_done", False):
+    return
+  if os.environ.get("KEPLER_RAM_BLOCK", "0") != "bit0":
+    return
+  _gk104_require_bar0_live(dev, "before deferred bit0 unstub")
+  r1620 = dev.read32(0x001620) & 0xffffffff
+  print(f"[kepler] deferred bit0 unstub: 0x1620 {r1620:#x}->{r1620 & ~1:#x}",
+        flush=True)
+  if os.environ.get("KEPLER_RAM_BIT0_FULL", "0") == "1":
+    def _host_mask(reg: int, m: int, val: int) -> None:
+      old = dev.read32(reg) & 0xffffffff
+      dev.write32(reg, ((old & ~m) | val) & 0xffffffff)
+    _host_mask(0x001620, 0x00000001, 0)
+    _host_mask(0x0026f0, 0x00000001, 0)
+    _host_mask(0x0026f0, 0x00000001, 0x00000001)
+    _host_mask(0x001620, 0x00000001, 0x00000001)
+  else:
+    dev.write32(0x001620, r1620 & ~0x1)
+  boot0 = _gk104_require_bar0_live(dev, "after deferred bit0 unstub")
+  print(f"[kepler] deferred bit0 done; PMC_BOOT_0={boot0:#x}", flush=True)
+  try:
+    setattr(dev, "_bit0_unstub_done", True)
+  except Exception:
+    pass
+
+
+def _gk104_ensure_bar0_mmio(hw) -> tuple:
+  """Recover BAR0 MMIO without assuming a physical replug is required.
+
+  Tiered check (Apple PCIDriverKit: Close() clears COMMAND Memory Space /
+  Bus Master; reopen must restore them before BAR access):
+
+    1. ConfigurationRead32(0x00) — vendor/device still on the link?
+    2. ConfigurationRead16(0x04) — restore MSE=1, keep MASTER=0 for probe
+    3. Remap BAR0, read PMC_BOOT_0
+    4. If still dead with valid ID+MSE → optional Function/Hot Reset
+    5. Only then report a physical power/link cycle
+
+  Returns ``(boot0, meta_dict)``.
+  """
+  meta = {
+    "id32": None,
+    "command_before": None,
+    "command_after": None,
+    "mse_before": None,
+    "did_reset": False,
+  }
+
+  def _read_id():
+    return hw.read_config(pci.PCI_VENDOR_ID, 4) & 0xffffffff
+
+  def _restore_mse_only():
+    """Open memory decode for BAR probe; leave Bus Master off until boot0 OK."""
+    before = hw.read_config(pci.PCI_COMMAND, 2) & 0xffff
+    if meta["command_before"] is None:
+      meta["command_before"] = before
+      meta["mse_before"] = bool(before & pci.PCI_COMMAND_MEMORY)
+    want = ((before | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_INTX_DISABLE) &
+            ~(pci.PCI_COMMAND_MASTER | pci.PCI_COMMAND_SERR | pci.PCI_COMMAND_PARITY))
+    after = hw.write_config_flush(pci.PCI_COMMAND, want, 2) & 0xffff
+    meta["command_after"] = after
+    if not (after & pci.PCI_COMMAND_MEMORY):
+      raise RuntimeError(
+          f"PCI COMMAND.MSE did not stick (before={before:#06x} after={after:#06x}); "
+          "TinyGPU reopen/init failed to restore memory decode — not a proven "
+          "physical GPU death yet")
+    return before, after
+
+  def _remap_and_read_boot0():
+    hw.bar_info(0)  # refresh BAR0 mapping after COMMAND change / reset
+    return hw.mmio_read32(0, 0) & 0xffffffff
+
+  id32 = _read_id()
+  meta["id32"] = id32
+  if id32 in (0, 0xffffffff):
+    raise RuntimeError(
+        f"PCI config space lost (vendor/device={id32:#010x}); "
+        "endpoint/link is down — physical power or Thunderbolt link cycle required")
+
+  vend = id32 & 0xffff
+  devid = (id32 >> 16) & 0xffff
+  if vend != 0x10de:
+    raise RuntimeError(
+        f"unexpected PCI vendor/device={id32:#010x} (want NVIDIA 0x10de/GK104)")
+
+  _restore_mse_only()
+  boot0 = _remap_and_read_boot0()
+  if _gk104_boot0_looks_live(boot0):
+    return boot0, meta
+
+  # Config OK + MSE set, but BAR0 still all-ones / wrong chip → try PCI reset
+  # before declaring a physical cycle.  TinyGPU exposes RemoteCmd.RESET;
+  # Linux sysfs path may no-op or raise — treat failure as soft.
+  if hasattr(hw, "reset") and callable(hw.reset):
+    try:
+      print(f"[kepler] BAR0 still dead (PMC_BOOT_0={boot0:#010x}) with "
+            f"id={id32:#010x} cmd={meta['command_after']:#06x}; trying PCI reset",
+            flush=True)
+      hw.reset()
+      meta["did_reset"] = True
+      time.sleep(0.05)
+      id32 = _read_id()
+      meta["id32"] = id32
+      if id32 in (0, 0xffffffff):
+        raise RuntimeError(
+            f"PCI config lost after Reset() (id={id32:#010x}); "
+            "physical power/link cycle required")
+      _restore_mse_only()
+      boot0 = _remap_and_read_boot0()
+      if _gk104_boot0_looks_live(boot0):
+        return boot0, meta
+    except RuntimeError:
+      raise
+    except Exception as e:
+      print(f"[kepler] PCI reset unavailable or failed: {e}", flush=True)
+
+  mse = bool((meta.get("command_after") or 0) & pci.PCI_COMMAND_MEMORY)
+  raise RuntimeError(
+      f"GK104 BAR0 MMIO still inaccessible after MSE restore"
+      f"{' + Reset' if meta['did_reset'] else ''} "
+      f"(PMC_BOOT_0={boot0:#010x}, PCI_ID={id32:#010x}/{vend:04x}:{devid:04x}, "
+      f"COMMAND={meta.get('command_before'):#06x}->{meta.get('command_after'):#06x}, "
+      f"MSE_was={meta.get('mse_before')}, MSE_now={mse}). "
+      f"Config space is alive — this is a hung MMIO/link state, not a missing "
+      f"device.  Try PCI reset path / enclosure power cycle; do not assume "
+      f"replug solely from PMC_BOOT_0=0xffffffff.")
+
+
 def _gk104_ltc_init(dev):
   """Initialize GK104 LTC (L2 cache) — gk104_ltc_init() + gf100_ltc_oneinit().
 
-  Without this, the L2 cache is not properly configured and GPU internal
-  clients (PBDMA, GR, etc.) may read stale/zero data from VRAM.  This is
-  a critical missing init step on the un-POSTed card.
+  Golden mmiotrace order (Nouveau on this Palit GTX 770):
+    RAMMAP/training → LTC topology + ZBC clear → 0x17e8d8/0x17e000/0x17e8d4
+    … much later → FECS.  Call this immediately after cold RAM init, before FECS.
 
-  gf100_ltc_oneinit() reads the LTC topology (ltc_nr, lts_nr) from hardware
-  and calls gf100_ltc_oneinit_tag_ram() to allocate compression tag RAM.
-  On this card there is no VBIOS-initialized VRAM, so num_tags=0 and
-  tag_base=0 (matching the no-ram path in gf100_ltc_oneinit_tag_ram()).
-  gk104_ltc_init() then programs the LTC registers.
+  Compression tag RAM (0x17e8d4) is left at 0: the golden trace programs a
+  VRAM-backed tag_base (0x7fddf) after Nouveau allocates tag memory; our
+  userspace path has no fb tags heap yet.  Uncompressed compute does not
+  require tags (gf100_ltc_oneinit_tag_ram's no-ram path).
   """
   # gf100_ltc_oneinit(): read LTC topology from hardware.
-  parts = dev.read32(0x022438)
+  # Nouveau reads 0x022438 unmasked; on this card it is 4.  Bound it anyway —
+  # gated/sentinel reads previously hung bring-up in range(parts).
+  parts = dev.read32(0x022438) & 0xff
   mask = dev.read32(0x022554)
-  lts_nr = dev.read32(0x17e8dc) >> 28
+  lts_nr = (dev.read32(0x17e8dc) >> 28) & 0xf
   ltc_nr = 0
-  for i in range(parts):
+  for i in range(min(parts, 32)):
     if not (mask & (1 << i)):
       ltc_nr += 1
-  # gf100_ltc_oneinit_tag_ram(): no VRAM → num_tags=0, tag_base=0.
+  # Nouveau clears ZBC colour/depth slots 1..15 during LTC bring-up
+  # (ltc/base.c: zbc_*_min=1 reserves index 0 for disabled; golden writes
+  # 0x17ea44 = 1..15 then depth, never index 0).
+  for i in range(1, 16):
+    nvkm_mask(dev, 0x17ea44, 0x0000000f, i)
+    for off in (0x17ea48, 0x17ea4c, 0x17ea50, 0x17ea54):
+      dev.write32(off, 0)
+  for i in range(1, 16):
+    nvkm_mask(dev, 0x17ea44, 0x0000000f, i)
+    dev.write32(0x17ea58, 0)
   tag_base = 0
   # gk104_ltc_init(): program LTC registers.
   lpg128 = not (dev.read32(0x100c80) & 0x00000001)
@@ -4173,9 +5185,10 @@ def _gk104_ltc_init(dev):
   dev.write32(0x17e000, ltc_nr)
   dev.write32(0x17e8d4, tag_base)
   nvkm_mask(dev, 0x17e8c0, 0x00000002, 0x00000002 if lpg128 else 0x00000000)
-  if DEBUG:
+  # Skip chatter on FakeMMIO recorders used by mmiotrace_selftest.
+  if not hasattr(dev, "ops"):
     print(f"[kepler] LTC init: ltc_nr={ltc_nr} lts_nr={lts_nr} parts={parts} "
-          f"mask={mask:#x} lpg128={lpg128} tag_base={tag_base}", flush=True)
+          f"mask={mask:#x} lpg128={lpg128} tag_base={tag_base:#x}", flush=True)
 
 def _gk104_fb_init_page(dev):
   """Set GF100/GK104 big-page mode — gf100_fb_init_page().
@@ -4183,6 +5196,22 @@ def _gk104_fb_init_page(dev):
   GK104 default is 17-bit (128 KiB) big pages: 0x100c80 bit0 = 0.
   """
   nvkm_mask(dev, 0x100c80, 0x00000001, 0x00000000)
+
+def _gk104_post_ram_fb_ltc(dev):
+  """Golden post-RAM cold step: fb_init_page then LTC/ZBC (before FECS).
+
+  Nouveau order on this Palit GTX 770 (mmiotrace @~0.393s): 0x100c80 →
+  ZBC 1..15 → 0x17e8d8/0x17e000/0x17e8d4/0x17e8c0.  Idempotent via
+  ``_ltc_inited``.
+  """
+  if getattr(dev, "_ltc_inited", False):
+    return
+  _gk104_fb_init_page(dev)
+  _gk104_ltc_init(dev)
+  try:
+    setattr(dev, "_ltc_inited", True)
+  except Exception:
+    pass
 
 def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
                               map_vram=True, userd_alias_pa=None):
@@ -4203,6 +5232,9 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
   The page directory and instance block live in PRAMIN (VRAM aperture 0),
   matching gf100_vmm_pgd_pde() for NVKM_MEM_TARGET_VRAM.
   """
+  # MEMX PRAMIN is slow; 16 MiB covers bit19-safe GR/attrib (≤0x900000).
+  if os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1":
+    mapped_size = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x1000000"), 0)
   dev.write32(0x001704, dev.read32(0x001704) & ~0x80000000)
   inst_pa = 0x00100000
   pgd_pa = 0x00110000
@@ -4518,9 +5550,30 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   # attrib_cb: 0x20 * (attrib_nr_max + alpha_nr_max) * tpc_total
   pagepool = alloc.alloc(0x8000, align=0x1000)
   bundle_cb = alloc.alloc(0x3000, align=0x1000)
-  # attrib_cb size depends on tpc_total; use a safe default for GK104
-  # (8 TPCs max on GTX 770): 0x20 * (0x324 + 0x7ff) * 8 = 0xb7c00
-  attrib_cb = alloc.alloc(0x100000, align=0x1000)
+  from grctx_gk104 import GK104_GRCTX_CONSTS as _GC
+  _gpc_n = max(1, dev.read32(0x409604) & 0x1f)
+  _tpc_nr = [dev.read32(0x500000 + gpc * 0x8000 + 0x2608) & 0x1f
+             for gpc in range(_gpc_n)]
+  _tpc_total = sum(_tpc_nr) or 8
+  _attrib_nr_max = _GC["attrib_nr_max"]
+  _alpha_nr_max = _GC["alpha_nr_max"]
+  _attrib_nr = _GC["attrib_nr"]
+  _alpha_nr = _GC["alpha_nr"]
+  # Full Nouveau attrib CB is ~0xb2300 for 8 TPCs.  With bit19 aliasing only
+  # 512 KiB per 1 MiB bank is unique — shrink counts so the CB fits.
+  if os.environ.get("KEPLER_VRAM_BIT19_SAFE", "1") != "0":
+    _sum_max = max(1, 0x80000 // (0x20 * _tpc_total))
+    if _attrib_nr_max + _alpha_nr_max > _sum_max:
+      _attrib_nr_max = min(_attrib_nr_max, max(1, _sum_max // 3))
+      _alpha_nr_max = max(1, _sum_max - _attrib_nr_max)
+      _attrib_nr = min(_attrib_nr, _attrib_nr_max)
+      _alpha_nr = min(_alpha_nr, _alpha_nr_max)
+      print(f"[kepler] bit19-safe attrib shrink: "
+            f"attrib_nr_max={_attrib_nr_max:#x} alpha_nr_max={_alpha_nr_max:#x} "
+            f"tpc={_tpc_total}", flush=True)
+  _attrib_size = round_up(
+      0x20 * (_attrib_nr_max + _alpha_nr_max) * _tpc_total, 0x1000)
+  attrib_cb = alloc.alloc(_attrib_size, align=0x1000)
   mmio_list = alloc.alloc(0x1000)
   chan_id = int(os.environ.get("KEPLER_CHAN_ID", "1"))
   userd_base_off = chan_id * 0x200
@@ -4536,14 +5589,11 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                     use_vram_inst)
   use_vram_signal = (os.environ.get("KEPLER_VRAM_SEMAPHORE", "1") != "0" and
                       use_vram_inst)
-  from grctx_gk104 import GK104_GRCTX_CONSTS as _GC
-  _tpc_nr = [dev.read32(0x500000 + gpc * 0x8000 + 0x2608) & 0x1f
-             for gpc in range(dev.read32(0x409604) & 0x1f)]
   _ppc_masks = [(dev.read32(0x500c30 + gpc * 0x8000) & 0xff) or
                 ((1 << _tpc_nr[gpc]) - 1) for gpc in range(len(_tpc_nr))]
   _bundle_size = _GC["bundle_size"]
   _state_limit = min(_GC["bundle_min_gpm_fifo_depth"], _bundle_size // 0x20)
-  _alpha, _beta = _GC["alpha_nr"], _GC["attrib_nr"]
+  _alpha, _beta = _alpha_nr, _attrib_nr
   runtime_mmio_entries = [
     (0x40800c, pagepool.va_addr >> 8), (0x408010, 0x80000000),
     (0x419004, pagepool.va_addr >> 8), (0x419008, 0),
@@ -4562,15 +5612,15 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         f"bundle={bundle_cb.va_addr:#x}+{bundle_cb.size:#x} "
         f"attrib={attrib_cb.va_addr:#x}+{attrib_cb.size:#x} "
         f"mmio={mmio_list.va_addr:#x}+{mmio_list.size:#x}", flush=True)
-  _bo, _ao = 0, _GC["attrib_nr_max"] * sum(_tpc_nr)
+  _bo, _ao = 0, _attrib_nr_max * sum(_tpc_nr)
   for _gpc, _mask in enumerate(_ppc_masks):
     _count = _mask.bit_count()
     _ppc = 0x503000 + _gpc * 0x8000
     runtime_mmio_entries.append(
       (_ppc + 0xc0, (1 << 28) | (_beta * _count << 16) | _bo))
-    _bo += _GC["attrib_nr_max"] * _count
+    _bo += _attrib_nr_max * _count
     runtime_mmio_entries.append((_ppc + 0xe4, (_alpha * _count << 16) | _ao))
-    _ao += _GC["alpha_nr_max"] * _count
+    _ao += _alpha_nr_max * _count
   runtime_mmio_entries.extend(((0x17e91c, dev.read32(0x17e91c)),
                                (0x17e920, dev.read32(0x17e920))))
   mmio_blob = b"".join(struct.pack("<II", reg, value & 0xffffffff)
@@ -4619,11 +5669,28 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   # stale dwords on this card.  Keep the bring-up heap inside the 128-MiB BAR1
   # aperture but above those bootstrap objects.
   bar1_cursor = int(os.environ.get("KEPLER_VRAM_HEAP_BASE", "0x400000"), 0)
+  # Incomplete GDDR address train on this eGPU aliases pa ^= 0x80000 (bit19).
+  # Default: only allocate in the low half of each 1 MiB bank.
+  bit19_safe = os.environ.get("KEPLER_VRAM_BIT19_SAFE", "1") != "0"
   def bar1_alloc(size, align=0x1000):
     nonlocal bar1_cursor
-    bar1_cursor = round_up(bar1_cursor, align)
+    size = round_up(size, 0x1000)
+    if bit19_safe:
+      if size > 0x80000:
+        raise MemoryError(
+            f"bit19-safe BAR1 alloc size {size:#x} exceeds 512 KiB bank")
+      while True:
+        bar1_cursor = round_up(bar1_cursor, align)
+        bank = bar1_cursor & ~0xfffff
+        lo_end = bank + 0x80000
+        if bar1_cursor >= lo_end or bar1_cursor + size > lo_end:
+          bar1_cursor = bank + 0x100000
+          continue
+        break
+    else:
+      bar1_cursor = round_up(bar1_cursor, align)
     pa = bar1_cursor
-    bar1_cursor += round_up(size, 0x1000)
+    bar1_cursor += size
     if bar1_cursor > dev.dev_impl.bar1_size:
       raise MemoryError("BAR1-backed instance allocation exceeds aperture")
     return pa
@@ -4651,11 +5718,19 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # Nouveau's nvkm_gpuobj_new() uses NVKM_MEM_TARGET_INST for the channel
     # instance and GR context. Keep their direct physical addresses in the
     # framebuffer aperture, while ordinary buffers remain in the VMM SYS path.
-    grctx_vram_pa = bar1_alloc(0x100000)
+    # PRAMIN is a 1-MiB window (0x1700 selects bits[36:16]).  Split the GR
+    # context into two bit19-safe 512 KiB banks: runtime at +0 and golden
+    # (CB_RESERVED) in a separate bank — a single 1 MiB object aliases on this
+    # eGPU and destroys itself during zero/repair.
+    grctx_vram_pa = bar1_alloc(0x80000)
+    grctx_golden_vram_pa = bar1_alloc(0x80000)
     pagepool_vram_pa = bar1_alloc(0x8000)
     bundle_vram_pa = bar1_alloc(0x3000)
-    attrib_vram_pa = bar1_alloc(0x100000)
+    attrib_vram_pa = bar1_alloc(attrib_cb.size)
     mmio_list_vram_pa = bar1_alloc(0x1000)
+    print(f"[kepler] VRAM inst: grctx_runtime={grctx_vram_pa:#x} "
+          f"grctx_golden={grctx_golden_vram_pa:#x} attrib={attrib_vram_pa:#x}+"
+          f"{attrib_cb.size:#x} bit19_safe={bit19_safe}", flush=True)
     gpfifo_vram_pa = bar1_alloc(0x2000, align=0x2000) if use_vram_gpfifo else None
     if gpfifo_vram_pa is not None and os.environ.get("KEPLER_GPFIFO_IN_USERD") == "1":
       # Diagnostic: USERD page 0 offset 0 is unused by CHID 1 (its USERD is at
@@ -4675,8 +5750,18 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
       _gk104_init_bar1_identity(dev, bus_base=base, map_vram=True,
                                 userd_alias_pa=userd_vram_pa)
       bar1_identity_ready = True
-    for pa, size in ((grctx_vram_pa, 0x100000), (pagepool_vram_pa, 0x8000),
-                     (bundle_vram_pa, 0x3000), (attrib_vram_pa, 0x100000)):
+    # Stop FECS before bulk-zeroing GR/instance VRAM.  A live FECS (left ready
+    # by a prior userspace attempt) can rewrite context pages underneath us and
+    # make every dword look non-zero again at the final proof.
+    try:
+      if (dev.read32(0x409800) & 0x80000000) or (dev.read32(0x409100) & 0x10):
+        falcon_stop(dev, FECS_FALCON_BASE, timeout_ms=1000)
+        print("[kepler] halted FECS before GR/instance zero", flush=True)
+    except Exception as e:
+      print(f"[kepler] FECS halt before zero skipped: {e}", flush=True)
+    for pa, size in ((grctx_vram_pa, 0x80000), (grctx_golden_vram_pa, 0x80000),
+                     (pagepool_vram_pa, 0x8000), (bundle_vram_pa, 0x3000),
+                     (attrib_vram_pa, attrib_cb.size)):
       bar1_write(pa, bytes(size))
     bar1_write(userd_vram_pa, bytes(0x2000))
     _gk104_pramin_write_literal(dev, userd_vram_pa, bytes(0x2000))
@@ -4691,50 +5776,78 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
       raise ValueError(
           "invalid KEPLER_ATTRIB_REPAIR; expected literal or bar1")
     def repair_zero(label, pa, size):
-      # The compensated writer cannot be used for zero here: its transformed
-      # immediate readback makes a raw 0xffffffff operand look like zero while
-      # the GPU still observes all ones.  Store literal zero dwords instead.
+      # Virgin GDDR often reads as 0xffffffff.  On this aperture a literal BAR1
+      # store of zeros is a no-op under XOR-update semantics (old^0 == old), so
+      # PRAMIN still sees all-ones.  Use the compensated PRAMIN writer
+      # (current^wanted first).  Do **not** LTC-invalidate between store and
+      # verify: discarding dirty lines before writeback resurrects all-ones from
+      # DRAM and makes a later full-buffer proof fail even when per-page checks
+      # briefly saw zeros.
       phase_label = label.lower().replace(" ", "-")
       if hw is not None:
         hw.set_phase(f"channel-build-repair-zero-{phase_label}")
-        # Use the kernel's write-combining BAR1 mapping for framebuffer bulk
-        # stores.  The uncached resource and PRAMIN aperture both expose a
-        # transient low-dword mask on this card.
+      use_bar1 = (attrib_repair_mode == "bar1" and label == "attrib")
       for _page in range(0, size, 0x1000):
         _page_size = min(0x1000, size - _page)
-        for _attempt in range(4):
-          bar1_write(pa + _page, bytes(_page_size))
+        for _attempt in range(6):
+          if use_bar1 and _attempt < 2:
+            bar1_write(pa + _page, bytes(_page_size))
+          _gk104_pramin_write(dev, pa + _page, bytes(_page_size))
           _gk104_bar_flush(dev)
-          if not _gk104_ltc_invalidate(dev):
-            raise TimeoutError(
-                f"GK104 LTC invalidate while zeroing {label} failed")
-          time.sleep(0.005)
+          time.sleep(0.002)
           _page_bad = [_off for _off in range(0, _page_size, 4)
                        if _gk104_pramin_read32(dev, pa + _page + _off)]
           if not _page_bad:
             break
         else:
+          _sample = [_gk104_pramin_read32(dev, pa + _page + _off) & 0xffffffff
+                     for _off in _page_bad[:4]]
           raise RuntimeError(
               f"GK104 {label} page {_page:#x} did not stabilise: "
-              f"offsets={[hex(_page + x) for x in _page_bad[:16]]}")
+              f"offsets={[hex(_page + x) for x in _page_bad[:16]]} "
+              f"samples={[hex(x) for x in _sample]}")
+      _gk104_bar_flush(dev)
+      # Flush L2 dirty lines to DRAM, but do **not** invalidate yet: on this
+      # eGPU an invalidate after PRAMIN zeroing resurrects 0xffffffff from DRAM
+      # (flush alone appears insufficient to commit PRAMIN stores).  FECS/VM
+      # paths invalidate later once the buffers are known-good.
+      try:
+        dev.write32(0x070010, 0x00000001)
+        _deadline = time.time() + 0.2
+        while dev.read32(0x070010) & 0x00000003:
+          if time.time() >= _deadline:
+            break
+          time.sleep(0.001)
+      except Exception:
+        pass
+      time.sleep(0.005)
       _bad = [_off for _off in range(0, size, 4)
               if _gk104_pramin_read32(dev, pa + _off)]
       if _bad:
+        # One more compensated pass without invalidate.
+        for _page in range(0, size, 0x1000):
+          _gk104_pramin_write(dev, pa + _page, bytes(min(0x1000, size - _page)))
+        _gk104_bar_flush(dev)
+        _bad = [_off for _off in range(0, size, 4)
+                if _gk104_pramin_read32(dev, pa + _off)]
+      if _bad:
+        _sample = [_gk104_pramin_read32(dev, pa + _off) & 0xffffffff
+                   for _off in _bad[:4]]
         raise RuntimeError(
             f"GK104 {label} final zero proof failed: "
-            f"nonzero={len(_bad)} offsets={[hex(x) for x in _bad[:16]]}")
+            f"nonzero={len(_bad)} offsets={[hex(x) for x in _bad[:16]]} "
+            f"samples={[hex(x) for x in _sample]}")
       sample = dev.dev_impl.hw.mmio_read(1, pa, min(size, 0x20)).hex()
       print(f"[kepler] {label} physical-zero verified; "
             f"BAR1 sample={sample}", flush=True)
-    repair_zero("GR ctx", grctx_vram_pa, 0x100000)
+    repair_zero("GR ctx runtime", grctx_vram_pa, 0x80000)
+    repair_zero("GR ctx golden", grctx_golden_vram_pa, 0x80000)
     repair_zero("pagepool", pagepool_vram_pa, 0x8000)
     repair_zero("bundle", bundle_vram_pa, 0x3000)
-    repair_zero("attrib", attrib_vram_pa, 0x100000)
-    # ctx_chan starts at CB_RESERVED, not at the allocation base sampled above.
-    # Prove that first context-header page remains zero after LTC settling;
-    # continuing with the alternating 0xffffffff BAR image makes FECS consume
-    # bogus context-control words after its VM DMA completes.
-    _ctx_header_pa = grctx_vram_pa + 0x80000
+    repair_zero("attrib", attrib_vram_pa, attrib_cb.size)
+    # ctx_chan starts at CB_RESERVED (separate golden bank).  Prove that first
+    # context-header page remains zero after LTC settling.
+    _ctx_header_pa = grctx_golden_vram_pa
     _zero_page = bytes(0x1000)
     for _attempt in range(4):
       _gk104_pramin_write(dev, _ctx_header_pa, _zero_page)
@@ -4766,8 +5879,11 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         print(f"[kepler] VRAM semaphore pa={signal_vram_pa:#x} initial="
               f"{_gk104_pramin_read32(dev, signal_vram_pa):#x}", flush=True)
     gr_ctx = HCQBuffer(0x08000000, 0x100000, meta={"pa": grctx_vram_pa})
+    # VA is still contiguous CB_RESERVED+size; PA splits across two lo512 banks.
     dev.dev_impl.mm.map_range(gr_ctx.va_addr, gr_ctx.size,
-                              [(grctx_vram_pa, gr_ctx.size)], AddrSpace.PHYS)
+                              [(grctx_vram_pa, 0x80000),
+                               (grctx_golden_vram_pa, 0x80000)],
+                              AddrSpace.PHYS)
     # Map the MMIO list and other GR buffers in the channel's VMM so the
     # FECS firmware can read them via MEM_TARGET=VM (xdld).  Without these
     # mappings, the FECS hangs at xdld in ctx_mmio_loop because the MMIO
@@ -4778,8 +5894,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                               [(pagepool_vram_pa, 0x8000)], AddrSpace.PHYS)
     dev.dev_impl.mm.map_range(bundle_cb.va_addr, 0x3000,
                               [(bundle_vram_pa, 0x3000)], AddrSpace.PHYS)
-    dev.dev_impl.mm.map_range(attrib_cb.va_addr, 0x100000,
-                              [(attrib_vram_pa, 0x100000)], AddrSpace.PHYS)
+    dev.dev_impl.mm.map_range(attrib_cb.va_addr, attrib_cb.size,
+                              [(attrib_vram_pa, attrib_cb.size)], AddrSpace.PHYS)
     print(f"[kepler] VMM map: mmio_list va={mmio_list.va_addr:#x} "
           f"pa={mmio_list_vram_pa:#x}", flush=True)
     # Write the MMIO list data to VRAM so the FECS can read it via VMM.
@@ -4821,13 +5937,16 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   ramin_pa, userd_pa, gpfifo_pa = ramin.meta['pa'], userd.meta['pa'], gpfifo.meta['pa']
   grctx_pa = gr_ctx.meta['pa']
   # ctxgf100.c allocates the golden context from INST/VRAM, not sysmem. Use a
-  # BAR1-backed 1 MiB region for the hardware path; the sysmem allocation is
+  # BAR1-backed region for the hardware path; the sysmem allocation is
   # retained only as the software/offline backing object.
   # NOTE: The _int path (!gr->firmware) does NOT write data[0x1c/0x20/0x28/0x2c]
   # — those writes are _ext path only (ctxgf100.c lines 1499-1504).  The context
   # buffer starts zeroed, and grctx->main() populates the GR registers before
   # the context unload saves the golden image.
-  ctx_header = gr_ctx.meta['pa'] + 0x80000
+  if use_vram_inst:
+    ctx_header = grctx_golden_vram_pa
+  else:
+    ctx_header = gr_ctx.meta['pa'] + 0x80000
   inst = bytearray(0x1000)
   # FECS VM DMA needs a VRAM-resident page-table hierarchy.  Clone the complete
   # software VMM so context, push, semaphore, code, CWD and parameter mappings
@@ -4920,10 +6039,14 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         _gk104_pramin_write(dev, cloned_by_pgd[pgdi] + spti * 8,
                             struct.pack("<Q", pte))
     # gk104_ectx_ctor() maps the engine context with gf100_vmm_map_v0.priv=1.
+    # Runtime (+0) and golden (+0x80000) land in separate bit19-safe PA banks.
     for page in range(gr_ctx.size // 0x1000):
       va = gr_ctx.va_addr + page * 0x1000
       pgdi, spti = (va >> 27) & 0x1fff, (va >> 12) & 0x7fff
-      pte = ((grctx_vram_pa + page * 0x1000) >> 8) | 3
+      off = page * 0x1000
+      pa = (grctx_vram_pa + off) if off < 0x80000 else (
+          grctx_golden_vram_pa + (off - 0x80000))
+      pte = (pa >> 8) | 3
       _gk104_pramin_write(dev, cloned_by_pgd[pgdi] + spti * 8,
                           struct.pack("<Q", pte))
     _gk104_bar_flush(dev)
@@ -5466,7 +6589,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
           for _pgdi in sorted(_critical_pgdis)]
       _ctx_critical.append(
           (_ctx_spt_pa + _ctx_spti * 8,
-           ((grctx_vram_pa + 0x80000) >> 8) | 3))
+           ((grctx_golden_vram_pa) >> 8) | 3))
       for _attempt in range(4):
         for _addr, _wanted in _ctx_critical:
           _gk104_pramin_write(dev, _addr, struct.pack("<Q", _wanted))
@@ -5671,7 +6794,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # context metadata.  Do not clear them: Nouveau copies gr->size bytes from
     # this offset verbatim into each runtime engine context.
     if use_vram_inst:
-      saved_head = [_gk104_pramin_read32(dev, grctx_vram_pa + 0x80000 + i)
+      saved_head = [_gk104_pramin_read32(dev, grctx_golden_vram_pa + i)
                     for i in range(0, 16, 4)]
     else:
       saved_head = list(struct.unpack_from("<4I", vram, grctx_pa + 0x80000))
@@ -5785,7 +6908,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
           dev.read32(0x409100)
         struct.pack_into(
             "<I", runtime_ctx_expected, off,
-            _gk104_pramin_read32(dev, grctx_vram_pa + 0x80000 + off))
+            _gk104_pramin_read32(dev, grctx_golden_vram_pa + off))
       _gk104_pramin_write(dev, grctx_vram_pa, runtime_ctx_expected)
       _gk104_bar_flush(dev)
       if not _gk104_ltc_invalidate(dev):
@@ -6079,8 +7202,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     for _page in range(gr_ctx.size // 0x1000):
       _va = gr_ctx.va_addr + _page * 0x1000
       _pgdi, _spti = (_va >> 27) & 0x1fff, (_va >> 12) & 0x7fff
-      _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = \
-          ((grctx_vram_pa + _page * 0x1000) >> 8) | 3
+      _off = _page * 0x1000
+      _pa = (grctx_vram_pa + _off) if _off < 0x80000 else (
+          grctx_golden_vram_pa + (_off - 0x80000))
+      _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = (_pa >> 8) | 3
     for _mirror in getattr(dev, "_kepler_vram_mirrors", ()):
       _mirror_pa = _mirror.meta.get("vram_pa")
       if _mirror_pa is None:
@@ -7728,7 +8853,9 @@ def run_hardware_demo(dev, cubin=None):
   path, plan §24.1).  Requires root, a GK104 firmware tree ($NV_FIRMWARE_DIR),
   and on-silicon FIFO validation."""
   import random
-  N = 256
+  N = int(os.environ.get("KEPLER_N", "256"))
+  if N <= 0 or N > 1024:
+    raise ValueError(f"invalid KEPLER_N={N}; expected 1..1024")
   test_stage = os.environ.get("KEPLER_TEST_STAGE", "full-add")
   if test_stage not in ("sem", "set-object", "full-add"):
     raise ValueError(
@@ -7993,9 +9120,25 @@ def main():
   # The verified GTX 770 sequence needs FIFO reset; retain an environment
   # override for diagnosis, but make the known-good behavior the default.
   os.environ.setdefault("KEPLER_FIFO_RESET", "1")
+  # Palit GTX 770 golden (nouveau_gk104_mmiotrace): strap group 6.  Cold BAR
+  # often returns 0x101000=0 and would pick the wrong training tables.
+  os.environ.setdefault("KEPLER_RAMCFG_STRAP", "6")
+  # MEMX INFO+WR32 work.  Shared default skips pause (golden mmiotrace / Linux).
+  # macOS TinyGPU wrapper overrides to bit0-only host pause.
+  os.environ.setdefault("KEPLER_PMU_MEMX", "1")
+  os.environ.setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")
+  os.environ.setdefault("KEPLER_RAM_BLOCK", "0")
+  os.environ.setdefault("KEPLER_RAM_MEMX_WR", "1")
   if "--middle-selftest" in sys.argv:
     kepler_selftest()
     return
+  if "--mmiotrace-selftest" in sys.argv:
+    # Offline golden-mmiotrace gate — no hardware / pagemap.  Run this on
+    # macOS before the next eGPU replug.
+    sys.path.insert(0, SHARED_KEPLER_DIR)
+    import mmiotrace_selftest as _mmio_st
+    raise SystemExit(_mmio_st.run_mmiotrace_selftest(
+        _mmio_st.build_hooks_from_add_module(sys.modules[__name__])))
   if "--compare-cubin" in sys.argv:
     operation = os.environ.get("KEPLER_OPERATION", "add")
     try:
@@ -8171,22 +9314,47 @@ def main():
   # is rejected above for hardware crash-isolation runs).
   quiet_buf = io.StringIO() if backend != "software" else None
   quiet_ctx = contextlib.redirect_stdout(quiet_buf) if quiet_buf is not None else contextlib.nullcontext()
+  init_err = None
+  run_err = None
+  dev = None
+
+  def _emit_quiet_diagnostics(prefix="[kepler]", also=("hardware_demo=", "[nvbios]")):
+    if quiet_buf is None:
+      return
+    for line in quiet_buf.getvalue().splitlines():
+      if line.startswith(prefix) or any(line.startswith(a) for a in also):
+        print(line, flush=True)
+
   with quiet_ctx:
     try:
       dev = NVDevice("NV", backend=backend)
     except (NotImplementedError, OSError, RuntimeError) as e:
-      print(f"hardware initialization failed safely: {e}", file=sys.stderr)
-      print("No automatic probe/retry was made; confirm the GK104 is unbound from "
-            "the nvidia driver and that you are root before another isolated run.",
-            file=sys.stderr)
-      sys.exit(2)
-    try:
-      if backend == "software":
-        run_software_demo(dev)
-      else:
-        run_hardware_demo(dev, cubin)
-    finally:
-      dev.close()
+      init_err = e
+    if init_err is None and dev is not None:
+      try:
+        if backend == "software":
+          run_software_demo(dev)
+        else:
+          run_hardware_demo(dev, cubin)
+      except Exception as e:
+        run_err = e
+      finally:
+        try:
+          dev.close()
+        except Exception:
+          pass
+
+  # Emit outside redirect_stdout so diagnostics reach the real terminal/log.
+  if init_err is not None:
+    _emit_quiet_diagnostics()
+    print(f"hardware initialization failed safely: {init_err}", file=sys.stderr)
+    print("No automatic probe/retry was made; confirm the GK104 is unbound from "
+          "the nvidia driver and that you are root before another isolated run.",
+          file=sys.stderr)
+    sys.exit(2)
+  if run_err is not None:
+    _emit_quiet_diagnostics()
+    raise run_err
   if quiet_buf is not None:
     for line in quiet_buf.getvalue().splitlines():
       if line.startswith("[kepler] output:") or line.startswith("hardware_demo="):

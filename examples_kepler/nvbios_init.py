@@ -9,7 +9,141 @@ RAM_RESTRICT_ZM_REG_GROUP 0x8f), so it never actually executes the VBIOS
 devinit scripts.  This module replaces it.
 """
 from __future__ import annotations
-import struct, time
+import os, struct, time
+
+# GK104 MEMX opcodes (ref/linux/.../pmu/fuc/os.h).
+_MEMX_ENTER = 1
+_MEMX_LEAVE = 2
+_MEMX_WR32 = 3
+_MEMX_WAIT = 4
+_MEMX_DELAY = 5
+
+
+class _MemxBus:
+  """Optional write buffer that flushes controller stores through PMU MEMX WR32.
+
+  Nouveau's gk104_ram_calc runs as a MEMX script on the PMU.  Host BAR0 stores
+  of the same sequence leave PRAMIN in the ``0xbad0fb`` stub on this eGPU.
+  MEMX WR32/DELAY/WAIT EXEC work without ENTER; buffer only between pause/unpause.
+  """
+
+  def __init__(self, real):
+    self.real = real
+    self.memx_on = False
+    self.pending: list[tuple[int, int]] = []
+    self.can_memx = (
+        os.environ.get("KEPLER_RAM_MEMX_WR", "1") != "0" and
+        hasattr(real, "pmu_memx_exec_commands") and
+        getattr(real, "_pmu_memx_data", None) is not None)
+    self._wr32_flushes = 0
+    self._wr32_words = 0
+    self._require_memx = False
+
+  def read32(self, reg: int) -> int:
+    self.flush()
+    return self.real.read32(reg) & 0xffffffff
+
+  def write32(self, reg: int, val: int) -> None:
+    val &= 0xffffffff
+    reg &= 0xffffffff
+    # Hard refuse (host *or* MEMX): TinyGPU dies if 0x1620/0x26f0 are stored
+    # from either path (proven: MEMX WR32 of 0x1620 times out and drops the
+    # link).  Nouveau applies these only inside MEMX ENTER, which we cannot use.
+    if reg in (0x001620, 0x0026f0):
+      print(f"[nvbios] refusing any write to {reg:#x} (TinyGPU-unsafe)",
+            flush=True)
+      return
+    if self.memx_on:
+      self.pending.append((reg, val))
+      if len(self.pending) >= 4:
+        self.flush()
+      return
+    # If we started in MEMX mode and it died, do not silently host-program
+    # the GDDR5 controller — that sequence collapses TinyGPU BAR0.
+    if self._require_memx:
+      raise RuntimeError(
+          f"MEMX buffering stopped; refusing host write to {reg:#x}")
+    self.real.write32(reg, val)
+
+  def flush(self) -> None:
+    if not self.pending:
+      return
+    pairs = self.pending
+    self.pending = []
+    # Smaller chunks: cold PMU MEMX EXEC sometimes times out on large batches.
+    chunk_n = 4
+    i = 0
+    while i < len(pairs):
+      chunk = pairs[i:i + chunk_n]
+      payload: list[int] = []
+      for addr, data in chunk:
+        payload.extend([addr, data])
+      try:
+        # Clear stuck PMU data semaphore before each EXEC.
+        try:
+          if (self.real.read32(0x10a580) & 0xffffffff) != 0:
+            self.real.write32(0x10a580, 0)
+        except Exception:
+          pass
+        self.real.pmu_memx_exec_commands(
+            [(_MEMX_WR32, tuple(payload))], timeout_s=8.0)
+      except (TimeoutError, RuntimeError) as e:
+        # Do **not** host-fallback the rest: on TinyGPU, host stores of the
+        # GDDR5 controller sequence (and especially 0x1620/0x26f0) can collapse
+        # BAR0.  Abort with context so the caller can fail closed.
+        self.memx_on = False
+        self.can_memx = False
+        addrs = [f"{a:#x}" for a, _ in chunk]
+        raise RuntimeError(
+            f"MEMX WR32 flush failed ({e}); aborting without host fallback "
+            f"(chunk_addrs={addrs})") from e
+      self._wr32_flushes += 1
+      self._wr32_words += len(payload)
+      i += chunk_n
+
+  def start_memx_buffer(self) -> bool:
+    if not self.can_memx:
+      return False
+    # Prove EXEC still works (DELAY) before buffering hundreds of WR32s.
+    try:
+      self.real.pmu_memx_exec_commands([(_MEMX_DELAY, (1000,))], timeout_s=3.0)
+    except (TimeoutError, RuntimeError) as e:
+      # Never imply host GDDR5 fallback when REQUIRE_MEMX (TinyGPU-hostile).
+      if os.environ.get("KEPLER_RAM_REQUIRE_MEMX", "1") != "0":
+        print(f"[nvbios] MEMX EXEC smoke failed ({e}); refusing host fallback",
+              flush=True)
+      else:
+        print(f"[nvbios] MEMX EXEC smoke failed ({e}); using host writes",
+              flush=True)
+      self.can_memx = False
+      return False
+    self.memx_on = True
+    self._require_memx = True
+    return True
+
+  def stop_memx_buffer(self) -> None:
+    self.flush()
+    self.memx_on = False
+
+  def memx_delay_ns(self, nsec: int) -> bool:
+    if not self.memx_on or nsec <= 0:
+      return False
+    self.flush()
+    self.real.pmu_memx_exec_commands([(_MEMX_DELAY, (int(nsec) & 0xffffffff,))])
+    return True
+
+  def memx_wait(self, addr: int, mask: int, data: int,
+                nsec: int = 500000) -> bool:
+    """MEMX_WAIT — Nouveau ``ram_wait`` / ``nvkm_memx_wait``."""
+    if not self.memx_on:
+      return False
+    self.flush()
+    self.real.pmu_memx_exec_commands([
+        (_MEMX_WAIT, (addr & 0xffffffff, mask & 0xffffffff,
+                      data & 0xffffffff, int(nsec) & 0xffffffff))],
+        timeout_s=max(3.0, nsec / 1e6 + 1.0))
+    return True
+
 
 class NvbiosInit:
   """State for one nvbios_exec() invocation."""
@@ -202,7 +336,16 @@ class NvbiosInit:
   def _ramcfg_index(self) -> int:
     if self._ramcfg_value is not None:
       return self._ramcfg_value
-    strap = (self._reg_rd32(0x101000) & 0x0000003c) >> 2
+    # Optional override for cold eGPU bring-up when 0x101000 is unreadable
+    # (returns 0) or for offline golden-trace replay.  The Palit GTX 770 ROM's
+    # Nouveau baseline uses hardware strap 6 (0x101000=0x8040509a).
+    override = os.environ.get("KEPLER_RAMCFG_STRAP")
+    if override is not None and override != "":
+      strap = int(override, 0) & 0xf
+    else:
+      strap_reg = self._reg_rd32(0x101000)
+      strap = (strap_reg & 0x0000003c) >> 2
+      self._ramcfg_strap_reg = strap_reg
     if not self.tables.get("m", 0):
       self._ramcfg_value = strap
       return strap
@@ -231,6 +374,391 @@ class NvbiosInit:
       strap = self.rd08(xlat + strap)
     self._ramcfg_value = strap
     return strap
+
+  def rammap_scripts(self) -> list[int]:
+    """Return the GK104 BIT-P RAMMAP init-script pointers.
+
+    Nouveau's ``gk104_ram_init()`` executes these scripts before it touches
+    framebuffer allocations.  They are distinct from the BIT-I devinit
+    scripts and contain the mode-specific GDDR5 controller setup.
+    """
+    poff, _ = self._bit_entry(b"P")
+    if not poff or poff + 8 > len(self.image):
+      return []
+    rammap = self.rd32(poff + 4)
+    if not rammap or rammap + 0x18 > len(self.image):
+      return []
+    count = self.rd08(rammap + 0x14)
+    table = self.rd32(rammap + 0x10)
+    if not table or table + count * 4 > len(self.image):
+      return []
+    return [self.rd32(table + i * 4) for i in range(count)
+            if self.rd32(table + i * 4)]
+
+  def rammap_config(self, freq_mhz: int = 1000) -> dict:
+    """Decode the v0x11 RAMMAP/RAMCFG entry selected for ``freq_mhz``.
+
+    ``gk104_ram_init()`` only consumes the mode scripts and training tables;
+    the clock transition path consumes the RAMCFG and timing fields.  Keeping
+    this decoder here makes that second phase use the same ROM/strap selection
+    as the first phase instead of duplicating offsets in the launcher.
+    """
+    poff, _ = self._bit_entry(b"P")
+    if not poff or poff + 12 > len(self.image):
+      raise ValueError("GK104 BIT-P table not found")
+    rammap = self.rd32(poff + 4)
+    if not rammap or rammap + 6 > len(self.image):
+      raise ValueError("GK104 RAMMAP table not found")
+    ver = self.rd08(rammap)
+    hdr = self.rd08(rammap + 1)
+    length = self.rd08(rammap + 2)
+    sub_size = self.rd08(rammap + 3)
+    sub_count = self.rd08(rammap + 4)
+    count = self.rd08(rammap + 5)
+    if ver != 0x11 or not length or not sub_size:
+      raise ValueError(f"unsupported GK104 RAMMAP version {ver:#x}")
+
+    selected = None
+    entries = []
+    for i in range(count):
+      entry = rammap + hdr + i * (length + sub_count * sub_size)
+      if entry + length + sub_count * sub_size > len(self.image):
+        break
+      lo, hi = self.rd16(entry), self.rd16(entry + 2)
+      item = (lo, hi, i, entry)
+      entries.append(item)
+      if lo <= int(freq_mhz) <= hi:
+        selected = item
+        break
+    if selected is None:
+      if not entries:
+        raise ValueError("GK104 RAMMAP has no entries")
+      selected = min(entries,
+                     key=lambda item: min(abs(freq_mhz - item[0]),
+                                          abs(freq_mhz - item[1])))
+    lo, hi, entry_index, entry = selected
+    ramcfg_index = self._ramcfg_index()
+    if ramcfg_index >= sub_count:
+      raise ValueError(f"RAMCFG strap index {ramcfg_index} >= {sub_count}")
+    cfg = entry + length + ramcfg_index * sub_size
+    if cfg + sub_size > len(self.image):
+      raise ValueError("GK104 RAMCFG entry is truncated")
+
+    # nvbios_rammapSp(), v0x11.
+    b = self.rd08
+    c = {
+      "rammap_index": entry_index, "rammap_min": lo, "rammap_max": hi,
+      "rammap_11_08_01": self.rd08(entry + 8) & 1,
+      "rammap_11_08_0c": (self.rd08(entry + 8) >> 2) & 3,
+      "rammap_11_08_10": (self.rd08(entry + 8) >> 4) & 1,
+      "rammap_11_09_01ff": self.rd32(entry + 9) & 0x1ff,
+      "rammap_11_0a_03fe": (self.rd32(entry + 9) >> 9) & 0x1ff,
+      "rammap_11_0a_0400": (self.rd32(entry + 9) >> 18) & 1,
+      "rammap_11_0a_0800": (self.rd32(entry + 9) >> 19) & 1,
+      "rammap_11_0b_01f0": (self.rd32(entry + 9) >> 20) & 0x1f,
+      "rammap_11_0b_0200": (self.rd32(entry + 9) >> 25) & 1,
+      "rammap_11_0b_0400": (self.rd32(entry + 9) >> 26) & 1,
+      "rammap_11_0b_0800": (self.rd32(entry + 9) >> 27) & 1,
+      "rammap_11_0d": self.rd08(entry + 0x0d),
+      "rammap_11_0e": self.rd08(entry + 0x0e),
+      "rammap_11_0f": self.rd08(entry + 0x0f),
+      "rammap_11_11_0c": (self.rd08(entry + 0x11) >> 2) & 3,
+      "ramcfg_index": ramcfg_index, "ramcfg_timing": b(cfg),
+      "ramcfg_11_01_01": b(cfg + 1) & 1,
+      "ramcfg_11_01_02": (b(cfg + 1) >> 1) & 1,
+      "ramcfg_11_01_04": (b(cfg + 1) >> 2) & 1,
+      "ramcfg_11_01_08": (b(cfg + 1) >> 3) & 1,
+      "ramcfg_11_01_10": (b(cfg + 1) >> 4) & 1,
+      "ramcfg_DLLoff": (b(cfg + 1) >> 5) & 1,
+      "ramcfg_11_01_40": (b(cfg + 1) >> 6) & 1,
+      "ramcfg_11_01_80": (b(cfg + 1) >> 7) & 1,
+      "ramcfg_11_02_03": b(cfg + 2) & 3,
+      "ramcfg_11_02_04": (b(cfg + 2) >> 2) & 1,
+      "ramcfg_11_02_08": (b(cfg + 2) >> 3) & 1,
+      "ramcfg_11_02_10": (b(cfg + 2) >> 4) & 1,
+      "ramcfg_11_02_40": (b(cfg + 2) >> 6) & 1,
+      "ramcfg_11_02_80": (b(cfg + 2) >> 7) & 1,
+      "ramcfg_11_03_0f": b(cfg + 3) & 0x0f,
+      "ramcfg_11_03_30": (b(cfg + 3) >> 4) & 3,
+      "ramcfg_11_03_c0": (b(cfg + 3) >> 6) & 3,
+      "ramcfg_11_03_f0": (b(cfg + 3) >> 4) & 0x0f,
+      "ramcfg_11_04": b(cfg + 4),
+      "ramcfg_11_06": b(cfg + 6),
+      "ramcfg_11_07_02": (b(cfg + 7) >> 1) & 1,
+      "ramcfg_11_07_04": (b(cfg + 7) >> 2) & 1,
+      "ramcfg_11_07_08": (b(cfg + 7) >> 3) & 1,
+      "ramcfg_11_07_10": (b(cfg + 7) >> 4) & 1,
+      "ramcfg_11_07_40": (b(cfg + 7) >> 6) & 1,
+      "ramcfg_11_07_80": (b(cfg + 7) >> 7) & 1,
+      "ramcfg_11_08_01": b(cfg + 8) & 1,
+      "ramcfg_11_08_02": (b(cfg + 8) >> 1) & 1,
+      "ramcfg_11_08_04": (b(cfg + 8) >> 2) & 1,
+      "ramcfg_11_08_08": (b(cfg + 8) >> 3) & 1,
+      "ramcfg_11_08_10": (b(cfg + 8) >> 4) & 1,
+      "ramcfg_11_08_20": (b(cfg + 8) >> 5) & 1,
+      "ramcfg_11_09": b(cfg + 9),
+    }
+    # nvbios_timingEp(), v0x20.  BIT-P+0x08 is the timing table pointer.
+    timing_table = self.rd32(poff + 8)
+    if not timing_table or self.rd08(timing_table) != 0x20:
+      raise ValueError("GK104 v0x20 timing table not found")
+    timing_hdr = self.rd08(timing_table + 1)
+    timing_len = self.rd08(timing_table + 2)
+    timing_count = self.rd08(timing_table + 5)
+    timing_index = c["ramcfg_timing"]
+    if timing_index >= timing_count:
+      raise ValueError(f"timing index {timing_index} >= {timing_count}")
+    timing = timing_table + timing_hdr + timing_index * timing_len
+    if timing + timing_len > len(self.image) or timing_len < 0x33:
+      raise ValueError("GK104 timing entry is truncated")
+    c["timing_index"] = timing_index
+    c["timing"] = [self.rd32(timing + i * 4) for i in range(11)]
+    c["timing_20_2e_03"] = self.rd08(timing + 0x2e) & 3
+    c["timing_20_2e_30"] = (self.rd08(timing + 0x2e) >> 4) & 3
+    c["timing_20_2e_c0"] = (self.rd08(timing + 0x2e) >> 6) & 3
+    c["timing_20_2f_03"] = self.rd08(timing + 0x2f) & 3
+    t2c = self.rd16(timing + 0x2c)
+    c["timing_20_2c_003f"] = t2c & 0x3f
+    c["timing_20_2c_1fc0"] = (t2c >> 6) & 0x7f
+    t30 = self.rd08(timing + 0x30)
+    c["timing_20_30_07"] = t30 & 7
+    c["timing_20_30_f8"] = (t30 >> 3) & 0x1f
+    t31 = self.rd16(timing + 0x31)
+    c["timing_20_31_0007"] = t31 & 7
+    c["timing_20_31_0078"] = (t31 >> 3) & 0xf
+    c["timing_20_31_0780"] = (t31 >> 7) & 0xf
+    c["timing_20_31_0800"] = (t31 >> 11) & 1
+    c["timing_20_31_7000"] = (t31 >> 12) & 7
+    c["timing_20_31_8000"] = (t31 >> 15) & 1
+    return c
+
+  def rammap_diffs(self) -> dict:
+    """Return Nouveau-style ``ram->diff`` flags for the ROM RAMMAP entries.
+
+    The GK104 driver compares each successive RAMMAP/RAMCFG entry while
+    constructing its transition program.  These flags describe ROM variation;
+    they are not equivalent to testing whether the selected value is nonzero.
+    Keeping that distinction matters for fields which must explicitly remain
+    zero in the selected configuration.
+    """
+    poff, _ = self._bit_entry(b"P")
+    if not poff or poff + 12 > len(self.image):
+      raise ValueError("GK104 BIT-P table not found")
+    rammap = self.rd32(poff + 4)
+    if not rammap or rammap + 6 > len(self.image):
+      raise ValueError("GK104 RAMMAP table not found")
+    hdr = self.rd08(rammap + 1)
+    length = self.rd08(rammap + 2)
+    sub_size = self.rd08(rammap + 3)
+    sub_count = self.rd08(rammap + 4)
+    count = self.rd08(rammap + 5)
+    stride = length + sub_count * sub_size
+    if not hdr or not length or not stride or not count:
+      raise ValueError("GK104 RAMMAP has no entries")
+    configs = []
+    for i in range(count):
+      entry = rammap + hdr + i * stride
+      if entry + length > len(self.image):
+        break
+      lo, hi = self.rd16(entry), self.rd16(entry + 2)
+      # Select this exact entry through the public decoder.  Midpoints avoid
+      # ambiguity at adjacent range boundaries.
+      freq = lo if hi <= lo else (lo + hi) // 2
+      try:
+        cfg = self.rammap_config(freq)
+      except ValueError:
+        continue
+      if cfg["rammap_index"] == i:
+        configs.append(cfg)
+    if len(configs) < 2:
+      return {k: False for k in (
+        "rammap_11_0a_03fe", "rammap_11_09_01ff",
+        "rammap_11_0a_0400", "rammap_11_0a_0800", "rammap_11_0b_01f0",
+        "rammap_11_0b_0200", "rammap_11_0d", "rammap_11_0f",
+        "rammap_11_0e", "rammap_11_0b_0800", "rammap_11_0b_0400",
+        "ramcfg_11_01_01", "ramcfg_11_01_02", "ramcfg_11_01_10",
+        "ramcfg_11_02_03", "ramcfg_11_08_20", "timing_20_30_07")}
+    fields = (
+      "rammap_11_0a_03fe", "rammap_11_09_01ff",
+      "rammap_11_0a_0400", "rammap_11_0a_0800", "rammap_11_0b_01f0",
+      "rammap_11_0b_0200", "rammap_11_0d", "rammap_11_0f",
+      "rammap_11_0e", "rammap_11_0b_0800", "rammap_11_0b_0400",
+      "ramcfg_11_01_01", "ramcfg_11_01_02", "ramcfg_11_01_10",
+      "ramcfg_11_02_03", "ramcfg_11_08_20", "timing_20_30_07")
+    first = configs[0]
+    return {field: any(cfg[field] != first[field] for cfg in configs[1:])
+            for field in fields}
+
+  def refpll_limits(self) -> dict | None:
+    """Decode the ROM's BIT-C memory reference-PLL limits.
+
+    GK104's ``gt215_pll_calc()`` does not use a generic VCO range.  It uses
+    the per-board limits from the type-0x0c PLL entry (including the allowed
+    P/M/N ranges and reference clock).  Returning those fields keeps the
+    userspace RAM transition on the same coefficient path as Nouveau.
+    """
+    coff, cver = self._bit_entry(b"C")
+    if not coff:
+      return None
+    # pll_limits_table(): BIT-C v1 stores the limits-table pointer at +8;
+    # v2 stores a 32-bit pointer at +0.
+    if cver == 1 and coff + 10 <= len(self.image):
+      table = self.rd16(coff + 8)
+    elif cver == 2 and coff + 4 <= len(self.image):
+      table = self.rd32(coff)
+    else:
+      return None
+    if not table or table + 4 > len(self.image):
+      return None
+    ver, hdr, length, count = (self.rd08(table + i) for i in range(4))
+    if ver < 0x30 or not hdr or not length:
+      return None
+    for i in range(count):
+      entry = table + hdr + i * length
+      if entry + length > len(self.image) or self.rd08(entry) != 0x0c:
+        continue
+      if ver >= 0x50:
+        # GK104 uses v0x40, but leave newer tables explicitly unsupported
+        # rather than guessing the pointer layout.
+        return None
+      if entry + 11 > len(self.image):
+        return None
+      limits = self.rd16(entry + 1)
+      if not limits or limits + 14 > len(self.image):
+        return None
+      if ver == 0x40:
+        # nvbios_pll_parse(), case 0x40.
+        return {
+          "refclk": self.rd16(entry + 9) * 1000,
+          "min_freq": self.rd16(limits + 0) * 1000,
+          "max_freq": self.rd16(limits + 2) * 1000,
+          "min_inputfreq": self.rd16(limits + 4) * 1000,
+          "max_inputfreq": self.rd16(limits + 6) * 1000,
+          "min_m": self.rd08(limits + 8),
+          "max_m": self.rd08(limits + 9),
+          "min_n": self.rd08(limits + 10),
+          "max_n": self.rd08(limits + 11),
+          "min_p": self.rd08(limits + 12),
+          "max_p": self.rd08(limits + 13),
+        }
+      return None
+    return None
+
+  def dcb_gpio(self, function: int) -> dict | None:
+    """Return a DCB GPIO function descriptor for a GK104 ROM.
+
+    The GDDR5 transition uses DCB tags 0x18 (memory-voltage select) and 0x2e
+    (voltage-control).  Nouveau maps a matching line to ``0xd610 + line*4``
+    and derives the two logical levels from the entry's log bits.
+    """
+    dcb = self.rd16(0x36)
+    if not dcb or dcb + 0x0c > len(self.image):
+      return None
+    dver, dhdr = self.rd08(dcb), self.rd08(dcb + 1)
+    if dver < 0x30 or dhdr < 0x0c:
+      return None
+    table = self.rd16(dcb + 0x0a)
+    if not table or table + 4 > len(self.image):
+      return None
+    ver = self.rd08(table)
+    hdr, count, length = self.rd08(table + 1), self.rd08(table + 2), self.rd08(table + 3)
+    if not hdr or not length:
+      return None
+    for i in range(count):
+      entry = table + hdr + i * length
+      if entry + length > len(self.image):
+        break
+      if ver < 0x40:
+        info = self.rd16(entry)
+        line = info & 0x1f
+        func = (info >> 5) & 0x3f
+        log0, log1 = (info >> 11) & 3, (info >> 13) & 3
+      elif ver < 0x41:
+        info = self.rd32(entry)
+        line = info & 0x1f
+        func = (info >> 8) & 0xff
+        log0, log1 = (info >> 27) & 3, (info >> 29) & 3
+      else:
+        info = self.rd32(entry)
+        info1 = self.rd08(entry + 4)
+        line = info & 0x3f
+        func = (info >> 8) & 0xff
+        log0, log1 = (info1 >> 4) & 3, (info1 >> 6) & 3
+      if func == int(function):
+        return {"line": line, "log0": log0, "log1": log1,
+                "reg": 0x00d610 + line * 4}
+    return None
+
+  def _m0205_training_entry(self, index: int):
+    """Decode one M0205E entry and select its current RAMCFG byte."""
+    m = self.tables.get("m", 0)
+    if not m or m + 9 > len(self.image):
+      return None
+    base = self.rd32(m + 5)
+    if not base or base + 6 > len(self.image) or self.rd08(base) != 0x10:
+      return None
+    hdr, length = self.rd08(base + 1), self.rd08(base + 2)
+    ssz, snr, count = (self.rd08(base + i) for i in (3, 4, 5))
+    if index >= count:
+      return None
+    entry = base + hdr + index * (length + snr * ssz)
+    data = entry + length + self._ramcfg_index() * ssz
+    if data >= len(self.image):
+      return None
+    return self.rd08(entry) & 0x0f, self.rd08(data)
+
+  def _m0209_values(self, index: int) -> list[int] | None:
+    """Decode one packed M0209 training data entry (Nouveau M0209.c)."""
+    m = self.tables.get("m", 0)
+    if not m or m + 13 > len(self.image):
+      return None
+    base = self.rd32(m + 9)
+    if not base or base + 5 > len(self.image) or self.rd08(base) != 0x10:
+      return None
+    hdr, length, sample_size, count = (self.rd08(base + i) for i in (1, 2, 3, 4))
+    if index >= count:
+      return None
+    entry = base + hdr + index * (length + sample_size)
+    if entry + length + sample_size > len(self.image):
+      return None
+    bits = self.rd08(entry) & 0x3f
+    modulo = self.rd08(entry + 1)
+    mode = self.rd08(entry + 2) & 0x07
+    remap_index = self.rd08(entry + 3)
+    if not bits or not modulo:
+      return None
+    data = entry + length
+    mask = (1 << bits) - 1
+    values = []
+    for i in range(0x100):
+      bit = (i % modulo) * bits
+      raw = self.rd32(data + bit // 8) >> (bit & 7)
+      values.append(raw & mask)
+    if mode == 2:
+      remap = self._m0209_values(remap_index)
+      if remap is None:
+        return None
+      values = [remap[v] for v in values]
+    elif mode != 1:
+      return None
+    return values
+
+  def ram_training(self) -> dict[int, list[int]]:
+    """Decode the GDDR5 training arrays consumed by gk104_ram_train_init()."""
+    result = {}
+    for i in range(0x100):
+      item = self._m0205_training_entry(i)
+      if item is None:
+        continue
+      typ, data_index = item
+      values = self._m0209_values(data_index)
+      if values is not None and typ in (0x00, 0x01, 0x04, 0x06, 0x07, 0x08, 0x09):
+        result[typ] = values
+    required = (0x00, 0x01, 0x04, 0x06, 0x07, 0x08, 0x09)
+    missing = [typ for typ in required if typ not in result]
+    if missing:
+      raise ValueError(f"GK104 VBIOS missing GDDR5 training types: {missing}")
+    return result
 
   def _condition_table(self) -> int:
     return self.tables.get("condition", 0)
@@ -890,3 +1418,809 @@ def run_vbios_init(dev, image: bytes, scripts: list | None = None, debug: bool =
     if debug:
       print(f"[nvbios] === script 0x{s:04x} ===")
     init.run_script(s)
+
+
+def run_vbios_ram_init(dev, image: bytes, debug: bool = False) -> None:
+  """Run the minimal GK104 GDDR5 bring-up used by Nouveau's ramgk104.c.
+
+  This deliberately ports only the hardware-visible portion needed before
+  userspace allocates framebuffer objects: all BIT-P RAMMAP scripts, the mode
+  finalisation writes, and the packed M0205/M0209 training tables.  Frequency
+  transition code and voltage/GPIO handling remain outside this cold-start
+  path.
+  """
+  init = NvbiosInit(dev, image, debug=debug)
+  scripts = init.rammap_scripts()
+  if not scripts:
+    raise ValueError("GK104 VBIOS BIT-P RAMMAP scripts not found")
+  ramcfg = init._ramcfg_index()
+  strap_reg = getattr(init, "_ramcfg_strap_reg", None)
+  strap_src = ("override" if os.environ.get("KEPLER_RAMCFG_STRAP") not in (None, "")
+               else "0x101000")
+  print(f"[nvbios] RAMCFG group={ramcfg} via {strap_src}"
+        + (f" raw={strap_reg:#x}" if strap_reg is not None else ""),
+        flush=True)
+  if (strap_src == "0x101000" and strap_reg == 0 and ramcfg == 0 and
+      os.environ.get("KEPLER_RAMCFG_ALLOW_ZERO", "0") != "1"):
+    # A true zero at 0x101000 is indistinguishable from an unclocked/unread
+    # PFB strap on the cold eGPU path, and selects the wrong M0205/M0209
+    # training tables for the checked-in Palit ROM (golden uses strap 6).
+    raise RuntimeError(
+        "GK104 0x101000 strap reads as 0; refusing RAM init.  "
+        "Replug for a cold POST, or set KEPLER_RAMCFG_STRAP=6 for the "
+        "Palit GTX 770 golden configuration "
+        "(KEPLER_RAMCFG_ALLOW_ZERO=1 to override this guard)")
+  save = dev.read32(0x10f65c) & 0x000000f0
+  selected = save >> 4
+  if debug:
+    print(f"[nvbios] RAMMAP scripts={len(scripts)} selected={selected}")
+  for i, script in enumerate(scripts):
+    if i == selected:
+      continue
+    dev.write32(0x10f65c, i << 4)
+    init.run_script(script)
+  current = dev.read32(0x10f65c)
+  dev.write32(0x10f65c, (current & ~0x000000f0) | save)
+  dev.write32(0x10f584, dev.read32(0x10f584) & ~0x11000000)
+  dev.write32(0x10ecc0, 0xffffffff)
+  dev.write32(0x10f160, dev.read32(0x10f160) | 0x00000010)
+
+  train = init.ram_training()
+  for i in range(0x30):
+    for j in (0, 4):
+      dev.write32(0x10f968 + j, i << 8)
+      dev.write32(0x10f920 + j,
+                   (train[0x08][i] << 4) | train[0x06][i])
+      dev.write32(0x10f918 + j, train[0x00][i])
+      dev.write32(0x10f920 + j,
+                   0x100 | (train[0x09][i] << 4) | train[0x07][i])
+      dev.write32(0x10f918 + j, train[0x01][i])
+  for j in (0, 4):
+    for i in range(0x100):
+      dev.write32(0x10f968 + j, i)
+      dev.write32(0x10f900 + j, train[0x04][i])
+  if debug:
+    print("[nvbios] GK104 GDDR5 RAM init/training complete")
+
+
+def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
+                          debug: bool = False) -> dict:
+  """Program the cold GDDR5 controller phase used by GK104 reclocking.
+
+  A card which was never POSTed has neither the EFI memory-controller state
+  nor Nouveau's first ``ram->func->calc/prog`` transition.  The RAMMAP
+  scripts alone therefore leave BAR1 writes nondeterministic.  This is the
+  bounded, single-configuration form of ``gk104_ram_calc_gddr5()``: it uses
+  the ROM's RAMCFG/timing entry, initializes the controller/MR/timing ports,
+  and leaves the separate RAMMAP/training pass to ``run_vbios_ram_init``.
+
+  Board DCB GPIO selection and the ROM-bounded fractional reference PLL are
+  included.  Dynamic voltage tables and the high-clock/mode-2 PLL path remain
+  deliberately out of scope until the known-good 648-MHz cold path is
+  validated.
+  """
+  init = NvbiosInit(dev, image, debug=debug)
+  cfg = init.rammap_config(int(freq_mhz))
+  b = cfg
+
+  # TinyGPU escape hatch: night5 cleared only 0x1620[0] (not 0x26f0, not
+  # unpause) and saw PRAMIN 0xbad0fb → 0xffffffff.  Full pause+unpause of both
+  # regs on true cold has killed BAR0 (2026-07-16).  Step carefully.
+  if os.environ.get("KEPLER_RAM_PROGRAM", "1") == "bit0-only":
+    def _boot0() -> int:
+      return dev.read32(0) & 0xffffffff
+    def _alive(label: str) -> None:
+      b0 = _boot0()
+      if b0 == 0xffffffff:
+        raise RuntimeError(f"bit0-only killed BAR0 at {label}")
+    print("[nvbios] KEPLER_RAM_PROGRAM=bit0-only: 0x1620[0] clear only "
+          "(no 0x26f0, no unpause)", flush=True)
+    _alive("entry")
+    r1620 = dev.read32(0x001620) & 0xffffffff
+    print(f"[nvbios] 0x1620 before={r1620:#x}", flush=True)
+    # Clear bit0 only; preserve 0xaa2 and everything else.
+    dev.write32(0x001620, r1620 & ~0x1)
+    _alive("after 0x1620 bit0 clear")
+    r1620b = dev.read32(0x001620) & 0xffffffff
+    print(f"[nvbios] 0x1620 after={r1620b:#x} PMC_BOOT_0={_boot0():#x}",
+          flush=True)
+    # Optional: continue into MEMX train now that FB is paused at bit0.
+    if os.environ.get("KEPLER_RAM_AFTER_BIT0", "0") == "memx":
+      print("[nvbios] KEPLER_RAM_AFTER_BIT0=memx: continuing GDDR5 MEMX train",
+            flush=True)
+    else:
+      return cfg
+
+  # Shadow `dev` with an optional MEMX WR32 buffer.
+  # TinyGPU: host prog0 then first MEMX WR32 has timed out (0x10f200); all-MEMX
+  # historically reached ~78 execs.  bit0 *before* MEMX also kills PMU acquire
+  # (0x10a580=0xffffffff) — only post-MEMX bit0 is safe.
+  # Optional: KEPLER_RAM_HOST_PROG0=1 restores Nouveau host-then-MEMX order.
+  _real_dev = dev
+  dev = _MemxBus(_real_dev)
+  _host_prog0 = os.environ.get("KEPLER_RAM_HOST_PROG0", "0") == "1"
+  if not _host_prog0:
+    if not dev.start_memx_buffer():
+      if os.environ.get("KEPLER_RAM_REQUIRE_MEMX", "1") != "0":
+        raise RuntimeError(
+            "PMU MEMX unavailable; refusing host GDDR5 "
+            "(power-cycle eGPU and retry)")
+    else:
+      print("[nvbios] GDDR5 ram_program writes buffered via MEMX WR32 "
+            "(all-MEMX; no host 0x10f* pre-store)", flush=True)
+  elif (not dev.can_memx and
+        os.environ.get("KEPLER_RAM_REQUIRE_MEMX", "1") != "0"):
+    raise RuntimeError(
+        "PMU MEMX unavailable; refusing host GDDR5 and bit0 pause on a "
+        "possibly-wedged GPU.  Power-cycle the eGPU enclosure, restart "
+        "TinyGPU server, then cold-run add.py once (no probe).")
+
+  def mask(reg: int, m: int, value: int) -> int:
+    old = dev.read32(reg)
+    # All controller masks in this phase originate from Nouveau's
+    # ramfuc_mask(), whose data operand is intentionally *not* clipped to the
+    # mask.  Several GK104 fields use mask=0 or place control bits outside the
+    # method mask, so ordinary nvkm_mask semantics would lose required state.
+    new = (old & ~m) | value
+    dev.write32(reg, new & 0xffffffff)
+    return old
+
+  def ramfuc_mask(reg: int, m: int, value: int) -> int:
+    """Apply Nouveau ``ramfuc_mask`` semantics for its special raw fields.
+
+    Unlike ``nvkm_mask``, ramfuc deliberately ORs ``value`` without clipping
+    it to ``m``.  The reference-PLL setup uses mask=0 to set control bits, so
+    those calls cannot be represented by the ordinary host mask helper.
+    """
+    return mask(reg, m, value)
+
+  def delay_ns(nsec: int) -> None:
+    """MEMX_DELAY while buffering; otherwise host sleep."""
+    if nsec <= 0:
+      return
+    if dev.memx_delay_ns(nsec):
+      return
+    time.sleep(nsec / 1_000_000_000)
+
+  def _direct_ram_block() -> None:
+    mask(0x001620, 0x00000aa2, 0)
+    mask(0x001620, 0x00000001, 0)
+    mask(0x0026f0, 0x00000001, 0)
+
+  def _direct_ram_unblock() -> None:
+    mask(0x0026f0, 0x00000001, 0x00000001)
+    mask(0x001620, 0x00000001, 0x00000001)
+    mask(0x001620, 0x00000aa2, 0x00000aa2)
+
+  def ram_block() -> None:
+    """Begin the GDDR5 reprogram window.
+
+    Nouveau queues MEMX ENTER (falcon writes 0x1620/0x26f0, waits FB_PAUSE).
+    On TinyGPU:
+      * host / MEMX-WR32 of 0x1620/0x26f0 kill BAR0 — never do that.
+      * stock ENTER hangs on FB_PAUSE — requires PMU wait patch
+        (``KEPLER_PMU_ENTER_NOWAIT``).
+    Modes:
+      ``0`` (default): skip pause; MEMX WR32 other controller regs only.
+      ``bit0``: do **not** pause mid-MEMX (that drops TinyGPU BAR0 once the
+        PMU is active).  After MEMX WR32 finishes, host-clear only
+        ``0x1620[0]`` / ``0x26f0[0]`` then restore — night5 unstub on clean
+        cold without touching ``0xaa2``.
+      ``enter``: real MEMX ENTER after the wait patch (falcon ``0x1620`` stores
+        still TinyGPU-hostile).
+      ``direct``: full Nouveau host ``0x1620``/``0x26f0`` masks (kills TinyGPU).
+    """
+    block_mode = os.environ.get("KEPLER_RAM_BLOCK", "0")
+    if block_mode == "bit0":
+      # Mid-sequence pause while MEMX is live kills BAR0 on this eGPU.
+      print("[nvbios] deferring bit0 pause until after MEMX WR32", flush=True)
+      return
+    if block_mode == "direct":
+      print("[nvbios] WARNING: KEPLER_RAM_BLOCK=direct — host 0x1620 pause "
+            "can kill TinyGPU BAR0", flush=True)
+      def _host_mask(reg: int, m: int, val: int) -> None:
+        old = _real_dev.read32(reg) & 0xffffffff
+        _real_dev.write32(reg, ((old & ~m) | val) & 0xffffffff)
+      _host_mask(0x001620, 0x00000aa2, 0)
+      _host_mask(0x001620, 0x00000001, 0)
+      _host_mask(0x0026f0, 0x00000001, 0)
+      return
+    if block_mode == "enter":
+      pmu_block = getattr(_real_dev, "pmu_memx_block", None)
+      if (pmu_block is None or
+          getattr(_real_dev, "_pmu_memx_data", None) is None or
+          not getattr(_real_dev, "_pmu_memx_nowait", False)):
+        print("[nvbios] KEPLER_RAM_BLOCK=enter unavailable "
+              "(need PMU MEMX + ENTER_NOWAIT); skipping pause", flush=True)
+        return
+      # Flush any buffered WR32s before ENTER so pause applies first.
+      if getattr(dev, "memx_on", False):
+        dev.flush()
+      pmu_block()
+      print("[nvbios] FB pause via patched MEMX ENTER", flush=True)
+      return
+    if block_mode != "0":
+      print(f"[nvbios] ignoring KEPLER_RAM_BLOCK={block_mode!r}; use bit0, "
+            "enter, 0, or direct", flush=True)
+    print("[nvbios] skipping FB pause (0x1620 unsafe via host and MEMX WR32)",
+          flush=True)
+
+  def ram_unblock() -> None:
+    """End pause window; keep MEMX buffering until ram_program returns."""
+    block_mode = os.environ.get("KEPLER_RAM_BLOCK", "0")
+    if block_mode == "bit0":
+      # Paired with deferred mid-sequence pause; real bit0 runs post-MEMX.
+      return
+    if block_mode == "enter":
+      if getattr(dev, "memx_on", False):
+        dev.flush()
+      pmu_unblock = getattr(_real_dev, "pmu_memx_unblock", None)
+      if pmu_unblock is None:
+        return
+      try:
+        pmu_unblock()
+        print("[nvbios] FB unpause via patched MEMX LEAVE", flush=True)
+      except (TimeoutError, RuntimeError) as e:
+        # Programming may have stuck; leave paused rather than host-unpause.
+        print(f"[nvbios] MEMX LEAVE failed ({e}); leaving FB paused",
+              flush=True)
+      return
+    if block_mode != "direct":
+      return
+    dev.flush()
+    def _host_mask(reg: int, m: int, val: int) -> None:
+      old = _real_dev.read32(reg) & 0xffffffff
+      _real_dev.write32(reg, ((old & ~m) | val) & 0xffffffff)
+    _host_mask(0x0026f0, 0x00000001, 0x00000001)
+    _host_mask(0x001620, 0x00000001, 0x00000001)
+    _host_mask(0x001620, 0x00000aa2, 0x00000aa2)
+
+  def set_gpio_level(function: int, logical: int, delay_nsec: int) -> None:
+    """Apply one Nouveau DCB GPIO level and pulse the GPIO trigger if needed."""
+    gpio = init.dcb_gpio(function)
+    if gpio is None:
+      return
+    # `logical` selects the DCB log[0]/log[1] entry; the entry itself carries
+    # the polarity encoding that Nouveau XORs with 2 before writing GPIO.
+    level = gpio["log1"] if int(logical) else gpio["log0"]
+    old = mask(gpio["reg"], 0x00003000, (int(level) ^ 2) << 12)
+    if old != dev.read32(gpio["reg"]):
+      dev.write32(0x00d604, 1)
+      delay_ns(delay_nsec)
+
+  # Nouveau's transition program only masks RAMMAP fields which differ across
+  # the ROM's entries.  Compute those flags once; testing the selected value
+  # itself would incorrectly skip valid zero fields (or touch invariant ones).
+  _diff = init.rammap_diffs()
+
+  # Nouveau mirrors a subset of controller registers into partitions whose
+  # 0x110204 configuration differs from the first active partition.  Compute
+  # that mask once, so the direct host path can reproduce ram_nuts() without
+  # assuming all eight GK104 partitions are identical.
+  _parts = dev.read32(0x022438) & 0xff
+  _pmask = dev.read32(0x022554)
+  _pnuts = 0
+  _first_cfg = None
+  for _part in range(min(_parts, 16)):
+    if _pmask & (1 << _part):
+      continue
+    _cfg1 = dev.read32(0x110204 + _part * 0x1000)
+    if _first_cfg is not None and _first_cfg != _cfg1:
+      _pnuts |= 1 << _part
+    else:
+      _first_cfg = _cfg1
+
+  def ram_nuts(reg: int, m: int, value: int, copy: int,
+               reg_data: int | None = None) -> None:
+    if not _pnuts:
+      return
+    if reg_data is None:
+      reg_data = dev.read32(reg)
+    full_mask = (m | copy) & 0xffffffff
+    full_data = ((value & m) | (reg_data & copy)) & 0xffffffff
+    for _part in range(min(_parts, 16)):
+      if not (_pnuts & (1 << _part)):
+        continue
+      _addr = 0x110000 + (reg & 0xfff) + _part * 0x1000
+      _prev = dev.read32(_addr)
+      dev.write32(_addr, ((_prev & ~full_mask) | full_data) & 0xffffffff)
+
+  def train(m: int, value: int) -> None:
+    mask(0x10f910, m, value)
+    mask(0x10f914, m, value)
+    if not (value & 0x80000000):
+      return
+    parts = dev.read32(0x022438) & 0xff
+    pmask = dev.read32(0x022554)
+    for part in range(min(parts, 16)):
+      if pmask & (1 << part):
+        continue
+      addr = 0x110000 + part * 0x1000
+      # Nouveau ram_wait → MEMX_WAIT while buffering; else host poll.
+      if getattr(dev, "memx_wait", None) and dev.memx_wait(
+          addr, 0x0000000f, 0x00000000, 500000):
+        continue
+      deadline = time.monotonic() + 0.5
+      while dev.read32(addr) & 0xf:
+        if time.monotonic() >= deadline:
+          raise TimeoutError(f"GK104 RAM training timeout on partition {part}")
+        time.sleep(0.00001)
+
+  def prog0() -> None:
+    """Port gk104_ram_prog_0() for the selected RAMMAP entry."""
+    if _diff["rammap_11_0a_03fe"] or _diff["rammap_11_09_01ff"]:
+      _m = ((0x001ff000 if _diff["rammap_11_0a_03fe"] else 0) |
+            (0x000001ff if _diff["rammap_11_09_01ff"] else 0))
+      _v = ((b["rammap_11_0a_03fe"] << 12) |
+            b["rammap_11_09_01ff"])
+      mask(0x10f468, _m, _v)
+    if _diff["rammap_11_0a_0400"]:
+      mask(0x10f420, 0x00000001, b["rammap_11_0a_0400"])
+    if _diff["rammap_11_0a_0800"]:
+      mask(0x10f430, 0x00000001, b["rammap_11_0a_0800"])
+    if _diff["rammap_11_0b_01f0"]:
+      mask(0x10f400, 0x0000001f, b["rammap_11_0b_01f0"])
+    if _diff["rammap_11_0b_0200"]:
+      mask(0x10f410, 0x00000200, b["rammap_11_0b_0200"] << 9)
+    if _diff["rammap_11_0d"] or _diff["rammap_11_0f"]:
+      _m = ((0x00ff0000 if _diff["rammap_11_0d"] else 0) |
+            (0x0000ff00 if _diff["rammap_11_0f"] else 0))
+      mask(0x10f440, _m,
+           (b["rammap_11_0d"] << 16) | (b["rammap_11_0f"] << 8))
+    if (_diff["rammap_11_0e"] or _diff["rammap_11_0b_0800"] or
+        _diff["rammap_11_0b_0400"]):
+      _m = ((0x0000ff00 if _diff["rammap_11_0e"] else 0) |
+            (0x00000080 if _diff["rammap_11_0b_0800"] else 0) |
+            (0x00000020 if _diff["rammap_11_0b_0400"] else 0))
+      mask(0x10f444, _m,
+           (b["rammap_11_0e"] << 8) |
+           (b["rammap_11_0b_0800"] << 7) |
+           (b["rammap_11_0b_0400"] << 5))
+
+  # nvkm_gddr5_calc(): derive the mode registers from the timing entry.
+  timing = b["timing"]
+  wl = (timing[1] >> 7) & 0xf
+  cl = timing[1] & 0x1f
+  wr = (timing[2] >> 16) & 0x7f
+  if not (1 <= wl <= 7 and 5 <= cl <= 36 and 4 <= wr <= 35):
+    raise ValueError(f"invalid GK104 GDDR5 timing WL={wl} CL={cl} WR={wr}")
+  cl -= 5
+  wr -= 4
+  # Keep the complete controller register image.  nvkm_gddr5_calc() changes
+  # only mode-register fields, and gk104_ram_calc_gddr5() preserves all upper
+  # bits when issuing MR1/MR3/MR5/MR6/MR7/MR8 writes.
+  mr = {i: dev.read32(addr) for i, addr in {
+    0: 0x10f300, 1: 0x10f330, 3: 0x10f338, 5: 0x10f340,
+    6: 0x10f344, 7: 0x10f348, 8: 0x10f354,
+  }.items()}
+  mr[0] = (mr[0] & ~0xf7f) | ((wr & 0xf) << 8) | ((cl & 0xf) << 3) | wl
+  xd = int(not b["ramcfg_DLLoff"])
+  mr[1] = ((mr[1] & ~0x0bf) |
+           ((b["timing_20_2e_c0"] & 3) << 4) |
+           ((b["timing_20_2e_03"] & 3) << 2) |
+           (b["timing_20_2f_03"] & 3) | (xd << 7))
+  mr[3] = (mr[3] & ~0x020) | (int(freq_mhz < 1000) << 5)
+  mr[5] = (mr[5] & ~0x004) | (int(not b["ramcfg_11_07_02"]) << 2)
+  vo = b["ramcfg_11_06"] or ((mr[6] >> 4) & 0xff)
+  pd = b["ramcfg_11_01_80"] or (mr[6] & 1)
+  mr[6] = (mr[6] & ~0xff1) | ((vo & 0xff) << 4) | (pd & 1)
+  mr[7] = ((mr[7] & ~0x388) | ((b["ramcfg_11_02_04"] & 3) << 8) |
+           ((b["ramcfg_11_02_10"] & 1) << 7) |
+           ((b["ramcfg_11_01_40"] & 1) << 3))
+  mr[8] = (mr[8] & ~3) | ((wr & 0x10) >> 3) | ((cl & 0x10) >> 4)
+  mr1_nuts = ((mr[1] & ~0x030) |
+              ((b["timing_20_2e_30"] & 3) << 4))
+
+  # MR1 + prog0: default all-MEMX; optional host-then-MEMX for A/B.
+  if (mr[1] & 0x03c) != 0x030:
+    mask(0x10f330, 0x0000003c, mr[1] & 0x0000003c)
+    ram_nuts(0x10f330, 0x0000003c, mr1_nuts & 0x0000003c,
+             0x00000000, reg_data=mr1_nuts)
+  prog0()
+
+  if not getattr(dev, "memx_on", False):
+    if dev.start_memx_buffer():
+      print("[nvbios] GDDR5 ram_program writes buffered via MEMX WR32 "
+            "(after host prog0; no host 0x1620 pause)", flush=True)
+    elif os.environ.get("KEPLER_RAM_REQUIRE_MEMX", "1") != "0":
+      raise RuntimeError(
+          "PMU MEMX EXEC smoke failed after host prog0; refusing host "
+          "GDDR5 transition (power-cycle eGPU and retry)")
+  # Controller reset/refresh/precharge and early write leveling.
+  # Match Nouveau's gt215_pll_calc(): use the ROM's type-0x0c limits rather
+  # than a generic VCO window.  For this ROM that changes the 648-MHz result
+  # from the old (P=2,N=48,M=1) guess to Nouveau's integer/fractional
+  # coefficients.  The fractional accumulator is required even when the
+  # requested output clock is an exact multiple of the reference clock:
+  # gt215_pll_calc() is called with pfN non-NULL by gk104_ram_calc_xits().
+  pll = init.refpll_limits()
+  if pll is None:
+    # Keep a conservative fallback for older/nonstandard dumps, but make it
+    # explicit and bounded.  The checked-in Palit ROM always takes the path
+    # above.
+    pll = {
+      "refclk": 27000, "min_freq": 600000, "max_freq": 1200000,
+      "min_inputfreq": 25000, "max_inputfreq": 75000,
+      "min_m": 1, "max_m": 255, "min_n": 8, "max_n": 255,
+      "min_p": 1, "max_p": 7,
+    }
+  target_khz = int(freq_mhz) * 1000
+  ref_khz = int(pll["refclk"])
+  p1 = pll["max_freq"] // target_khz
+  p1 = max(int(pll["min_p"]), min(int(pll["max_p"]), p1))
+  l_m = (ref_khz + int(pll["max_inputfreq"])) // int(pll["max_inputfreq"])
+  l_m = max(l_m, int(pll["min_m"]))
+  h_m = (ref_khz + int(pll["min_inputfreq"])) // int(pll["min_inputfreq"])
+  h_m = min(h_m, int(pll["max_m"]))
+  l_m = min(l_m, h_m)
+  best = None
+  for m in range(l_m, h_m + 1):
+    tmp = target_khz * p1 * m
+    n = tmp // ref_khz
+    rem = tmp % ref_khz
+    # Match gt215_pll_calc()'s pfN branch.  It chooses the lower integer N
+    # when the remainder is below half the reference clock, then represents
+    # the residual in the 13-bit fractional accumulator.  The hardware value
+    # is biased by 4096 and stored in both 0x132030[31:16] and
+    # 0x132034[15:0].
+    if rem < ref_khz // 2:
+      n -= 1
+      rem = tmp - n * ref_khz
+    if n < int(pll["min_n"]):
+      continue
+    if n > int(pll["max_n"]):
+      break
+    fn = (((rem << 13) + ref_khz // 2) // ref_khz - 4096) & 0xffff
+    # With pfN supplied Nouveau returns at the first valid M/N pair rather
+    # than comparing integer-only output errors.  Preserve that ordering;
+    # the fractional accumulator makes the resulting PLL output exact.
+    best = (0, target_khz, p1, n, m, fn)
+    break
+  if best is None:
+    raise ValueError(f"cannot calculate GK104 memory PLL for {freq_mhz} MHz")
+  _, actual, p1, n1, m1, fn1 = best
+
+  _pll_from = dev.read32(0x1373f4) & 0x0000000f
+
+  def finish_refpll() -> None:
+    """Apply the source's r1373f4_fini() sequence."""
+    dev.write32(0x1373ec,
+                (dev.read32(0x1373ec) & ~0x00030000) |
+                (b["ramcfg_11_03_30"] << 16))
+    # r1373f4_fini(): (~mode & 3) is only bit 1 in mode 1; preserve bit 0.
+    mask(0x1373f0, 0x00000002, 0)
+    mask(0x1373f4, 0x00000003, 0x00000001)
+    mask(0x1373f4, 0x00010000, 0)
+    mask(0x10f800, 0x00000030,
+         ((b["ramcfg_11_03_c0"] ^ b["ramcfg_11_03_30"]) & 3) << 4)
+
+  def program_refpll(from_mode: int = _pll_from, finish: bool = True) -> None:
+    # r1373f4_init()/r1373f4_fini(), mode 1.  This is deliberately invoked
+    # after refresh/precharge setup, matching gk104_ram_calc_gddr5().
+    if from_mode == 2:
+      # r1373f4_init() has a distinct pre-existing-clock path.  These are
+      # ramfuc_mask(mask=0,data=...) operations, not ordinary masked writes.
+      ramfuc_mask(0x1373f4, 0x00000000, 0x00001100)
+      ramfuc_mask(0x1373f4, 0x00000000, 0x00000010)
+    else:
+      ramfuc_mask(0x1373f4, 0x00000000, 0x00010010)
+    ramfuc_mask(0x1373f4, 0x00000003, 0x00000000)
+    ramfuc_mask(0x1373f4, 0x00000010, 0x00000000)
+    mask(0x132000, 0x00000001, 0)
+    mask(0x132020, 0x00000001, 0)
+    dev.write32(0x137320, 0)
+    mask(0x132030, 0xffff0000, fn1 << 16)
+    mask(0x132034, 0x0000ffff, fn1)
+    dev.write32(0x132024, (p1 << 16) | (n1 << 8) | m1)
+    mask(0x132028, 0x00080000, 0x00080000)
+    mask(0x132020, 0x00000001, 0x00000001)
+    # Nouveau's MEMX program waits for REFPLL_LOCK (0x137390[17]) for at
+    # most 64 ms.  Poll the same condition on the direct host path rather
+    # than assuming a fixed delay was sufficient.
+    deadline = time.monotonic() + 0.064
+    while not (dev.read32(0x137390) & 0x00020000):
+      if time.monotonic() >= deadline:
+        if os.environ.get("KEPLER_RAM_STRICT_WAIT", "1") != "0":
+          raise TimeoutError("GK104 reference PLL lock timeout (0x137390[17])")
+        break
+      time.sleep(0.00001)
+    mask(0x132028, 0x00080000, 0)
+    if finish:
+      finish_refpll()
+
+  mask(0x10f808, 0x40000000, 0x40000000)
+  ram_block()
+  # vc == !ramcfg_11_02_08; select the DCB tag-0x2e level before refresh
+  # sequencing, matching Nouveau's source ordering.
+  if not b["ramcfg_11_02_08"]:
+    set_gpio_level(0x2e, 1, 20_000)
+  mask(0x10f200, 0x00000800, 0)
+  train(0x01020000, 0x000c0000)
+  dev.write32(0x10f210, 0)
+  time.sleep(0.000001)
+  dev.write32(0x10f310, 1)
+  time.sleep(0.000001)
+  mask(0x10f200, 0x80000000, 0x80000000)
+  dev.write32(0x10f314, 1)
+  mask(0x10f200, 0x80000000, 0)
+  dev.write32(0x10f090, 0x61)
+  dev.write32(0x10f090, 0xc000007f)
+  delay_ns(1_000)
+
+  # RAMCFG-dependent controller knobs.  These masks intentionally mirror
+  # gk104_ram_calc_gddr5() instead of using a fixed aggregate mask: the
+  # strap-6 Palit entry exercises several of the conditional fields.
+  dev.write32(0x10f698, 0)
+  dev.write32(0x10f69c, 0)
+  mask_824 = 0x800F07E0
+  data_824 = 0x00030000
+  if dev.read32(0x10f978) & 0x00800000:
+    data_824 |= 0x00040000
+  data_824 |= 0x800807E0
+  clear_c0 = {3: 0x00000040, 2: 0x00000100,
+              1: 0x80000000, 0: 0x00000400}
+  clear_30 = {3: 0x00000020, 2: 0x00000080,
+              1: 0x00080000, 0: 0x00000200}
+  data_824 &= ~clear_c0[b["ramcfg_11_03_c0"]]
+  data_824 &= ~clear_30[b["ramcfg_11_03_30"]]
+  if b["ramcfg_11_02_80"]:
+    mask_824 |= 0x03000000
+  if b["ramcfg_11_02_40"]:
+    mask_824 |= 0x00002000
+  if b["ramcfg_11_07_10"]:
+    mask_824 |= 0x00004000
+  if b["ramcfg_11_07_08"]:
+    mask_824 |= 0x00000003
+  else:
+    mask_824 |= 0x34000000
+    if dev.read32(0x10f978) & 0x00800000:
+      mask_824 |= 0x40000000
+  mask(0x10f824, mask_824, data_824)
+  mask(0x132040, 0x00010000, 0)
+  if _pll_from == 2:
+    mask(0x10f808, 0x00080000, 0)
+    mask(0x10f200, 0x18008000, 0x00008000)
+    ramfuc_mask(0x10f800, 0x00000000, 0x00000004)
+    ramfuc_mask(0x10f830, 0x00008000, 0x01040010)
+    mask(0x10f830, 0x01000000, 0)
+    program_refpll(_pll_from, finish=False)
+    # The source performs r1373f4_fini() only after the temporary 1373f0
+    # transition, then applies the raw-mask 0x10f830 update.
+    ramfuc_mask(0x1373f0, 0x00000002, 0x00000001)
+    finish_refpll()
+    ramfuc_mask(0x10f830, 0x00c00000, 0x00240001)
+  else:
+    program_refpll(_pll_from)
+  # Memory-voltage GPIO (DCB tag 0x18), matching the source's mv =
+  # !ramcfg_11_02_04 selection.  The Palit ROM maps this to GPIO line 7.
+  set_gpio_level(0x18, int(not b["ramcfg_11_02_04"]), 64_000)
+  if b["ramcfg_11_02_40"] or b["ramcfg_11_07_10"]:
+    mask(0x132040, 0x00010000, 0x00010000)
+    delay_ns(20_000)
+  # gk104_ram_calc_gddr5() raises the controller transition bit before the
+  # RAMMAP/controller fields below, then waits for it to settle immediately
+  # after the second 0x10f200 update.  Keeping this ordering is important for
+  # the memory-controller state machine; do not defer it until PFB timing.
+  if b["ramcfg_11_07_40"]:
+    mask(0x10f670, 0x80000000, 0x80000000)
+  dev.write32(0x10f65c, 0x11 * cfg["rammap_11_11_0c"])
+  dev.write32(0x10f6b8, 0x01010101 * b["ramcfg_11_09"])
+  dev.write32(0x10f6bc, 0x01010101 * b["ramcfg_11_09"])
+  dev.write32(0x10f698, 0)
+  dev.write32(0x10f69c, 0)
+  mask(0x10f60c, 0x00000080, 0)
+  mask_824 = 0x00070000
+  data_824 = 0
+  if not b["ramcfg_11_02_80"]:
+    data_824 |= 0x03000000
+  if not b["ramcfg_11_02_40"]:
+    data_824 |= 0x00002000
+  if not b["ramcfg_11_07_10"]:
+    data_824 |= 0x00004000
+  if not b["ramcfg_11_07_08"]:
+    data_824 |= 0x00000003
+  else:
+    data_824 |= 0x74000000
+  mask(0x10f824, mask_824, data_824)
+  mask(0x10f200, 0x00001000, 0x00000000 if b["ramcfg_11_01_08"] else 0x00001000)
+  if dev.read32(0x10f670) & 0x80000000:
+    delay_ns(10_000_000)
+    mask(0x10f670, 0x80000000, 0)
+  mask(0x10f82c, 0x00100000, 0x00100000 if b["ramcfg_11_08_01"] else 0)
+  mask(0x10f830, 0x00007000,
+       (b["ramcfg_11_08_08"] << 13) |
+       (b["ramcfg_11_08_04"] << 12) |
+       (b["ramcfg_11_08_02"] << 14))
+  # PFB timing registers, copied in the same order as ramgk104.c.
+  for reg, value in zip((0x10f248, 0x10f290, 0x10f294, 0x10f298,
+                         0x10f29c, 0x10f2a0, 0x10f2a4, 0x10f2a8,
+                         0x10f2ac, 0x10f2cc, 0x10f2e8), timing):
+    dev.write32(reg, value)
+  if _diff["ramcfg_11_08_20"]:
+    mask(0x10f200, 0x01000000,
+         0x01000000 if b["ramcfg_11_08_20"] else 0)
+  mask_604 = 0
+  data_604 = 0
+  # ram->diff is nonzero for a cold card; retain both the low mode field and
+  # the 0x70000000 transition field when the selected RAMCFG enables it.
+  if _diff["ramcfg_11_02_03"]:
+    mask_604 |= 0x00000300
+    data_604 |= b["ramcfg_11_02_03"] << 8
+  if _diff["ramcfg_11_01_10"]:
+    mask_604 |= 0x70000000
+    data_604 |= 0x70000000
+  mask(0x10f604, mask_604, data_604)
+  mask_614 = 0
+  data_614 = 0
+  if _diff["timing_20_30_07"]:
+    mask_614 |= 0x70000000
+    data_614 |= b["timing_20_30_07"] << 28
+  if _diff["ramcfg_11_01_01"]:
+    mask_614 |= 0x00000100
+    data_614 |= 0x00000100
+  mask(0x10f614, mask_614, data_614)
+  mask_610 = 0
+  data_610 = 0
+  if _diff["timing_20_30_07"]:
+    mask_610 |= 0x70000000
+    data_610 |= b["timing_20_30_07"] << 28
+  if _diff["ramcfg_11_01_02"]:
+    mask_610 |= 0x00000100
+    data_610 |= 0x00000100
+  mask(0x10f610, mask_610, data_610)
+
+  mask_808 = 0x33F00000
+  data_808 = 0
+  if not b["ramcfg_11_01_04"]:
+    data_808 |= 0x20200000
+  if not b["ramcfg_11_07_80"]:
+    data_808 |= 0x12800000
+  if b["ramcfg_11_03_f0"]:
+    if cfg["rammap_11_08_0c"]:
+      if not b["ramcfg_11_07_80"]:
+        mask_808 |= 0x00000020
+      else:
+        data_808 |= 0x00000020
+      # gk104_ram_calc_gddr5() uses mask bit 0x4 here (not the SDR/DDR
+      # sibling's 0x08000004).  Keep the GDDR5 encoding exact.
+      mask_808 |= 0x00000004
+  else:
+    mask_808 |= 0x40000020
+    data_808 |= 0x00000004
+  mask(0x10f808, mask_808, data_808)
+  mask(0x10f694, 0xffffffff, 0)
+  mask(0x10f694, 0xff00ff00, 0x01000100 * b["ramcfg_11_04"])
+  dev.write32(0x10f870, 0x11111111 * b["ramcfg_11_03_0f"])
+  mask(0x100778, 0x00000700,
+       (b["timing_20_30_07"] << 8) |
+       (0x80000000 if b["ramcfg_11_01_01"] else 0))
+  mask_100770 = ((0x00000003 if _diff["ramcfg_11_02_03"] else 0) |
+                 (0x00000004 if _diff["ramcfg_11_01_10"] else 0))
+  old_100770 = dev.read32(0x100770)
+  if mask_100770:
+    new_100770 = ((old_100770 & ~mask_100770) |
+                  (b["ramcfg_11_02_03"] |
+                   (0x00000004 if b["ramcfg_11_01_10"] else 0)))
+    dev.write32(0x100770, new_100770)
+  if ((_diff["ramcfg_11_01_10"] and b["ramcfg_11_01_10"]) and
+      ((old_100770 & 4) != 4)):
+    mask(0x100750, 0x00000008, 0x00000008)
+    dev.write32(0x100710, 0)
+    deadline = time.monotonic() + 0.2
+    while not (dev.read32(0x100710) & 0x80000000):
+      if time.monotonic() >= deadline:
+        if os.environ.get("KEPLER_RAM_STRICT_WAIT") == "1":
+          raise TimeoutError("GK104 0x100710 transition timeout")
+        break
+      time.sleep(0.00001)
+  mask(0x10f250, 0x000003f0, b["timing_20_2c_003f"] << 4)
+  t10 = (timing[10] >> 24) & 0x7f
+  mask(0x10f24c, 0x7f000000,
+       max(t10, b["timing_20_2c_1fc0"]) << 24)
+  mask(0x10f224, 0x001f0000, b["timing_20_30_f8"] << 16)
+  mask(0x10fec4, 0x041e0f07,
+       (b["timing_20_31_0800"] << 26) |
+       (b["timing_20_31_0780"] << 17) |
+       (b["timing_20_31_0078"] << 8) |
+       b["timing_20_31_0007"])
+  mask(0x10fec8, 0x00000027,
+       (b["timing_20_31_8000"] << 5) | b["timing_20_31_7000"])
+  # Restore refresh and mode registers, then issue the mode-register writes.
+  dev.write32(0x10f090, 0x4000007e)
+  delay_ns(2_000)
+  dev.write32(0x10f314, 1)
+  dev.write32(0x10f310, 1)
+  dev.write32(0x10f210, 0x80000000)
+  mask(0x10f338, 0x00000fff, mr[3])
+  dev.write32(0x10f300, mr[0])
+  mask(0x10f354, 0x00000fff, mr[8]); delay_ns(1_000)
+  mask(0x10f330, 0x00000fff, mr[1])
+  mask(0x10f340, 0x00000fff, mr[5] & ~0x004)
+  mask(0x10f344, 0x00000fff, mr[6])
+  mask(0x10f348, 0x00000fff, mr[7])
+  if b["ramcfg_11_02_08"]:
+    set_gpio_level(0x2e, 0, 20_000)
+  mask(0x10f200, 0x80000000, 0x80000000)
+  dev.write32(0x10f318, 1)
+  mask(0x10f200, 0x80000000, 0)
+  delay_ns(1_000)
+  ram_nuts(0x10f200, 0x18808800, 0x00000000, 0x18808800)
+  data = dev.read32(0x10f978) & ~0x00046144
+  data |= 0x0000000b
+  if not b["ramcfg_11_07_08"]:
+    if not b["ramcfg_11_07_04"]: data |= 0x0000200c
+  else:
+    data |= 0x00040044
+  dev.write32(0x10f978, data)
+  # Mode-1 path enables the controller's low-clock mode before the final
+  # write-leveling train.
+  mask(0x10f830, 0x00000001, 0x00000001)
+  train_data = 0x88020000 | (0x10000000 if b["ramcfg_11_07_04"] else 0)
+  if not cfg.get("rammap_11_08_10", 0): train_data |= 0x00080000
+  train(0xbc0f0000, train_data)
+  delay_ns(1_000)
+  mask(0x10f830, 0x01000000, 0x01000000)
+  mask(0x10f830, 0x01000000, 0)
+  if b["ramcfg_11_07_02"]:
+    train(0x80020000, 0x01000000)
+  # Restore LP3 bit from the original MR5 after the temporary training value;
+  # Nouveau waits one microsecond when that write changes state.
+  if mask(0x10f340, 0x00000fff, mr[5]) != mr[5]:
+    delay_ns(1_000)
+  ram_unblock()
+  mask(0x10f200, 0x00000800,
+       0x00000800 if cfg.get("rammap_11_08_01", 0) else 0)
+  ram_nuts(0x10f200, 0x18808800,
+           0x00000800 if cfg.get("rammap_11_08_01", 0) else 0,
+           0x18808800)
+  # The second gk104_ram_prog_0() applies the target entry after execution;
+  # this is the same entry for the validated 648-MHz baseline, but retaining
+  # the write makes the transition explicit for future frequency tests.
+  prog0()
+  if getattr(dev, "memx_on", False) or getattr(dev, "_wr32_flushes", 0):
+    print(f"[nvbios] MEMX WR32 totals: {dev._wr32_flushes} execs, "
+          f"{dev._wr32_words} words", flush=True)
+  dev.stop_memx_buffer()
+  # TinyGPU bit0 unstub *after* MEMX: mid-sequence bit0 drops BAR0 once the
+  # PMU is active (proven 2026-07-16 replug).  Night5 standalone bit0 still
+  # converts PRAMIN stub → virgin without clearing 0xaa2.
+  # After post-MEMX bit0, the host PGRAPH pack (and BLCG/LTC) collapses BAR0
+  # — defer with KEPLER_RAM_BIT0_DEFER=1 until just before first PRAMIN store.
+  if os.environ.get("KEPLER_RAM_BLOCK", "0") == "bit0":
+    if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
+      print("[nvbios] deferring post-MEMX bit0 until first PRAMIN store "
+            "(KEPLER_RAM_BIT0_DEFER=1; PGRAPH pack is TinyGPU-hostile after bit0)",
+            flush=True)
+    else:
+      boot0 = _real_dev.read32(0) & 0xffffffff
+      if boot0 == 0xffffffff:
+        raise RuntimeError(
+            f"BAR0 dead before post-MEMX bit0 (PMC_BOOT_0={boot0:#x}); abort")
+      # Night5: clear only 0x1620[0]; no 0x26f0, no unpause (pause+unpause of
+      # both killed BAR0 on true cold).  KEPLER_RAM_BIT0_FULL=1 restores old.
+      r1620 = _real_dev.read32(0x001620) & 0xffffffff
+      if os.environ.get("KEPLER_RAM_BIT0_FULL", "0") == "1":
+        print("[nvbios] post-MEMX bit0 FULL (0x1620[0]+0x26f0 pause/unpause)",
+              flush=True)
+        def _host_mask(reg: int, m: int, val: int) -> None:
+          old = _real_dev.read32(reg) & 0xffffffff
+          _real_dev.write32(reg, ((old & ~m) | val) & 0xffffffff)
+        _host_mask(0x001620, 0x00000001, 0)
+        _host_mask(0x0026f0, 0x00000001, 0)
+        _host_mask(0x0026f0, 0x00000001, 0x00000001)
+        _host_mask(0x001620, 0x00000001, 0x00000001)
+      else:
+        print(f"[nvbios] post-MEMX bit0: 0x1620 {r1620:#x}->"
+              f"{r1620 & ~1:#x} (no 0x26f0, no unpause)", flush=True)
+        _real_dev.write32(0x001620, r1620 & ~0x1)
+      boot0 = _real_dev.read32(0) & 0xffffffff
+      if boot0 == 0xffffffff:
+        raise RuntimeError(
+            f"post-MEMX bit0 killed BAR0 (PMC_BOOT_0={boot0:#x})")
+      print(f"[nvbios] post-MEMX bit0 done; PMC_BOOT_0={boot0:#x}", flush=True)
+  if debug:
+    print(f"[nvbios] GK104 cold GDDR5 controller programmed: "
+          f"freq={freq_mhz}MHz actual={actual // 1000}MHz "
+         f"PLL(P={p1},N={n1},M={m1},fN={fn1:#x}) rammap={cfg['rammap_index']} "
+          f"ramcfg={cfg['ramcfg_index']} timing={cfg['timing_index']}")
+  return cfg
