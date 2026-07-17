@@ -773,8 +773,10 @@ def test_12_macos_replug_preflight() -> None:
       "macOS wrapper must default KEPLER_PMU_MEMX=1 (MEMX WR32 path)"
   assert 'setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")' in src, \
       "macOS wrapper must default KEPLER_PMU_ENTER_NOWAIT=1 (patch FB_PAUSE hang)"
-  assert 'setdefault("KEPLER_RAM_BLOCK", "bit0")' in src, \
-      "macOS live path must default KEPLER_RAM_BLOCK=bit0 (safe TinyGPU pause)"
+  assert 'setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")' in src
+  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "1")' in src
+  assert 'setdefault("KEPLER_RAM_BLOCK", "atomic")' in src, \
+      "macOS live path must keep ENTER/program/LEAVE in one PMU script"
   assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in src, \
       "macOS offline path must default KEPLER_RAM_BLOCK=0 (golden mmiotrace)"
   assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in src, \
@@ -852,7 +854,9 @@ def test_14_oneshot_env_defaults() -> None:
   assert 'setdefault("KEPLER_RAMCFG_STRAP", "6")' in mac
   assert 'setdefault("KEPLER_PMU_MEMX", "1")' in mac
   assert 'setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")' in mac
-  assert 'setdefault("KEPLER_RAM_BLOCK", "bit0")' in mac
+  assert 'setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")' in mac
+  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "1")' in mac
+  assert 'setdefault("KEPLER_RAM_BLOCK", "atomic")' in mac
   assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in mac
   assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in mac
   assert 'setdefault("KEPLER_RAM_REQUIRE_MEMX", "1")' in mac

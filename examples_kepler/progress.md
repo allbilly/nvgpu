@@ -2819,22 +2819,149 @@ BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.
     `0x1704` and complete Nouveau's two readable `0x070000` flushes.  Then clear
     bit0, let the serialized `xdst`s create the roots, and make BAR1 readback
     the first page-table lookup; issue no post-bit0 BAR0 writes.
+28. FECS physical DMA still has a circular prerequisite: Nouveau only uses
+    FECS direct-memory transfers after `ctx_load` activates a real channel, but
+    BAR1 roots are required before that channel can exist.  Night24 already
+    proved PMU MEMIF `ENABLE|IGNORE_ACTIVATION` completes channel-independent
+    transfers.  **Patched for night40:** embed a PMU v4 pad routine at
+    `0xb20` (`pmu_bar1_bootstrap.fuc`) that builds the same roots in local
+    DMEM and `xdst`s through port0 direct VRAM after the long delay; host arms
+    MEMIF, observes PC in the delay, pre-activates BAR1, clears bit0, then
+    waits.  Offline middle/fake path now asserts the PMU image pad, not FECS.
+29. Night40 true cold reached FECS ready + topology `4x2`, then aborted in
+    `_gk104_pmu_dma_prepare`: soft `falcon_stop(PMU)` never posted
+    `CPUSTAT.STOPPED` (1 s of `0x10a128` polls).  Bit0 was not crossed.
+    **Patched for night40b:** on soft-stop timeout, MC-reset the PMU
+    (`PMC_ENABLE[13]`), reload the embedded image with `start=False` at
+    ENTRY=`0xb20`, then configure MEMIF and START the pad.
+30. Night40b true cold: soft-stop missed (`CPUCTL=0x20` SLEEPING), MC reload
+    + MEMIF OK (`port=0x114 ctrl=0x190`), then arm aborted because host
+    TRACEPC `0x10aff0` stayed `0` (unlike FECS).  **Patched for night40c:**
+    match `gt215_pmu_init` start (scrub clear → ENTRY → START, no HALT
+    pulse); verify IMEM pad dword; accept TRACEPC-dead + non-halted/non-
+    stopped CPUCTL as armed.
+31. Night40c true cold: arm accepted with `TRACEPC=0`, pre-bit0 BAR1 + bit0
+    kept `PMC_BOOT_0` live, but BAR1 control PTEs were `bad0fb` walk
+    sentinels — roots never landed.  False arm likely (pad never ran).
+    **Patched for night40d:** rebuild pad to construct roots and publish
+    DMEM magic `0x40c0b002` at `0xd7c` *before* the long delay; host must
+    read magic + exact root bytes before crossing bit0.
+32. Night40d true cold: magic+roots proven, bit0 live, BAR1 still `bad0fb`.
+    Pad ran but `xdst` still missed live VRAM (likely finished delay before
+    bit0).  **Patched for night40e:** host GO at `0xd78` after BAR1 activate;
+    falcon then delays and `xdst`s with idiomatic `$xdbase=(pa>>8)`.
+33. Night40e: GO written, bit0 live, BAR1 still `bad0fb`.  Likely `cmpu`
+    wait_go never exited.  **Patched for night40f:** `sub`-based wait_go,
+    DELAY_ENTERED magic at `0xd74` (host must see it before bit0), pad at
+    `0xb14` to fit.
+34. Night40f true cold: `delay-entered=0x40c0b004` proven, bit0 live,
+    BAR1 still `bad0fb`.  Timing/wait_go are ruled out — Falcon reaches the
+    post-GO delay, but `xdst` still does not produce BAR1-visible roots.
+35. **Night40g true cold:** host-staged DMEM roots + Falcon IO `XFER_*`
+    (`CTRL=0x220`/`0x120`, pad end `0xbf4`).  Handshake identical
+    (`magic`/`GO`/`delay-entered`, bit0 live `PMC_BOOT_0`), BAR1 still
+    `bad0fb` (`wanted=01120000…01100000…` vs `actual=03fbd0ba…`).  So uc
+    `xdst` vs IO XFER is not the differentiator — post-MC-reset PMU MEMIF
+    stores are not BAR1-visible.
+36. **Night40h true cold:** live IMEM pad patch verified (`0xb14..0xbf4`,
+    no MC reset), MEMIF `0x114/0x190`, full handshake
+    (`magic`/`GO`/`delay-entered`), bit0 live — BAR1 still `bad0fb`.
+    Live-vs-MC-reload is ruled out; post-bit0 PMU MEMIF stores are not
+    BAR1-visible on either engine state.
+37. **Night40i true cold:** `ENABLE|IGNORE` validated then IGNORE cleared
+    (`ctrl=0x110` ENABLE-only), live IMEM patch, full handshake, bit0 live —
+    BAR1 still `bad0fb`.  IGNORE_ACTIVATION is not the missing FB-commit
+    switch.
+38. **Night40j true cold:** compact `xdst` + `call wr32@0x34` HUB
+    `PAGE_ALL` PDB invalidate after stores; live IMEM patch; full handshake;
+    bit0 live — BAR1 still identical `bad0fb`.  Negative-walk cache is
+    ruled out (or wr32 invalidate is a no-op); roots are still not
+    BAR1-visible.
+39. **Night40k true cold (partial):** after Nouveau-motivated ENABLE-only
+    arm, host MEMIF store hung `CTRL=0x220 STATUS=0x10012` (one store
+    pending) — same signature as night23 without activation.  **Bit0 was
+    not crossed.**  Conclusion: channel-less PMU MEMIF requires
+    `IGNORE_ACTIVATION` to retire transfers (`gm200_flcn_fw_load` no-inst
+    sets IGNORE).  Night40i ENABLE-only was therefore a DMA hang, not a
+    silent FB commit.  Code restored to ENABLE|IGNORE; host verify +
+    falcon fallback kept for the next cold run.
+40. **Night40k power-cycle cold:** `ENABLE|IGNORE` host MEMIF completed;
+    all three pre-bit0 loadbacks were `ff` (night24 discard reproduced).
+    Falcon fallback: live IMEM patch, full handshake, bit0 live — BAR1
+    still `bad0fb`.  Pre-bit0 physical VRAM discards PMU MEMIF stores even
+    with IGNORE; post-bit0 falcon xdst still not BAR1-visible.
+41. **Night40l true cold:** skipped host pre-bit0 `0x1704`; falcon
+    `wr32` enable after xdst; handshake+bit0 OK; BAR1 still `bad0fb`
+    (`03fbd0ba06…` — walk failure, so BAR1 was likely enabled).  Pre-bit0
+    enable is not the sole cause; roots still never become BAR1-visible.
+42. **Night40m true cold:** fire-and-forget MEMX `DELAY(100ms)` +
+    virgin-XOR PRAMIN `WR32` roots + `0x1704` + two flushes; bit0 during
+    DELAY; `finish=1096`; BAR1 still `bad0fb`.  Post-bit0 MEMX PRAMIN
+    writes are also not BAR1-visible (same class of failure as MEMIF/xdst).
+43. **Patched for night40n:** MEMX `WR32` roots are now literal.  Nouveau's
+    `memx_func_wr32` directly calls `nv_wr32(addr, data)`; it does not perform
+    the host-PRAMIN read/modify/XOR workaround used elsewhere in this script.
+    `KEPLER_BAR1_MEMX_LITERAL=0` retains the night40m encoding for comparison.
+44. **Night40n true cold:** literal MEMX roots produced the identical BAR1
+    `bad0fb` walk-failure sentinel.  Literal vs XOR is ruled out.  More
+    importantly, fire-and-forget only proves EXEC was queued; night18 already
+    showed PMU `nv_wr32` cannot safely complete after the bit0 transition.
+45. **Patched for night40o:** bootstrap through unpaged physical BAR1.  Local
+    envytools `bars.rst` says G80+ BAR1 maps directly to VRAM with VM disabled,
+    and `pbus.xml` defines GF100 `0x1704[31]=0` as VRAM mode.  Keep `0x1704=0`,
+    host-clear bit0, write+verify the 40 root bytes at physical BAR1 offsets,
+    then set `0x1704=0x80000100` and validate the first paged read.  This avoids
+    the circular need for valid page tables before BAR1 can create them.
+46. **Night40o true cold:** direct physical BAR1 after bit0 read virgin
+    `0xffffffff`, but both XOR and literal stores at physical `0x100200` were
+    discarded.  Failure is below BAR1 paging: no tested post-bit0 client can
+    commit physical VRAM.  The skipped framebuffer-quiesce window is now the
+    leading RAM-controller defect.
+47. **Patched for night40p:** reproduce Nouveau's RAM transition atomically in
+    one PMU MEMX EXEC: pre-transition writes + `ENTER` + GDDR5 programming,
+    delays and waits + `LEAVE`.  Previously `KEPLER_RAM_BLOCK=bit0` skipped
+    ENTER/LEAVE entirely, programming the controller while live.  Standalone
+    ENTER stranded host MMIO; the combined script restores the aperture before
+    its reply.  Offline serialization is 46 commands / `0x448` bytes within
+    the PMU's `0x800`-byte data buffer, with exactly one ENTER and one LEAVE.
+48. **Night40p true cold:** the atomic script was submitted (`31` WR32 groups,
+    `208` words) but the PMU EXEC reply timed out after 15 seconds.  Later review
+    found the script still contained target `prog0` stores after `LEAVE`, so the
+    timeout did not prove that LEAVE itself was unreachable.
+49. **Patched for night40q:** precede the RAM script with one minimal synchronous
+    MEMX EXEC containing only `ENTER; LEAVE`.  Review also corrected the RAM
+    training status address (`0x110974`, not `0x110000`), restored Nouveau's
+    `64us`/`200us` WAIT values, required the patched ENTER firmware, and moved
+    target `prog0` to a separate post-transition MEMX EXEC.
+50. **Night40r true cold:** minimal `ENTER;LEAVE` preflight completed; corrected
+    atomic RAM transition completed (`47` commands, `0x458` bytes), and separate
+    target `prog0` completed (`2` commands, `0x30` bytes).  Night40p's MEMX hang
+    is fixed.  FECS reached ready and channel construction continued, but direct
+    physical BAR1 root `0x100200` rejected `0x00110000` and read back
+    `0xbad0fb0d`.  Correct framebuffer quiesce/program/unquiesce is therefore
+    not sufficient to make physical VRAM stores stick.  **Needs enclosure power
+    cycle.**
+51. **Night40s true cold:** review found `_gk104_bit0_unstub()` silently skipped
+    atomic mode, so night40r never performed its claimed late clear.  Allowing
+    it produced the expected live `0x1620 0xaab→0xaaa`, but direct BAR1 changed
+    from `bad0fb` to `0xffffffff` and every store timed out/discarded.  The PMU
+    firmware explains why: ENTER clears bit0 only inside framebuffer pause and
+    LEAVE deliberately restores it.  A late clear is not a valid steady state.
+52. **Night40t true cold:** root PRAMIN `nv_wr32`s were moved inside one
+    synchronous `ENTER→WR32→LEAVE`; LEAVE restored `0x1620=0xaab`, BAR1 enable
+    and Nouveau's two flushes completed, but the first VM access still returned
+    identical `bad0fb`.  Correct ENTER scope does not make MEMX PRAMIN stores
+    physically visible.
+53. **Patched for night40u:** replace blind PRAMIN `WR32` with verified direct-
+    VRAM PMU MEMIF under the same ownership boundary.  Roots are staged in
+    DMEM, `ENTER` runs, each fragment is MEMIF-stored then MEMIF-loaded to a
+    separate scratch address and compared exactly, and `LEAVE` always runs in
+    `finally`.  BAR1 is enabled/flushed only after all physical loadbacks match.
+    The fake now rejects MEMIF root transfers outside ENTER and verifies
+    `ENTER < store/load < LEAVE < enable < first BAR1 access`.
 
 ### Still missing for `hardware_demo=ok N=8`
 
-1. Night39 cold run: pre-bit0 BAR1 activation + post-bit0 roots → two-PTE match
+1. Prove ENTER-scoped MEMIF physical root store+load on a cold night40u run
 2. Expand BAR1 + channel (coded)
 3. Launch → `hardware_demo=ok N=8`
-
-### Current hardware state / next step
-
-- Night38 ran from a true-cold state, then its post-bit0 activation writes
-  collapsed BAR0 before BAR1 readback.  The card is dirty.  Fully remove
-  enclosure/card power, then start a fresh server and run night39 exactly once
-  with the pre-bit0 Nouveau BAR1 activation:
-
-```bash
-/Applications/TinyGPU.app/Contents/MacOS/TinyGPU server /tmp/tinygpu.sock &
-KEPLER_LIVE_ACK=completion-abort-risk KEPLER_RPC_TRACE=logs/rpc-n8-night39.log \
-  KEPLER_N=8 KEPLER_COLD_FLR=0 python3 -u examples_kepler/add.py
-```

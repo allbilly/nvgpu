@@ -2564,21 +2564,36 @@ FECS_BAR1_BOOTSTRAP_ROOTS = (
     struct.pack("<QQ", 0x00001201, 0x00001001),
 )
 FECS_BAR1_BOOTSTRAP_END = FECS_BAR1_BOOTSTRAP_IMEM + len(FECS_BAR1_BOOTSTRAP_CODE)
-# Channel-independent replacement for FECS xdst.  The PMU v4 firmware's last
-# live instruction ends at 0xb13; embed in its 0xb20..0xbff zero pad.
-PMU_BAR1_BOOTSTRAP_IMEM = 0xb20
-PMU_BAR1_BOOTSTRAP_DELAY_START = 0xb2f
-PMU_BAR1_BOOTSTRAP_DELAY_END = 0xb35
+# Night40l: host-staged roots + xdst, then wr32@0x34 enables 0x1704
+# (no pre-bit0 BAR1 init; no PDB invalidate).
+PMU_BAR1_BOOTSTRAP_IMEM = 0xb14
+PMU_BAR1_BOOTSTRAP_DELAY_START = 0xb57
+PMU_BAR1_BOOTSTRAP_DELAY_END = 0xb5d
+PMU_BAR1_BOOTSTRAP_MAGIC_DMEM = 0xd7c
+PMU_BAR1_BOOTSTRAP_MAGIC = 0x40c0b002
+PMU_BAR1_BOOTSTRAP_GO_DMEM = 0xd78
+PMU_BAR1_BOOTSTRAP_GO = 0x40c0b003
+PMU_BAR1_BOOTSTRAP_DELAY_ENTERED_DMEM = 0xd74
+PMU_BAR1_BOOTSTRAP_DELAY_ENTERED = 0x40c0b004
+PMU_BAR1_BOOTSTRAP_DONE_DMEM = 0xd70
+PMU_BAR1_BOOTSTRAP_DONE = 0x40c0b005
 PMU_BAR1_BOOTSTRAP_CODE = bytes(bytearray().join(
     struct.pack("<I", w) for w in (
-        0x07fe04bd, 0x000bfe00, 0xf10017f0, 0xb6100013, 0x1bf40112,
-        0x8047f1fd, 0x0043f00d, 0x000037f1, 0x801133f0, 0x34bd0043,
-        0xf1014380, 0xf0ffff37, 0x4380ff33, 0x8034bd02, 0x43800343,
-        0x0137f104, 0x0033f012, 0x80054380, 0x34bd0843, 0xf1094380,
-        0xf0100137, 0x43800033, 0x8034bd0a, 0x17f10b43, 0x13f00d80,
-        0x0027f102, 0x1023f002, 0xf80621fa, 0x9017f103, 0x0113f00d,
-        0x000027f1, 0xfa1123f0, 0x03f80621, 0x0da017f1, 0xf10213f0,
-        0xf0000027, 0x21fa1223, 0xf403f806, 0x0000000e,
+        0xb00237f1, 0x40c033f1, 0x0d7c47f1, 0x800043f0,
+        0x27f10043, 0x23f1b003, 0x47f140c0, 0x43f00d78,
+        0x00439800, 0xf40232bb,
+        0xe7f1fa1b, 0xe3f01620, 0x08d7f100, 0x00d3f000,
+        0xf13421f4, 0xf126f0e7, 0xf40000d7, 0x07f13421,
+        0x03f007e0, 0x0437f000, 0xbd0003d0, 0xfe04bd04,
+        0x37f1000b, 0x33f01002, 0x0037fe00, 0x17f124bd,
+        0x13f00d80, 0x0621fa02, 0x21fa03f8, 0xf103f805,
+        0xfe110037, 0x24bd0037, 0x0d9017f1, 0xfa0113f0,
+        0x03f80621, 0xf80521fa, 0x0037f103, 0x0037fe12,
+        0x17f124bd, 0x13f00da0, 0x0621fa02, 0x21fa03f8,
+        0xf103f805, 0xf007e407, 0x37f00003, 0x0003d004,
+        0xe7f104bd, 0xd7f126f0, 0x21f40001, 0x20e7f134,
+        0xabd7f116, 0x3421f40a, 0xb00537f1, 0x40c033f1,
+        0x0d7047f1, 0x800043f0, 0x0ef40043, 0x00000000,
     )))
 PMU_BAR1_BOOTSTRAP_END = PMU_BAR1_BOOTSTRAP_IMEM + len(PMU_BAR1_BOOTSTRAP_CODE)
 PMU_BAR1_BOOTSTRAP_XFER = (
@@ -2720,6 +2735,52 @@ def pmu_memx_exec(dev, data_base, commands, timeout_s=5.0):
     dev.write32(0x10a580, 0)
   return pmu_send(dev, PMU_PROC_MEMX, PMU_MEMX_EXEC,
                   data_base, finish, timeout_s=timeout_s)
+
+
+def pmu_memx_exec_fire(dev, data_base, commands) -> int:
+  """Submit a MEMX EXEC without waiting for the PMU reply.
+
+  Night40m: the script's DELAY covers host bit0; afterward PMU host MMIO is
+  dead so a synchronous reply cannot be collected.  Return the script end
+  address that was handed to EXEC.
+  """
+  words = []
+  for opcode, payload in commands:
+    payload = tuple(int(x) & 0xffffffff for x in payload)
+    words.append(((len(payload) << 16) | (int(opcode) & 0xffff)) & 0xffffffff)
+    words.extend(payload)
+  _pmu_wait_data_access(dev, 0x00000003)
+  try:
+    dev.write32(0x10a1c0, 0x01000000 | (data_base & 0x00ffffff))
+    for word in words:
+      dev.write32(0x10a1c4, word)
+    finish = dev.read32(0x10a1c0) & 0x00ffffff
+  finally:
+    dev.write32(0x10a580, 0)
+  # One-shot ring push of EXEC; ignore the reply path entirely.
+  process, message, data0, data1 = (
+      PMU_PROC_MEMX, PMU_MEMX_EXEC, data_base, finish)
+  ring = dev.read32(0x10a4d0)
+  if not ring:
+    raise RuntimeError("GK104 PMU host-command ring is not initialized")
+  send_base = ring & 0x0000ffff
+  addr = dev.read32(0x10a4a0) & 0x0f
+  deadline = time.monotonic() + 0.2
+  while dev.read32(0x10a4b0) == (addr ^ 0x08):
+    if time.monotonic() >= deadline:
+      raise TimeoutError("GK104 PMU host-command ring is full (fire)")
+    time.sleep(0.00001)
+  _pmu_wait_data_access(dev, 0x00000001)
+  try:
+    dev.write32(0x10a1c0,
+                0x01000000 | (((addr & 0x07) << 4) + send_base))
+    for word in (process, message, data0, data1):
+      dev.write32(0x10a1c4, word & 0xffffffff)
+    dev.write32(0x10a4a0, (addr + 1) & 0x0f)
+  finally:
+    dev.write32(0x10a580, 0)
+  return finish
+
 
 def falcon_write_dmem(dev, base, data):
   """nouveau nvkm_falcon_v1_load_dmem: DATA_INDEX = start|WRITE, then DATA words."""
@@ -3686,6 +3747,104 @@ def kepler_selftest():
   assert any(r == 0x1620 for r, _ in _direct.writes), \
       "KEPLER_RAM_BLOCK=direct must emit host 0x1620 pause masks"
 
+  class _FakeAtomicRamRegs(_FakeRamRegs):
+    def __init__(self):
+      super().__init__()
+      self.regs.update({0x1620: 0xaab, 0x26f0: 1, 0x022438: 2,
+                        0x110974: 0, 0x111974: 0})
+      self._pmu_memx_data = (0x3cc, 0x800)
+      self._pmu_memx_nowait = True
+      self.exec_calls = []
+    def pmu_memx_exec_commands(self, commands, timeout_s=5.0):
+      commands = [(op, tuple(payload)) for op, payload in commands]
+      self.exec_calls.append(commands)
+      for opcode, payload in commands:
+        if opcode == PMU_MEMX_ENTER:
+          self.regs[0x1620] = self.regs[0x1620] & ~0xaa3
+          self.regs[0x26f0] = self.regs[0x26f0] & ~1
+        elif opcode == PMU_MEMX_LEAVE:
+          self.regs[0x26f0] = self.regs[0x26f0] | 1
+          self.regs[0x1620] = self.regs[0x1620] | 0xaa3
+        elif opcode == PMU_MEMX_WR32:
+          assert len(payload) % 2 == 0
+          for i in range(0, len(payload), 2):
+            self.write32(payload[i], payload[i + 1])
+        elif opcode == PMU_MEMX_WAIT:
+          reg, mask, value, _nsec = payload
+          assert (self.read32(reg) & mask) == value
+        else:
+          assert opcode == PMU_MEMX_DELAY
+      return (0, 0)
+
+  _atomic_ram = _FakeAtomicRamRegs()
+  _atomic_ram_env = {key: os.environ.get(key) for key in (
+      "KEPLER_RAM_MEMX_ATOMIC", "KEPLER_RAM_BLOCK")}
+  try:
+    os.environ["KEPLER_RAM_MEMX_ATOMIC"] = "1"
+    os.environ["KEPLER_RAM_BLOCK"] = "atomic"
+    nvbios_init.run_vbios_ram_program(
+        _atomic_ram, _ram_image, freq_mhz=648)
+  finally:
+    for _key, _value in _atomic_ram_env.items():
+      if _value is None:
+        os.environ.pop(_key, None)
+      else:
+        os.environ[_key] = _value
+  # One smoke DELAY, one minimal ENTER+LEAVE preflight, one indivisible RAM
+  # transition, then a separate smoke/target-prog0 phase.
+  assert len(_atomic_ram.exec_calls) == 5, _atomic_ram.exec_calls
+  assert [op for op, _payload in _atomic_ram.exec_calls[1]] == [
+      PMU_MEMX_ENTER, PMU_MEMX_LEAVE]
+  _atomic_script = _atomic_ram.exec_calls[2]
+  _atomic_ops = [op for op, _payload in _atomic_script]
+  assert _atomic_ops.count(PMU_MEMX_ENTER) == 1
+  assert _atomic_ops.count(PMU_MEMX_LEAVE) == 1
+  assert _atomic_ops.index(PMU_MEMX_ENTER) < _atomic_ops.index(PMU_MEMX_LEAVE)
+  _atomic_waits = [payload for op, payload in _atomic_script
+                   if op == PMU_MEMX_WAIT]
+  assert (0x137390, 0x00020000, 0x00020000, 64_000) in _atomic_waits
+  assert (0x110974, 0x0000000f, 0x00000000, 500_000) in _atomic_waits
+  assert (0x111974, 0x0000000f, 0x00000000, 500_000) in _atomic_waits
+  for _wait in _atomic_waits:
+    if _wait[0] == 0x100710:
+      assert _wait[3] == 200_000, _wait
+  _prog0_regs = {0x10f468, 0x10f420, 0x10f430, 0x10f400,
+                 0x10f410, 0x10f440, 0x10f444}
+  _after_leave = False
+  for _op, _payload in _atomic_script:
+    if _op == PMU_MEMX_LEAVE:
+      _after_leave = True
+    elif _after_leave and _op == PMU_MEMX_WR32:
+      assert not (_prog0_regs & set(_payload[0::2])), _payload
+  assert _atomic_ram.exec_calls[3] == [(PMU_MEMX_DELAY, (1000,))]
+  _prog0_script = _atomic_ram.exec_calls[4]
+  assert _prog0_script and all(op == PMU_MEMX_WR32
+                               for op, _payload in _prog0_script)
+  _prog0_addrs = {addr for _op, _payload in _prog0_script
+                  for addr in _payload[0::2]}
+  assert _prog0_addrs and _prog0_addrs <= _prog0_regs, _prog0_addrs
+  assert _atomic_ram.regs[0x1620] == 0xaab
+  assert _atomic_ram.regs[0x26f0] & 1
+
+  _unsafe_atomic = _FakeAtomicRamRegs()
+  _unsafe_atomic._pmu_memx_nowait = False
+  _unsafe_error = None
+  try:
+    os.environ["KEPLER_RAM_MEMX_ATOMIC"] = "1"
+    os.environ["KEPLER_RAM_BLOCK"] = "atomic"
+    nvbios_init.run_vbios_ram_program(
+        _unsafe_atomic, _ram_image, freq_mhz=648)
+  except RuntimeError as _error:
+    _unsafe_error = str(_error)
+  finally:
+    for _key, _value in _atomic_ram_env.items():
+      if _value is None:
+        os.environ.pop(_key, None)
+      else:
+        os.environ[_key] = _value
+  assert _unsafe_error and "_pmu_memx_nowait is false" in _unsafe_error
+  assert not _unsafe_atomic.exec_calls
+
   # Full golden-mmiotrace checkpoint suite (also available as
   # --mmiotrace-selftest; must pass on macOS before the next eGPU replug).
   import mmiotrace_selftest as _mmio_st
@@ -3733,14 +3892,18 @@ def kepler_selftest():
   # Exercise the macOS-only crossing end-to-end against an XOR-like BAR1
   # model.  Night25: host FECS XFER MMIO dies after bit0, so the fake arms an
   # autonomous Falcon bootstrap and commits the staged DMEM roots during the
-  # bit0 write itself (standing in for the Falcon delay+xdst).
+  # bit0 write itself (standing in for the Falcon delay+IO XFER).
   class _AtomicBar1Hw:
     def __init__(self, owner):
       self.owner = owner
     def _xlate(self, va, size):
       o = self.owner
       ctl = o.regs.get(0x1704, 0)
-      assert ctl & 0x80000000, f"BAR1 disabled for VA {va:#x}"
+      if not (ctl & 0x80000000):
+        # GF100 PBUS BAR1 VRAM mode: VM disabled maps BAR1 directly to VRAM.
+        pa = ((ctl & 0x0fffffff) << 12) + va
+        assert 0 <= pa <= len(o.vram) - size, (pa, size)
+        return pa
       inst_pa = (ctl & 0x3fffffff) << 12
       limit = struct.unpack_from("<Q", o.vram, inst_pa + 0x208)[0]
       assert va + size - 1 <= limit, (va, size, limit)
@@ -3794,8 +3957,14 @@ def kepler_selftest():
       self._imem_addr = 0
       self._pmu_memx_data = (0x3cc, 0x800)
       self._pmu_code = bytes(_gk104_pmu_embed_bar1_bootstrap(bytes(0xc00)))
+      self.pmu_imem = bytearray(0x2000)
+      self.pmu_imem[:len(self._pmu_code)] = self._pmu_code
+      self._pmu_imem_addr = 0
+      self._pmu_dmem_addr = 0
+      self._pmu_dmem_write = False
       self._pmu_auto_bar1_armed = False
       self._pmu_auto_bar1_applied = False
+      self._memx_inside_enter = False
       self._fecs_stopped_for_staging = False
       self.bar_flushes = 0
       self.bar1_semantic_ops = []
@@ -3819,6 +3988,8 @@ def kepler_selftest():
         assert pa + size <= len(self.vram)
         self.vram[pa:pa + size] = self.dmem[dmem:dmem + size]
         self.bar1_semantic_ops.append(("PMU xdst", ext, size))
+        self.dmem[dmem:dmem + size] = self.vram[pa:pa + size]
+        self.bar1_semantic_ops.append(("PMU xdld", ext, size))
       self._pmu_auto_bar1_applied = True
     def read32(self, reg):
       if reg == FECS_FALCON_BASE + FALCON_DATA:
@@ -3828,6 +3999,13 @@ def kepler_selftest():
         return value
       if reg == FECS_FALCON_BASE + FALCON_CODE:
         return struct.unpack_from("<I", self.imem, self._imem_addr)[0]
+      if reg == PMU_FALCON_BASE + FALCON_CODE:
+        return struct.unpack_from("<I", self.pmu_imem, self._pmu_imem_addr)[0]
+      if reg == PMU_FALCON_BASE + FALCON_DATA:
+        assert not self._pmu_dmem_write
+        value = struct.unpack_from("<I", self.dmem, self._pmu_dmem_addr)[0]
+        self._pmu_dmem_addr += 4
+        return value
       return self.regs.get(reg, 0)
     def write32(self, reg, value):
       value &= 0xffffffff
@@ -3835,6 +4013,42 @@ def kepler_selftest():
           0x070000, 0x100cb8, 0x100cbc):
         raise AssertionError(
             f"post-bit0 host access to proven-dead BAR/LTC/VMM reg {reg:#x}")
+      if reg == PMU_FALCON_BASE + FALCON_CODE_INDEX:
+        self._pmu_imem_addr = value & 0x00ffffff
+        return
+      if reg == PMU_FALCON_BASE + FALCON_CODE:
+        struct.pack_into("<I", self.pmu_imem, self._pmu_imem_addr, value)
+        return
+      if reg == PMU_FALCON_BASE + FALCON_CODE_TAG:
+        self.regs[reg] = value
+        return
+      if reg == PMU_FALCON_BASE + FALCON_DATA_INDEX:
+        self._pmu_dmem_addr = value & 0x00ffffff
+        self._pmu_dmem_write = bool(value & FALCON_IDX_WRITE)
+        return
+      if reg == PMU_FALCON_BASE + FALCON_DATA:
+        assert self._pmu_dmem_write
+        struct.pack_into("<I", self.dmem, self._pmu_dmem_addr, value)
+        # Host GO write releases the pad into its delay (model DELAY_ENTERED).
+        if (self._pmu_dmem_addr == PMU_BAR1_BOOTSTRAP_GO_DMEM and
+            value == PMU_BAR1_BOOTSTRAP_GO):
+          struct.pack_into("<I", self.dmem,
+                           PMU_BAR1_BOOTSTRAP_DELAY_ENTERED_DMEM,
+                           PMU_BAR1_BOOTSTRAP_DELAY_ENTERED)
+          self.regs[PMU_FALCON_BASE + 0xff0] = PMU_BAR1_BOOTSTRAP_DELAY_START
+          self.regs[0x1620] = 0x8
+          self.regs[0x26f0] = 0
+          self.bar1_semantic_ops.append(("Falcon ENTER", 0x8, 0))
+          self.bar1_semantic_ops.append(("FB_PAUSE SET", 4, 0))
+          self._apply_autonomous_roots()
+          self.bar1_semantic_ops.append(("FB_PAUSE CLR", 4, 0))
+          self.regs[0x26f0] = 1
+          self.regs[0x1620] = 0xaab
+          self.bar1_semantic_ops.append(("Falcon LEAVE", 0xaab, 0))
+          struct.pack_into("<I", self.dmem, PMU_BAR1_BOOTSTRAP_DONE_DMEM,
+                           PMU_BAR1_BOOTSTRAP_DONE)
+        self._pmu_dmem_addr += 4
+        return
       if reg == PMU_FALCON_BASE + FALCON_UC_CTRL:
         self.regs[reg] = value
         if value & FALCON_UC_CTRL_START:
@@ -3844,6 +4058,12 @@ def kepler_selftest():
             self._pmu_auto_bar1_armed = True
             self.regs[PMU_FALCON_BASE + 0xff0] = \
                 PMU_BAR1_BOOTSTRAP_DELAY_START
+            # Roots are host-staged in dma_prepare; pad only publishes magic.
+            struct.pack_into("<I", self.dmem, PMU_BAR1_BOOTSTRAP_MAGIC_DMEM,
+                             PMU_BAR1_BOOTSTRAP_MAGIC)
+            struct.pack_into("<I", self.dmem, PMU_BAR1_BOOTSTRAP_GO_DMEM, 0)
+            struct.pack_into("<I", self.dmem,
+                             PMU_BAR1_BOOTSTRAP_DELAY_ENTERED_DMEM, 0)
         if value & 0x10:
           self.regs[PMU_FALCON_BASE + 0x128] = 0x10
         return
@@ -3888,6 +4108,24 @@ def kepler_selftest():
       if reg == FECS_FALCON_BASE + 0x118:
         raise AssertionError(
             "host must not submit FECS XFER after night25; use autonomous xdst")
+      if reg == PMU_FALCON_BASE + 0x118:
+        # Night40k host MEMIF: model store/load against local DMEM ↔ VRAM.
+        assert self._memx_inside_enter, \
+            "direct-VRAM MEMIF roots must be transferred inside ENTER/LEAVE"
+        mode = (value >> 4) & 3
+        code = (value >> 8) & 7
+        size = 4 << code
+        ext = ((self.regs.get(PMU_FALCON_BASE + 0x110, 0) & 0xffffffff) << 8) + (
+            self.regs.get(PMU_FALCON_BASE + 0x11c, 0) & 0xffffffff)
+        local = self.regs.get(PMU_FALCON_BASE + 0x114, 0) & 0xffffffff
+        if mode == 2:
+          self.vram[ext:ext + size] = bytes(self.dmem[local:local + size])
+          self.bar1_semantic_ops.append(("MEMIF root", ext, size))
+        elif mode == 0:
+          self.dmem[local:local + size] = bytes(self.vram[ext:ext + size])
+        self.regs[reg] = value & ~0x3
+        self.regs[PMU_FALCON_BASE + 0x120] = 0x10
+        return
       if reg in (0x409a04, 0x409a20):
         assert self._fecs_stopped_for_staging, \
             "FECS transfer target must be configured only after halt"
@@ -3897,6 +4135,8 @@ def kepler_selftest():
         prev = self.regs.get(reg, 0)
         self.regs[reg] = value
         if (prev & 1) and not (value & 1) and self._pmu_auto_bar1_armed:
+          go = struct.unpack_from("<I", self.dmem, PMU_BAR1_BOOTSTRAP_GO_DMEM)[0]
+          assert go == PMU_BAR1_BOOTSTRAP_GO, "PMU IO XFER requires host GO before bit0"
           self.bar1_semantic_ops.append(("bit0 unstub", value, 0))
           self._apply_autonomous_roots()
         return
@@ -3914,6 +4154,20 @@ def kepler_selftest():
         return (0, 0)
       window = 0
       for opcode, payload in commands:
+        if opcode == PMU_MEMX_ENTER:
+          assert not self._memx_inside_enter
+          self._memx_inside_enter = True
+          self.regs[0x1620] &= ~0xaa3
+          self.regs[0x26f0] = self.regs.get(0x26f0, 1) & ~1
+          self.bar1_semantic_ops.append(("MEMX ENTER", 0, 0))
+          continue
+        if opcode == PMU_MEMX_LEAVE:
+          assert self._memx_inside_enter
+          self.regs[0x26f0] = self.regs.get(0x26f0, 0) | 1
+          self.regs[0x1620] |= 0xaa3
+          self._memx_inside_enter = False
+          self.bar1_semantic_ops.append(("MEMX LEAVE", 0, 0))
+          continue
         if opcode == PMU_MEMX_WAIT:
           reg, mask, value, _nsec = payload
           assert (self.regs.get(reg, 0) & mask) == value
@@ -3926,9 +4180,11 @@ def kepler_selftest():
           elif reg == 0x1620:
             self.write32(reg, value)
           elif 0x700000 <= reg < 0x800000:
+            assert self._memx_inside_enter, \
+                "framebuffer roots must be stored inside MEMX ENTER/LEAVE"
             pa = window + reg - 0x700000
-            cur = struct.unpack_from("<I", self.vram, pa)[0]
-            struct.pack_into("<I", self.vram, pa, cur ^ value)
+            struct.pack_into("<I", self.vram, pa, value)
+            self.bar1_semantic_ops.append(("MEMX root", pa, 4))
           else:
             self.regs[reg] = value
       return (0, 0)
@@ -3936,39 +4192,41 @@ def kepler_selftest():
   _atomic_env = {k: os.environ.get(k) for k in (
       "KEPLER_TINYGPU_ATOMIC_BAR1", "KEPLER_PRAMIN_MEMX",
       "KEPLER_RAM_BIT0_DEFER", "KEPLER_RAM_BLOCK",
-      "KEPLER_BAR1_MAP_SIZE")}
+      "KEPLER_BAR1_MAP_SIZE", "KEPLER_BAR1_DIRECT_PHYS")}
   try:
     os.environ["KEPLER_TINYGPU_ATOMIC_BAR1"] = "1"
     os.environ["KEPLER_PRAMIN_MEMX"] = "1"
     os.environ["KEPLER_RAM_BIT0_DEFER"] = "1"
-    os.environ["KEPLER_RAM_BLOCK"] = "bit0"
+    os.environ["KEPLER_RAM_BLOCK"] = "atomic"
     os.environ["KEPLER_BAR1_MAP_SIZE"] = "0x1000000"
+    os.environ["KEPLER_BAR1_DIRECT_PHYS"] = "1"
     _atomic_dev = _AtomicBar1Dev()
     _gk104_init_bar1_identity(
         _atomic_dev, map_vram=True, userd_alias_pa=0x400000)
     assert _atomic_dev._bar1_identity_ready
-    assert _atomic_dev.regs[0x1620] == 0xaaa
+    assert _atomic_dev.regs[0x1620] == 0xaab
     assert _atomic_dev._pmu_auto_bar1_applied
     assert _atomic_dev.bar_flushes == 2
-    _bar1_expected_prefix = [
-        ("gf100_bar_bar1_init", 0x80000100, 0),
-        ("g84_bar_flush", 1, 0),
-        ("g84_bar_flush", 1, 0),
-        ("bit0 unstub", 0xaaa, 0),
-        ("PMU xdst", 0x00100200, 16),
-        ("PMU xdst", 0x00110000, 8),
-        ("PMU xdst", 0x00120000, 16),
-        ("first BAR1 access", 0, 16),
-    ]
-    assert _atomic_dev.bar1_semantic_ops[:len(_bar1_expected_prefix)] == \
-        _bar1_expected_prefix, _atomic_dev.bar1_semantic_ops[:12]
+    _enter = _atomic_dev.bar1_semantic_ops.index(("Falcon ENTER", 0x8, 0))
+    _pause = _atomic_dev.bar1_semantic_ops.index(("FB_PAUSE SET", 4, 0))
+    _root = _atomic_dev.bar1_semantic_ops.index(("PMU xdst", 0x100200, 16))
+    _load = _atomic_dev.bar1_semantic_ops.index(("PMU xdld", 0x100200, 16))
+    _unpause = _atomic_dev.bar1_semantic_ops.index(("FB_PAUSE CLR", 4, 0))
+    _leave = _atomic_dev.bar1_semantic_ops.index(("Falcon LEAVE", 0xaab, 0))
+    _vm_switch = _atomic_dev.bar1_semantic_ops.index(
+        ("gf100_bar_bar1_init", 0x80000100, 0))
+    _paged_first = _atomic_dev.bar1_semantic_ops.index(
+        ("first BAR1 access", 0, 16))
+    assert _enter < _pause < _root < _load < _unpause < _leave < _vm_switch < _paged_first, \
+        _atomic_dev.bar1_semantic_ops[:24]
     assert struct.unpack_from("<Q", _atomic_dev.vram, 0x100000 + 0x208)[0] == 0xffffff
     assert struct.unpack_from("<Q", _atomic_dev.vram, 0x120000)[0] == 0x4001
     assert struct.unpack_from("<Q", _atomic_dev.vram, 0x120008)[0] == 0x4011
     assert struct.unpack_from("<Q", _atomic_dev.vram, 0x120000 + 0x120 * 8)[0] == 0x1201
-    # Bootstrap IMEM pad must have been patched.
-    assert _atomic_dev.imem[FECS_BAR1_BOOTSTRAP_IMEM:FECS_BAR1_BOOTSTRAP_IMEM + 4] == \
-        FECS_BAR1_BOOTSTRAP_CODE[:4]
+    # PMU firmware image must carry the autonomous pad routine.
+    assert _atomic_dev._pmu_code[
+        PMU_BAR1_BOOTSTRAP_IMEM:PMU_BAR1_BOOTSTRAP_IMEM + 4] == \
+        PMU_BAR1_BOOTSTRAP_CODE[:4]
   finally:
     for _key, _value in _atomic_env.items():
       if _value is None:
@@ -5263,11 +5521,13 @@ GK104_BAR1_NOUVEAU_FLOW = (
 )
 GK104_BAR1_TINYGPU_FLOW = (
     "PMU direct-VRAM MEMIF ENABLE|IGNORE_ACTIVATION",
-    "PMU delay armed",
+    "PMU host MEMIF store+load verify (pre-bit0)",
+    "PMU magic+roots in DMEM (wait_go) [falcon fallback]",
     "gf100_bar_bar1_init",
     "gf100_bar_bar1_wait (g84_bar_flush x2)",
+    "PMU GO [falcon fallback]",
     "bit0 unstub",
-    "PMU xdst instance/PDE/PTE + xdwait",
+    "PMU delay + xdst + wr32 HUB PDB invalidate [falcon fallback]",
     "first BAR1 access",
 )
 GK104_BAR1_DIVERGENCES = (
@@ -5396,10 +5656,10 @@ def _gk104_require_bar0_live(dev, label: str) -> int:
 
 
 def _gk104_bit0_unstub(dev) -> None:
-  """Clear only ``0x1620[0]`` to unstub PRAMIN (night5); once per device.
+  """Legacy-only late framebuffer bit0 clear; once per device.
 
-  Must run *after* PGRAPH pack / FECS MMIO on TinyGPU — doing it earlier makes
-  the PGRAPH pack collapse BAR0 (2026-07-16 night11).
+  MEMX ENTER owns this bit and LEAVE deliberately restores it.  Atomic mode
+  must put framebuffer stores inside ENTER/LEAVE instead of clearing it late.
   """
   if getattr(dev, "_bit0_unstub_done", False):
     return
@@ -5679,8 +5939,95 @@ def _gk104_pmu_embed_bar1_bootstrap(pmu_code):
   return code
 
 
+def _gk104_pmu_patch_live_imem_pad(dev) -> None:
+  """Night40h: patch the pad into the live MEMX PMU without MC reset.
+
+  Night40g proved Falcon IO XFER after MC-reload still yields BAR1 `bad0fb`.
+  Night24's completing MEMIF path ran on the live post-FECS PMU.  Soft-stop
+  leaves CPUCTL SLEEPING (never STOPPED); still try an IMEM pad write +
+  readback there so MEMIF keeps the live engine's FB binding.
+  """
+  code = getattr(dev, "_pmu_code", None)
+  if not code or len(code) < PMU_BAR1_BOOTSTRAP_END:
+    raise RuntimeError("PMU image missing for live IMEM pad patch")
+  if code[PMU_BAR1_BOOTSTRAP_IMEM:PMU_BAR1_BOOTSTRAP_END] != \
+      PMU_BAR1_BOOTSTRAP_CODE:
+    code = _gk104_pmu_embed_bar1_bootstrap(code)
+    try:
+      setattr(dev, "_pmu_code", bytes(code))
+    except Exception:
+      pass
+  pad = PMU_BAR1_BOOTSTRAP_CODE
+  print("[kepler] PMU live IMEM pad patch (no MC reset)", flush=True)
+  tag_page = -1
+  for off in range(0, len(pad), 4):
+    addr = PMU_BAR1_BOOTSTRAP_IMEM + off
+    page = addr >> 8
+    if page != tag_page:
+      dev.write32(PMU_FALCON_BASE + FALCON_CODE_TAG, page)
+      tag_page = page
+    dev.write32(PMU_FALCON_BASE + FALCON_CODE_INDEX, addr & 0x00ffffff)
+    dev.write32(PMU_FALCON_BASE + FALCON_CODE,
+                struct.unpack_from("<I", pad, off)[0])
+  for off in range(0, len(pad), 4):
+    addr = PMU_BAR1_BOOTSTRAP_IMEM + off
+    want = struct.unpack_from("<I", pad, off)[0]
+    got = _gk104_pmu_imem_read32(dev, addr)
+    if got != want:
+      raise RuntimeError(
+          f"PMU live IMEM pad mismatch at {addr:#x}: "
+          f"wanted={want:#x} actual={got:#x}")
+  print(f"[kepler] PMU live IMEM pad verified "
+        f"{PMU_BAR1_BOOTSTRAP_IMEM:#x}..{PMU_BAR1_BOOTSTRAP_END:#x}",
+        flush=True)
+
+
+def _gk104_pmu_reload_halted_for_bar1(dev) -> None:
+  """MC-reset the PMU and reload the embedded image without START.
+
+  Night40: after FECS ready, soft CPUCTL HALT never posts CPUSTAT.STOPPED on
+  the live MEMX PMU, so falcon_stop() timed out before MEMIF arm.  Nouveau
+  recovers this class of PMU wedging with gf100_pmu_reset() (PMC_ENABLE[13]).
+  Reload leaves ENTRY at the pad and CPU halted so arm only needs START.
+  Night40h prefers live IMEM patch; this remains the fallback when that
+  readback fails.
+  """
+  code = getattr(dev, "_pmu_code", None)
+  if not code or len(code) < PMU_BAR1_BOOTSTRAP_END:
+    fw = find_kepler_firmware()
+    if not fw:
+      raise RuntimeError("PMU image missing for autonomous BAR1 reload")
+    code = open(os.path.join(fw, "gk104_pmu_code.bin"), "rb").read()
+    if os.environ.get("KEPLER_PMU_ENTER_NOWAIT", "1") != "0":
+      code = _patch_pmu_memx_nowait(code)
+    code = _gk104_pmu_embed_bar1_bootstrap(code)
+    try:
+      setattr(dev, "_pmu_code", bytes(code))
+    except Exception:
+      pass
+  elif code[PMU_BAR1_BOOTSTRAP_IMEM:PMU_BAR1_BOOTSTRAP_END] != \
+      PMU_BAR1_BOOTSTRAP_CODE:
+    code = _gk104_pmu_embed_bar1_bootstrap(code)
+    try:
+      setattr(dev, "_pmu_code", bytes(code))
+    except Exception:
+      pass
+  fw = find_kepler_firmware()
+  if not fw:
+    raise RuntimeError("GK104 firmware tree missing for PMU data reload")
+  pmu_data = open(os.path.join(fw, "gk104_pmu_data.bin"), "rb").read()
+  print("[kepler] PMU MC reset + halted reload for autonomous BAR1", flush=True)
+  falcon_reset(dev, PMU_FALCON_BASE)
+  falcon_load(dev, PMU_FALCON_BASE, code, pmu_data,
+              entry=PMU_BAR1_BOOTSTRAP_IMEM, start=False)
+  try:
+    setattr(dev, "_pmu_memx_data", None)
+  except Exception:
+    pass
+
+
 def _gk104_pmu_dma_prepare(dev, segments):
-  """Validate fixed roots, stop PMU, and enable channel-independent MEMIF."""
+  """Validate fixed roots, halt PMU, and enable channel-independent MEMIF."""
   segments = tuple((int(pa), bytes(blob)) for pa, blob in segments)
   actual = tuple((pa, len(blob)) for pa, blob in segments)
   expected = tuple((ext, size) for _dmem, ext, size in PMU_BAR1_BOOTSTRAP_XFER)
@@ -5696,7 +6043,22 @@ def _gk104_pmu_dma_prepare(dev, segments):
         f"expected={[b.hex() for b in FECS_BAR1_BOOTSTRAP_ROOTS]}")
 
   _gk104_ensure_pmu_memx_ready(dev)
-  falcon_stop(dev, PMU_FALCON_BASE, timeout_ms=1000)
+  # Prefer a cheap soft halt when CPUSTAT.STOPPED posts (fake + idle falcons).
+  # On the live post-FECS MEMX PMU (night40) it never does — try live IMEM
+  # pad patch first (night40h); MC-reload only if that readback fails.
+  try:
+    falcon_stop(dev, PMU_FALCON_BASE, timeout_ms=200)
+  except TimeoutError as err:
+    cpuctl = dev.read32(PMU_FALCON_BASE + FALCON_UC_CTRL) & 0xffffffff
+    cpustat = dev.read32(PMU_FALCON_BASE + 0x128) & 0xffffffff
+    print(f"[kepler] PMU soft-stop missed STOPPED "
+          f"(CPUCTL={cpuctl:#x} CPUSTAT={cpustat:#x}); {err}", flush=True)
+    try:
+      _gk104_pmu_patch_live_imem_pad(dev)
+    except Exception as patch_err:
+      print(f"[kepler] PMU live IMEM pad patch failed ({patch_err}); "
+            f"falling back to MC reset", flush=True)
+      _gk104_pmu_reload_halted_for_bar1(dev)
   # Standard Falcon MEMIF: port0 TYPE=VRAM(4), CTRL ENABLE(4)|
   # IGNORE_ACTIVATION(7).  Night24 read these exact transitions back as
   # PORT 0x110->0x114 and CTRL 0x110->0x190 before a completed store/load.
@@ -5714,10 +6076,121 @@ def _gk104_pmu_dma_prepare(dev, segments):
         f"ctrl={ctrl_actual:#x}")
   print(f"[kepler] PMU local-root constants + MEMIF validated: "
         f"port={port_actual:#x} ctrl={ctrl_actual:#x}", flush=True)
+  # Night40k live: clearing IGNORE left CTRL=0x220 STATUS=0x10012 (one store
+  # pending forever) — channel-less MEMIF *requires* IGNORE_ACTIVATION to
+  # retire transfers (matches Nouveau gm200_flcn_fw_load no-inst path).
+  # Keep ENABLE|IGNORE for both host verify and falcon xdst.
+  # Night40g: stage fixed roots into DMEM while halted; the pad no longer
+  # constructs them (IO XFER path needs the instruction budget).
+  for (dmem, _ext, size), blob in zip(
+      PMU_BAR1_BOOTSTRAP_XFER, FECS_BAR1_BOOTSTRAP_ROOTS):
+    assert len(blob) == size
+    _gk104_pmu_dmem_write(dev, dmem, blob)
+  for (dmem, _ext, size), blob in zip(
+      PMU_BAR1_BOOTSTRAP_XFER, FECS_BAR1_BOOTSTRAP_ROOTS):
+    actual = _gk104_pmu_dmem_read(dev, dmem, size)
+    if actual != blob:
+      raise RuntimeError(
+          f"PMU DMEM root stage mismatch at {dmem:#x}: "
+          f"wanted={blob.hex()} actual={actual.hex()}")
+  print("[kepler] PMU DMEM roots staged for xdst+invalidate bootstrap", flush=True)
+
+
+def _gk104_pmu_memif_wait_idle(dev, timeout_ms=50) -> None:
+  """Wait for PMU XFER queue idle (CTRL pending clear, STATUS busy clear)."""
+  ctrl_reg = PMU_FALCON_BASE + 0x118
+  stat_reg = PMU_FALCON_BASE + 0x120
+  deadline = time.monotonic() + timeout_ms / 1000.0
+  while time.monotonic() < deadline:
+    ctrl = dev.read32(ctrl_reg) & 0xffffffff
+    stat = dev.read32(stat_reg) & 0xffffffff
+    if not (ctrl & 1) and not (stat & 2):
+      return
+    time.sleep(0.0005)
+  raise TimeoutError(
+      f"PMU MEMIF XFER idle timed out: CTRL={dev.read32(ctrl_reg):#x} "
+      f"STATUS={dev.read32(stat_reg):#x}")
+
+
+def _gk104_pmu_memif_xfer(dev, *, local: int, ext_pa: int, size: int,
+                          store: bool) -> None:
+  """Host-originated PMU MEMIF DMA (night24 register path).
+
+  EXT_BASE is PA>>8 with EXT_OFFSET 0 (envytools xfer.rst).  CTRL mode:
+  data load=0, data store=2; size code s where bytes = 4<<s.
+  """
+  if size not in (4, 8, 16, 32, 64, 128, 256):
+    raise ValueError(f"unsupported MEMIF xfer size {size}")
+  # bytes = 4 << code
+  code = size.bit_length() - 3
+  if code < 0 or (4 << code) != size:
+    raise ValueError(f"size {size} is not 4<<code")
+  mode = 2 if store else 0
+  ctrl = (mode << 4) | (code << 8)
+  _gk104_pmu_memif_wait_idle(dev)
+  dev.write32(PMU_FALCON_BASE + 0x110, (ext_pa >> 8) & 0xffffffff)
+  dev.write32(PMU_FALCON_BASE + 0x114, local & 0xffffffff)
+  dev.write32(PMU_FALCON_BASE + 0x11c, 0)
+  dev.write32(PMU_FALCON_BASE + 0x118, ctrl)
+  _gk104_pmu_memif_wait_idle(dev)
+
+
+def _gk104_pmu_memif_verify_roots(dev) -> bool:
+  """Night40k: pre-bit0 host MEMIF store+load of staged roots (ENABLE-only).
+
+  Night24 completed DMA with IGNORE but loadback was ff.  Nouveau's no-inst
+  falcon path sets IGNORE (gm200_flcn_fw_load); we already cleared it in
+  prepare.  Exact loadback here proves whether physical VRAM accepts PMU
+  stores before bit0.
+  """
+  scratch = 0x0dc0
+  ok = True
+  for (dmem, ext, size), blob in zip(
+      PMU_BAR1_BOOTSTRAP_XFER, FECS_BAR1_BOOTSTRAP_ROOTS):
+    assert len(blob) == size
+    _gk104_pmu_memif_xfer(dev, local=dmem, ext_pa=ext, size=size, store=True)
+    _gk104_pmu_dmem_write(dev, scratch, b"\xff" * size)
+    _gk104_pmu_memif_xfer(dev, local=scratch, ext_pa=ext, size=size, store=False)
+    got = _gk104_pmu_dmem_read(dev, scratch, size)
+    match = got == blob
+    print(f"[kepler] PMU MEMIF pre-bit0 {'store+load OK' if match else 'LOADBACK FAIL'} "
+          f"pa={ext:#x} size={size:#x} got={got.hex()}", flush=True)
+    ok = ok and match
+  return ok
+
+
+def _gk104_pmu_imem_read32(dev, addr: int) -> int:
+  """Read one PMU IMEM dword through the host CODE port (explicit index)."""
+  dev.write32(PMU_FALCON_BASE + FALCON_CODE_INDEX, addr & 0x00ffffff)
+  return dev.read32(PMU_FALCON_BASE + FALCON_CODE) & 0xffffffff
+
+
+def _gk104_pmu_dmem_read(dev, addr: int, size: int) -> bytes:
+  """Read PMU DMEM bytes through the host DATA port (explicit index)."""
+  if (addr & 3) or (size & 3) or size <= 0:
+    raise ValueError("PMU DMEM read must be dword-aligned and non-empty")
+  out = bytearray(size)
+  for off in range(0, size, 4):
+    dev.write32(PMU_FALCON_BASE + FALCON_DATA_INDEX, (addr + off) & 0x00ffffff)
+    struct.pack_into("<I", out, off,
+                     dev.read32(PMU_FALCON_BASE + FALCON_DATA) & 0xffffffff)
+  return bytes(out)
+
+
+def _gk104_pmu_dmem_write(dev, addr: int, data) -> None:
+  """Write PMU DMEM bytes through the host DATA port (explicit index)."""
+  data = memoryview(data).cast("B")
+  if (addr & 3) or (len(data) & 3) or not data:
+    raise ValueError("PMU DMEM write must be dword-aligned and non-empty")
+  for off in range(0, len(data), 4):
+    dev.write32(PMU_FALCON_BASE + FALCON_DATA_INDEX,
+                ((addr + off) & 0x00ffffff) | FALCON_IDX_WRITE)
+    dev.write32(PMU_FALCON_BASE + FALCON_DATA,
+                struct.unpack_from("<I", data, off)[0])
 
 
 def _gk104_pmu_arm_autonomous_bootstrap(dev) -> None:
-  """Restart the prepared PMU at its embedded long-delay root routine."""
+  """Start the PMU pad; prove roots+magic, leave it spinning on host GO."""
   code = getattr(dev, "_pmu_code", None)
   if not code or len(code) < PMU_BAR1_BOOTSTRAP_END:
     raise RuntimeError("PMU firmware image missing; cannot arm BAR1 bootstrap")
@@ -5727,32 +6200,68 @@ def _gk104_pmu_arm_autonomous_bootstrap(dev) -> None:
         f"PMU bootstrap not embedded at {PMU_BAR1_BOOTSTRAP_IMEM:#x}: "
         f"wanted={PMU_BAR1_BOOTSTRAP_CODE[:4].hex()} "
         f"actual={embedded[:4].hex()}")
-  dev.write32(PMU_FALCON_BASE + FALCON_UC_CTRL, 0x00000010)
+  imem0 = _gk104_pmu_imem_read32(dev, PMU_BAR1_BOOTSTRAP_IMEM)
+  want0 = struct.unpack_from("<I", PMU_BAR1_BOOTSTRAP_CODE, 0)[0]
+  if imem0 != want0:
+    raise RuntimeError(
+        f"PMU IMEM pad mismatch at {PMU_BAR1_BOOTSTRAP_IMEM:#x}: "
+        f"wanted={want0:#x} actual={imem0:#x}")
+  # Clear stale handshake state before START.
+  _gk104_pmu_dmem_write(dev, PMU_BAR1_BOOTSTRAP_GO_DMEM,
+                        struct.pack("<I", 0))
+  _gk104_pmu_dmem_write(dev, PMU_BAR1_BOOTSTRAP_DELAY_ENTERED_DMEM,
+                        struct.pack("<I", 0))
+  _gk104_pmu_dmem_write(dev, PMU_BAR1_BOOTSTRAP_DONE_DMEM,
+                        struct.pack("<I", 0))
   dev.write32(PMU_FALCON_BASE + 0x10c, 0x00000000)
   dev.write32(PMU_FALCON_BASE + FALCON_UC_ENTRY, PMU_BAR1_BOOTSTRAP_IMEM)
-  dev.write32(PMU_FALCON_BASE + 0xff0, PMU_BAR1_BOOTSTRAP_IMEM)
-  dev.write32(PMU_FALCON_BASE + FALCON_UC_CTRL, FALCON_UC_CTRL_START)
-  cpuctl = dev.read32(PMU_FALCON_BASE + FALCON_UC_CTRL) & 0xffffffff
-  entry = dev.read32(PMU_FALCON_BASE + FALCON_UC_ENTRY) & 0xffffffff
-  pcs = []
-  deadline = time.monotonic() + 0.1
+  falcon_start(dev, PMU_FALCON_BASE)
+  deadline = time.monotonic() + 0.5
+  magic = 0
   while time.monotonic() < deadline:
-    pc = dev.read32(PMU_FALCON_BASE + 0xff0) & 0xffffffff
-    pcs.append(pc)
-    if PMU_BAR1_BOOTSTRAP_DELAY_START <= pc < PMU_BAR1_BOOTSTRAP_DELAY_END:
+    magic = struct.unpack_from(
+        "<I", _gk104_pmu_dmem_read(dev, PMU_BAR1_BOOTSTRAP_MAGIC_DMEM, 4))[0]
+    if magic == PMU_BAR1_BOOTSTRAP_MAGIC:
       break
-    time.sleep(0.0005)
+    time.sleep(0.001)
   else:
+    cpuctl = dev.read32(PMU_FALCON_BASE + FALCON_UC_CTRL) & 0xffffffff
+    cpustat = dev.read32(PMU_FALCON_BASE + 0x128) & 0xffffffff
+    pc = dev.read32(PMU_FALCON_BASE + 0xff0) & 0xffffffff
     raise RuntimeError(
-        f"PMU bootstrap not in delay after ENTRY={PMU_BAR1_BOOTSTRAP_IMEM:#x}: "
-        f"CPUCTL={cpuctl:#x} ENTRY={entry:#x} "
-        f"pcs={[hex(p) for p in pcs[-8:]]}")
+        f"PMU bootstrap did not publish DMEM magic "
+        f"{PMU_BAR1_BOOTSTRAP_MAGIC:#x} at {PMU_BAR1_BOOTSTRAP_MAGIC_DMEM:#x}: "
+        f"got={magic:#x} CPUCTL={cpuctl:#x} CPUSTAT={cpustat:#x} TRACEPC={pc:#x}")
+  actual_roots = tuple(
+      _gk104_pmu_dmem_read(dev, dmem, size)
+      for dmem, _ext, size in PMU_BAR1_BOOTSTRAP_XFER)
+  if actual_roots != FECS_BAR1_BOOTSTRAP_ROOTS:
+    raise RuntimeError(
+        "PMU bootstrap local roots mismatch before GO: "
+        f"actual={[b.hex() for b in actual_roots]} "
+        f"expected={[b.hex() for b in FECS_BAR1_BOOTSTRAP_ROOTS]}")
+  cpuctl = dev.read32(PMU_FALCON_BASE + FALCON_UC_CTRL) & 0xffffffff
+  cpustat = dev.read32(PMU_FALCON_BASE + 0x128) & 0xffffffff
+  pc = dev.read32(PMU_FALCON_BASE + 0xff0) & 0xffffffff
   try:
     setattr(dev, "_pmu_auto_bar1_armed", True)
   except Exception:
     pass
   print(f"[kepler] PMU autonomous BAR1 bootstrap armed at "
-        f"{PMU_BAR1_BOOTSTRAP_IMEM:#x} pc={pc:#x}", flush=True)
+        f"{PMU_BAR1_BOOTSTRAP_IMEM:#x} magic={magic:#x} (waiting for GO) "
+        f"TRACEPC={pc:#x} CPUCTL={cpuctl:#x} CPUSTAT={cpustat:#x}", flush=True)
+
+
+def _gk104_pmu_signal_go(dev) -> None:
+  """Release the autonomous ENTER→XFER→LEAVE pad without racing host MMIO."""
+  _gk104_pmu_dmem_write(dev, PMU_BAR1_BOOTSTRAP_DELAY_ENTERED_DMEM,
+                        struct.pack("<I", 0))
+  _gk104_pmu_dmem_write(dev, PMU_BAR1_BOOTSTRAP_GO_DMEM,
+                        struct.pack("<I", PMU_BAR1_BOOTSTRAP_GO))
+  # Do not read PMU MMIO here: the pad may already have cleared 0x1620[0].
+  # It restores the bit and publishes DONE before host polling resumes.
+  print(f"[kepler] PMU BAR1 bootstrap GO={PMU_BAR1_BOOTSTRAP_GO:#x}; "
+        "awaiting autonomous ENTER/XFER/LEAVE", flush=True)
 
 
 def _gk104_fecs_dmem_write(dev, addr: int, data) -> None:
@@ -5917,15 +6426,23 @@ def _gk104_fecs_arm_autonomous_bootstrap(
 
 
 def _gk104_wait_autonomous_roots(dev) -> int:
-  """Wait for the PMU long-delay+xdst, or its software-fake equivalent."""
+  """Require DONE after the PMU's autonomous ENTER→XFER→LEAVE transaction."""
   transferred = sum(size for _d, _e, size in PMU_BAR1_BOOTSTRAP_XFER)
   if getattr(dev, "_pmu_auto_bar1_applied", False):
     return transferred
-  # Night35 sampled PC=0xb2f, proving the short loop could end before bit0.
-  # The restored 0x10000000 loop was still active at arm on night31; wait 30s
-  # after crossing so it also has ample time to finish at the cold HUB clock.
-  time.sleep(30.0)
-  return transferred
+  # Avoid touching PMU while the short critical section has host MMIO hidden.
+  time.sleep(0.25)
+  deadline = time.monotonic() + 2.0
+  done = 0
+  while time.monotonic() < deadline:
+    done = struct.unpack_from(
+        "<I", _gk104_pmu_dmem_read(dev, PMU_BAR1_BOOTSTRAP_DONE_DMEM, 4))[0]
+    if done == PMU_BAR1_BOOTSTRAP_DONE:
+      print(f"[kepler] PMU autonomous BAR1 roots DONE={done:#x}", flush=True)
+      return transferred
+    time.sleep(0.005)
+  raise TimeoutError(
+      f"PMU autonomous BAR1 roots did not restore/publish DONE: got={done:#x}")
 
 
 def _gk104_pre_bit0_bar1_activate(dev, bar1_ctl: int) -> None:
@@ -5944,19 +6461,161 @@ def _gk104_pre_bit0_bar1_activate(dev, bar1_ctl: int) -> None:
 
 def _gk104_atomic_bar1_bootstrap(
     dev, segments, inst_pa: int) -> None:
-  """Arm channel-independent PMU MEMIF, cross bit0, then store BAR1 roots."""
+  """Cross bit0 and establish the minimal BAR1 VM translation roots."""
   _gk104_require_bar0_live(dev, "before atomic BAR1 bootstrap")
-  _gk104_pmu_dma_prepare(dev, segments)
   bar1_ctl = 0x80000000 | (inst_pa >> 12)
+  segments = tuple((int(pa), bytes(blob)) for pa, blob in segments)
+
+  # Night40s established that clearing 0x1620[0] after MEMX LEAVE is not a
+  # usable steady state: BAR1 changes from bad0fb to all-ones.  Nouveau's
+  # memx.fuc owns the bit strictly inside ENTER/LEAVE.  Night40t further
+  # showed that PMU nv_wr32(PRAMIN) in that scope is not physically visible.
+  # Night40u then proved a standalone ENTER cannot reply because that clear
+  # hides PMU host MMIO.  The embedded Falcon pad therefore owns the entire
+  # ENTER→direct-VRAM XFER→LEAVE transaction and publishes DONE only after
+  # restoring host visibility.  BAR1 enable+flush follows DONE.
+  if os.environ.get("KEPLER_BAR1_DIRECT_PHYS", "1") != "0":
+    _gk104_pmu_dma_prepare(dev, segments)
+    _gk104_pmu_arm_autonomous_bootstrap(dev)
+    _gk104_pmu_signal_go(dev)
+    transferred = _gk104_wait_autonomous_roots(dev)
+    for (dmem, ext, size), (_pa, wanted) in zip(
+        PMU_BAR1_BOOTSTRAP_XFER, segments):
+      got = _gk104_pmu_dmem_read(dev, dmem, size)
+      if got != wanted:
+        raise RuntimeError(
+            f"autonomous PMU physical root loadback failed at {ext:#x}: "
+            f"wanted={wanted.hex()} actual={got.hex()}")
+      print(f"[kepler] PMU physical root loadback OK: "
+            f"pa={ext:#x} size={size:#x}", flush=True)
+    boot0 = _gk104_require_bar0_live(dev, "after autonomous ENTER/XFER/LEAVE")
+    r1620 = dev.read32(0x001620) & 0xffffffff
+    if not (r1620 & 1):
+      raise RuntimeError(
+          f"MEMX LEAVE did not restore framebuffer state: 0x1620={r1620:#x}")
+    _gf100_bar_bar1_init(dev, inst_pa)
+    _gf100_bar_bar1_wait(dev)
+    _gk104_require_bar0_live(dev, "after ENTER-scoped BAR1 enable/flush")
+    try:
+      setattr(dev, "_tinygpu_bar1_ctl", bar1_ctl)
+      setattr(dev, "_pmu_auto_bar1_applied", True)
+    except Exception:
+      pass
+    transferred = sum(len(blob) for _pa, blob in segments)
+    print(f"[kepler] autonomous ENTER/XFER/LEAVE roots DONE and VM armed: "
+          f"bytes={transferred:#x} ctl={bar1_ctl:#x} "
+          f"0x1620={r1620:#x} PMC_BOOT_0={boot0:#x}",
+          flush=True)
+    return
+
+  # Night40m/n: keep the live MEMX PMU (do not steal it with the BAR1 pad).
+  # Fire DELAY then literal PRAMIN WR32 of roots + 0x1704 enable + two
+  # 0x070000 flushes.  Host bit0 during DELAY; no PMU reply after crossing.
+  #
+  # MEMX's memx_func_wr32 uses nv_wr32(addr, data), so its payload is literal.
+  # The XOR compensation used by host PRAMIN is a workaround for the observed
+  # broken/stale host aperture and must not be carried into this Falcon path.
+  if os.environ.get("KEPLER_BAR1_MEMX_POSTBIT0", "1") != "0":
+    _gk104_ensure_pmu_memx_ready(dev)
+    memx_data = getattr(dev, "_pmu_memx_data", None)
+    if memx_data is None:
+      raise RuntimeError("PMU MEMX data base missing for post-bit0 root script")
+    data_base = memx_data[0] if isinstance(memx_data, tuple) else int(memx_data)
+    pairs: list[int] = []
+    literal = os.environ.get("KEPLER_BAR1_MEMX_LITERAL", "1") != "0"
+    window = None
+    for pa, blob in segments:
+      for off in range(0, len(blob), 4):
+        addr = pa + off
+        base = addr & 0xffffff00000
+        if base != window:
+          pairs.extend([0x001700, (base >> 16) & 0xffffffff])
+          window = base
+        wanted = struct.unpack_from("<I", blob, off)[0]
+        pairs.extend([0x700000 + (addr & 0xfffff),
+                      wanted if literal else (0xffffffff ^ wanted) & 0xffffffff])
+    pairs.extend([
+        0x001704, bar1_ctl & 0xffffffff,
+        0x00070000, 1,
+        0x00070000, 1,
+    ])
+    # One WR32 cmd; payload length is pair count (addr/data words).
+    commands = [
+        (PMU_MEMX_DELAY, (100_000_000,)),  # 100 ms — covers host bit0
+        (PMU_MEMX_WR32, tuple(pairs)),
+    ]
+    finish = None
+    if type(dev).__name__ == "_AtomicBar1Dev":
+      # Fake: run DELAY(no-op)+WR32 synchronously so XOR roots land in vram.
+      window = 0
+      for opcode, payload in commands:
+        if opcode == PMU_MEMX_DELAY:
+          continue
+        assert opcode == PMU_MEMX_WR32
+        for i in range(0, len(payload), 2):
+          reg, value = payload[i], payload[i + 1]
+          if reg == 0x1700:
+            window = value << 16
+          elif 0x700000 <= reg < 0x800000:
+            pa = window + reg - 0x700000
+            if literal:
+              struct.pack_into("<I", dev.vram, pa, value)
+            else:
+              cur = struct.unpack_from("<I", dev.vram, pa)[0]
+              struct.pack_into("<I", dev.vram, pa, cur ^ value)
+          else:
+            dev.write32(reg, value)
+      setattr(dev, "_pmu_auto_bar1_applied", True)
+    else:
+      finish = pmu_memx_exec_fire(dev, data_base, commands)
+    encoding = "literal" if literal else "virgin-XOR"
+    print(f"[kepler] PMU MEMX post-bit0 root script fired "
+          f"(DELAY 100ms + {encoding} WR32 roots/enable/flush); finish={finish}",
+          flush=True)
+    _gk104_bit0_unstub(dev)
+    boot0 = _gk104_require_bar0_live(dev, "after MEMX-script BAR1 bit0 crossing")
+    time.sleep(0.25)  # DELAY 100ms + WR32 margin at cold HUB clock
+    try:
+      setattr(dev, "_pmu_memx_data", None)
+      setattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", True)
+      setattr(dev, "_tinygpu_bar1_ctl", bar1_ctl)
+      setattr(dev, "_pmu_auto_bar1_applied", True)
+    except Exception:
+      pass
+    transferred = sum(len(blob) for _pa, blob in segments)
+    print(f"[kepler] post-bit0 MEMX BAR1 roots armed: "
+          f"bytes={transferred:#x} PMC_BOOT_0={boot0:#x}", flush=True)
+    return
+
+  # Legacy falcon-pad path (KEPLER_BAR1_MEMX_POSTBIT0=0).
+  _gk104_pmu_dma_prepare(dev, segments)
+  try:
+    host_roots_ok = _gk104_pmu_memif_verify_roots(dev)
+  except TimeoutError as err:
+    print(f"[kepler] PMU host MEMIF verify hung ({err}); treating as FAIL",
+          flush=True)
+    host_roots_ok = False
+  if host_roots_ok:
+    print("[kepler] PMU host MEMIF roots committed pre-bit0; "
+          "skipping falcon autonomous xdst", flush=True)
+    _gk104_pre_bit0_bar1_activate(dev, bar1_ctl)
+    _gk104_bit0_unstub(dev)
+    boot0 = _gk104_require_bar0_live(dev, "after host-MEMIF BAR1 bit0 crossing")
+    try:
+      setattr(dev, "_pmu_memx_data", None)
+      setattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", True)
+      setattr(dev, "_tinygpu_bar1_ctl", bar1_ctl)
+      setattr(dev, "_pmu_auto_bar1_applied", True)
+    except Exception:
+      pass
+    transferred = sum(size for _d, _e, size in PMU_BAR1_BOOTSTRAP_XFER)
+    print(f"[kepler] post-bit0 host-MEMIF BAR1 roots armed: "
+          f"bytes={transferred:#x} PMC_BOOT_0={boot0:#x}", flush=True)
+    return
+  print("[kepler] PMU host MEMIF pre-bit0 loadback failed; "
+        "falling back to falcon post-bit0 xdst+BAR1 enable", flush=True)
   _gk104_pmu_arm_autonomous_bootstrap(dev)
-  # Unlike ordinary Nouveau, TinyGPU loses the BAR/LTC/VMM host apertures when
-  # bit0 clears.  Activate the controller while host MMIO is still safe.  No
-  # BAR1 lookup occurs yet, so it cannot cache the still-virgin roots; xdwait
-  # completes all three later stores before the first BAR1 read.
-  _gk104_pre_bit0_bar1_activate(dev, bar1_ctl)
-  # Host bit0-only clear makes VRAM real but hides PMU and FECS host MMIO
-  # (night17/night25).  The already-running Falcon finishes its delay and
-  # stores the staged roots with xdst; the host must not touch FECS afterward.
+  _gk104_pmu_signal_go(dev)
   _gk104_bit0_unstub(dev)
   boot0 = _gk104_require_bar0_live(dev, "after staged BAR1 bit0 crossing")
   try:
@@ -5967,8 +6626,6 @@ def _gk104_atomic_bar1_bootstrap(
     pass
   transferred = _gk104_wait_autonomous_roots(dev)
   _gk104_require_bar0_live(dev, "after autonomous PMU root wait")
-  # Do not touch 0x1704/0x070000/0x100cb* here: night38 proved any attempted
-  # post-bit0 host activation collapses BAR0.  Exact BAR1 readback follows.
   print(f"[kepler] post-bit0 PMU autonomous BAR1 roots armed: "
         f"bytes={transferred:#x} PMC_BOOT_0={boot0:#x}", flush=True)
 
@@ -6054,11 +6711,10 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
     bootstrap_inst = bytearray(inst)
     bootstrap_pte = struct.pack(
         "<QQ", (spt_pa >> 8) | 0x1, (inst_pa >> 8) | 0x1)
-    # gf100_vmm_join() consumes only instance +0x200/+0x208.  Stage those
-    # four dwords plus the PDE and two temporary PTEs in FECS xfer_data, arm
-    # the autonomous Falcon xdst routine, then host-clear bit0.  Night25
-    # proved host FECS XFER MMIO dies after bit0, so the Falcon itself must
-    # store the roots once VRAM is live.
+    # gf100_vmm_join() consumes only instance +0x200/+0x208.  Store those four
+    # dwords plus the PDE and two temporary PTEs with direct-VRAM PMU MEMIF
+    # while MEMX ENTER owns framebuffer access, and load them back exactly
+    # before LEAVE.  Only the proven roots are then exposed through BAR1 VM.
     _gk104_atomic_bar1_bootstrap(
         dev, ((inst_pa + 0x200, bootstrap_inst[0x200:0x210]),
               (pgd_pa, pde), (spt_pa, bootstrap_pte)), inst_pa)
@@ -6066,9 +6722,12 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
     actual = dev.dev_impl.hw.mmio_read(1, 0, len(bootstrap_pte))
     if actual != bootstrap_pte:
       raise RuntimeError(
-          f"autonomous-FECS BAR1 control mapping mismatch: "
+          f"verified-PMU BAR1 control mapping mismatch: "
           f"wanted={bootstrap_pte.hex()} actual={actual.hex()}")
-    print("[kepler] BAR1 root mechanism selected: autonomous PMU xdst after bit0",
+    mechanism = ("autonomous PMU ENTER/XFER/LEAVE"
+                 if os.environ.get("KEPLER_BAR1_DIRECT_PHYS", "1") != "0"
+                 else "MEMX DELAY+WR32 after bit0")
+    print(f"[kepler] BAR1 root mechanism selected: {mechanism}",
           flush=True)
 
     # Populate the first SPT page through VA0 while it maps the SPT itself.

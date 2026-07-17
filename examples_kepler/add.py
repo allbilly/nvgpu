@@ -392,12 +392,16 @@ def main():
   offline = any(x in sys.argv for x in (
       "--middle-selftest", "--mmiotrace-selftest",
       "--vbios-info", "--vbios-init-info", "--compare-cubin"))
-  # Live TinyGPU only: post-MEMX bit0 unstub (full 0xaa2 / mid-MEMX bit0
-  # kill BAR0).  Keep offline golden selftests on KEPLER_RAM_BLOCK=0.
+  # Live TinyGPU only: one atomic PMU RAM transition.  Keep offline golden
+  # selftests on KEPLER_RAM_BLOCK=0.
   if not offline:
-    os.environ.setdefault("KEPLER_RAM_BLOCK", "bit0")
+    # Run the complete Nouveau memory transition inside one PMU script.  ENTER
+    # may hide host MMIO transiently; LEAVE restores it before the reply.
+    os.environ.setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")
+    os.environ.setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "1")
+    os.environ.setdefault("KEPLER_RAM_BLOCK", "atomic")
     # Never host-program GDDR5 without MEMX (kills BAR0). Soft PRAMIN live
-    # skips the PRAMIN window poke that collapses BAR0 after bit0 unstub.
+    # skips the destructive PRAMIN window poke until BAR1 bootstrap.
     os.environ.setdefault("KEPLER_RAM_REQUIRE_MEMX", "1")
     os.environ.setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")
     # Refuse GPC-awake+PRAMIN-stub half-POST (dirty) — that path hung USB4 /
@@ -407,7 +411,8 @@ def main():
     os.environ.setdefault("KEPLER_POST_RAM_LTC", "0")
     # Host write to 0x4041f0 after bit0 collapses BAR0 (even no-op).
     os.environ.setdefault("KEPLER_PGRAPH_BLCG", "0")
-    # bit0 before full PGRAPH pack collapses BAR0; defer unstub to first PRAMIN.
+    # Keep ENTER/XFER/LEAVE inside one autonomous PMU routine; standalone
+    # ENTER hides host PMU MMIO before a separate LEAVE can be submitted.
     os.environ.setdefault("KEPLER_RAM_BIT0_DEFER", "1")
     # Full pack is OK *before* bit0 (night13 FECS ready); keep default on.
     os.environ.setdefault("KEPLER_PGRAPH_PACK", "1")
@@ -415,11 +420,14 @@ def main():
     os.environ.setdefault("KEPLER_PRAMIN_LITERAL", "0")
     # Host 0x1700 after bit0 kills BAR0 (night14); store PRAMIN via MEMX WR32.
     os.environ.setdefault("KEPLER_PRAMIN_MEMX", "1")
-    # macOS/TinyGPU only: bit0 hides host PMU *and* FECS MMIO (night17/25).
-    # Stage roots in FECS xfer_data, arm a small IMEM pad routine that issues
-    # xdst after an internal delay, host-clear bit0, then enable BAR1 once
-    # the Falcon has stored the roots.  The shared/Linux entrypoint never
-    # sets this flag.
+    # Retained for the legacy post-bit0 WR32 path; the default uses MEMIF.
+    os.environ.setdefault("KEPLER_BAR1_MEMX_LITERAL", "1")
+    # Store minimal BAR1 roots with PMU xdst inside autonomous ENTER/LEAVE.
+    # The option name is retained for compatibility with night40o-r.
+    os.environ.setdefault("KEPLER_BAR1_DIRECT_PHYS", "1")
+    # macOS/TinyGPU only: the embedded PMU pad owns ENTER→xdst→LEAVE and
+    # publishes DONE after host visibility is restored.  Shared/Linux never
+    # enables this experimental bootstrap.
     os.environ.setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "1")
     # 16 MiB BAR1 covers bit19-safe GR/attrib; keeps MEMX PRAMIN tractable.
     os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")
