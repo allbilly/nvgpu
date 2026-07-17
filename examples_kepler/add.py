@@ -415,10 +415,11 @@ def main():
     os.environ.setdefault("KEPLER_PRAMIN_LITERAL", "0")
     # Host 0x1700 after bit0 kills BAR0 (night14); store PRAMIN via MEMX WR32.
     os.environ.setdefault("KEPLER_PRAMIN_MEMX", "1")
-    # macOS/TinyGPU only: bit0 permanently hides host PMU MMIO (night17).
-    # Stage roots in FECS xfer_data, cross bit0 with the proven host-only
-    # clear, then DMA-store/verify them through FECS while framebuffer storage
-    # is real.  The shared/Linux entrypoint never sets this flag.
+    # macOS/TinyGPU only: bit0 hides host PMU *and* FECS MMIO (night17/25).
+    # Stage roots in FECS xfer_data, arm a small IMEM pad routine that issues
+    # xdst after an internal delay, host-clear bit0, then enable BAR1 once
+    # the Falcon has stored the roots.  The shared/Linux entrypoint never
+    # sets this flag.
     os.environ.setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "1")
     # 16 MiB BAR1 covers bit19-safe GR/attrib; keeps MEMX PRAMIN tractable.
     os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")
