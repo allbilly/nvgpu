@@ -38,8 +38,21 @@ class _MemxBus:
     self._wr32_flushes = 0
     self._wr32_words = 0
     self._require_memx = False
+    self.atomic = os.environ.get("KEPLER_RAM_MEMX_ATOMIC", "0") == "1"
+    self.commands: list[tuple[int, tuple[int, ...]]] = []
+    self.shadow: dict[int, int] = {}
 
   def read32(self, reg: int) -> int:
+    reg &= 0xffffffff
+    if self.atomic and self.memx_on:
+      # Nouveau snapshots register values while constructing one MEMX script.
+      # Preserve queued writes in a software shadow instead of flushing the
+      # transition before its ENTER/LEAVE critical section can surround it.
+      if reg in self.shadow:
+        return self.shadow[reg]
+      value = self.real.read32(reg) & 0xffffffff
+      self.shadow[reg] = value
+      return value
     self.flush()
     return self.real.read32(reg) & 0xffffffff
 
@@ -55,6 +68,8 @@ class _MemxBus:
       return
     if self.memx_on:
       self.pending.append((reg, val))
+      if self.atomic:
+        self.shadow[reg] = val
       if len(self.pending) >= 4:
         self.flush()
       return
@@ -78,6 +93,12 @@ class _MemxBus:
       payload: list[int] = []
       for addr, data in chunk:
         payload.extend([addr, data])
+      if self.atomic:
+        self.commands.append((_MEMX_WR32, tuple(payload)))
+        self._wr32_flushes += 1
+        self._wr32_words += len(payload)
+        i += chunk_n
+        continue
       try:
         # Clear stuck PMU data semaphore before each EXEC.
         try:
@@ -101,9 +122,13 @@ class _MemxBus:
       self._wr32_words += len(payload)
       i += chunk_n
 
-  def start_memx_buffer(self) -> bool:
+  def start_memx_buffer(self, *, preflight: bool = True) -> bool:
     if not self.can_memx:
       return False
+    if self.atomic and not getattr(self.real, "_pmu_memx_nowait", False):
+      raise RuntimeError(
+          "atomic MEMX requires patched ENTER/LEAVE firmware "
+          "(_pmu_memx_nowait is false)")
     # Prove EXEC still works (DELAY) before buffering hundreds of WR32s.
     try:
       self.real.pmu_memx_exec_commands([(_MEMX_DELAY, (1000,))], timeout_s=3.0)
@@ -117,18 +142,43 @@ class _MemxBus:
               flush=True)
       self.can_memx = False
       return False
+    if (self.atomic and preflight and
+        os.environ.get("KEPLER_RAM_ATOMIC_PREFLIGHT", "1") != "0"):
+      # Determine whether framebuffer pause can round-trip at all before a
+      # long RAM program obscures the boundary.  ENTER and LEAVE share one
+      # EXEC, so host MMIO may disappear transiently but must return before
+      # the reply.  A timeout proves the pause mechanism itself is the block.
+      self.real.pmu_memx_exec_commands(
+          [(_MEMX_ENTER, ()), (_MEMX_LEAVE, ())], timeout_s=5.0)
+      print("[nvbios] atomic MEMX ENTER+LEAVE preflight completed", flush=True)
+    self.shadow.clear()
     self.memx_on = True
     self._require_memx = True
     return True
 
-  def stop_memx_buffer(self) -> None:
+  def stop_memx_buffer(self, *, label: str = "script") -> None:
     self.flush()
+    if self.atomic and self.commands:
+      words = sum(1 + len(payload) for _opcode, payload in self.commands)
+      memx_data = getattr(self.real, "_pmu_memx_data", None)
+      capacity = (memx_data[1] if isinstance(memx_data, tuple) else 0)
+      if capacity and words * 4 > capacity:
+        raise RuntimeError(
+            f"atomic MEMX RAM script too large: {words * 4:#x}>{capacity:#x}")
+      self.real.pmu_memx_exec_commands(self.commands, timeout_s=15.0)
+      print(f"[nvbios] atomic MEMX {label} completed: "
+            f"commands={len(self.commands)} bytes={words * 4:#x}", flush=True)
+      self.commands.clear()
+      self.shadow.clear()
     self.memx_on = False
 
   def memx_delay_ns(self, nsec: int) -> bool:
     if not self.memx_on or nsec <= 0:
       return False
     self.flush()
+    if self.atomic:
+      self.commands.append((_MEMX_DELAY, (int(nsec) & 0xffffffff,)))
+      return True
     self.real.pmu_memx_exec_commands([(_MEMX_DELAY, (int(nsec) & 0xffffffff,))])
     return True
 
@@ -138,11 +188,21 @@ class _MemxBus:
     if not self.memx_on:
       return False
     self.flush()
+    payload = (addr & 0xffffffff, mask & 0xffffffff,
+               data & 0xffffffff, int(nsec) & 0xffffffff)
+    if self.atomic:
+      self.commands.append((_MEMX_WAIT, payload))
+      return True
     self.real.pmu_memx_exec_commands([
-        (_MEMX_WAIT, (addr & 0xffffffff, mask & 0xffffffff,
-                      data & 0xffffffff, int(nsec) & 0xffffffff))],
+        (_MEMX_WAIT, payload)],
         timeout_s=max(3.0, nsec / 1e6 + 1.0))
     return True
+
+  def memx_control(self, opcode: int) -> None:
+    if not (self.atomic and self.memx_on):
+      raise RuntimeError("atomic MEMX control requested outside atomic buffer")
+    self.flush()
+    self.commands.append((int(opcode), ()))
 
 
 class NvbiosInit:
@@ -1611,6 +1671,14 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
       ``direct``: full Nouveau host ``0x1620``/``0x26f0`` masks (kills TinyGPU).
     """
     block_mode = os.environ.get("KEPLER_RAM_BLOCK", "0")
+    if block_mode == "atomic":
+      if not getattr(dev, "atomic", False):
+        raise RuntimeError(
+            "KEPLER_RAM_BLOCK=atomic requires KEPLER_RAM_MEMX_ATOMIC=1")
+      dev.memx_control(_MEMX_ENTER)
+      print("[nvbios] queued atomic MEMX ENTER around RAM transition",
+            flush=True)
+      return
     if block_mode == "bit0":
       # Mid-sequence pause while MEMX is live kills BAR0 on this eGPU.
       print("[nvbios] deferring bit0 pause until after MEMX WR32", flush=True)
@@ -1640,14 +1708,19 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
       print("[nvbios] FB pause via patched MEMX ENTER", flush=True)
       return
     if block_mode != "0":
-      print(f"[nvbios] ignoring KEPLER_RAM_BLOCK={block_mode!r}; use bit0, "
-            "enter, 0, or direct", flush=True)
+      print(f"[nvbios] ignoring KEPLER_RAM_BLOCK={block_mode!r}; use atomic, "
+            "bit0, enter, 0, or direct", flush=True)
     print("[nvbios] skipping FB pause (0x1620 unsafe via host and MEMX WR32)",
           flush=True)
 
   def ram_unblock() -> None:
     """End pause window; keep MEMX buffering until ram_program returns."""
     block_mode = os.environ.get("KEPLER_RAM_BLOCK", "0")
+    if block_mode == "atomic":
+      dev.memx_control(_MEMX_LEAVE)
+      print("[nvbios] queued atomic MEMX LEAVE after RAM transition",
+            flush=True)
+      return
     if block_mode == "bit0":
       # Paired with deferred mid-sequence pause; real bit0 runs post-MEMX.
       return
@@ -1735,7 +1808,7 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     for part in range(min(parts, 16)):
       if pmask & (1 << part):
         continue
-      addr = 0x110000 + part * 0x1000
+      addr = 0x110974 + part * 0x1000
       # Nouveau ram_wait → MEMX_WAIT while buffering; else host poll.
       if getattr(dev, "memx_wait", None) and dev.memx_wait(
           addr, 0x0000000f, 0x00000000, 500000):
@@ -1915,15 +1988,18 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     mask(0x132028, 0x00080000, 0x00080000)
     mask(0x132020, 0x00000001, 0x00000001)
     # Nouveau's MEMX program waits for REFPLL_LOCK (0x137390[17]) for at
-    # most 64 ms.  Poll the same condition on the direct host path rather
+    # most 64 us.  Poll the same condition on the direct host path rather
     # than assuming a fixed delay was sufficient.
-    deadline = time.monotonic() + 0.064
-    while not (dev.read32(0x137390) & 0x00020000):
-      if time.monotonic() >= deadline:
-        if os.environ.get("KEPLER_RAM_STRICT_WAIT", "1") != "0":
-          raise TimeoutError("GK104 reference PLL lock timeout (0x137390[17])")
-        break
-      time.sleep(0.00001)
+    refpll_wait_ns = 64_000
+    deadline = time.monotonic() + refpll_wait_ns / 1_000_000_000
+    if not (getattr(dev, "memx_wait", None) and dev.memx_wait(
+        0x137390, 0x00020000, 0x00020000, refpll_wait_ns)):
+      while not (dev.read32(0x137390) & 0x00020000):
+        if time.monotonic() >= deadline:
+          if os.environ.get("KEPLER_RAM_STRICT_WAIT", "1") != "0":
+            raise TimeoutError("GK104 reference PLL lock timeout (0x137390[17])")
+          break
+        time.sleep(0.00001)
     mask(0x132028, 0x00080000, 0)
     if finish:
       finish_refpll()
@@ -1937,9 +2013,9 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   mask(0x10f200, 0x00000800, 0)
   train(0x01020000, 0x000c0000)
   dev.write32(0x10f210, 0)
-  time.sleep(0.000001)
+  delay_ns(1_000)
   dev.write32(0x10f310, 1)
-  time.sleep(0.000001)
+  delay_ns(1_000)
   mask(0x10f200, 0x80000000, 0x80000000)
   dev.write32(0x10f314, 1)
   mask(0x10f200, 0x80000000, 0)
@@ -2106,13 +2182,16 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
       ((old_100770 & 4) != 4)):
     mask(0x100750, 0x00000008, 0x00000008)
     dev.write32(0x100710, 0)
-    deadline = time.monotonic() + 0.2
-    while not (dev.read32(0x100710) & 0x80000000):
-      if time.monotonic() >= deadline:
-        if os.environ.get("KEPLER_RAM_STRICT_WAIT") == "1":
-          raise TimeoutError("GK104 0x100710 transition timeout")
-        break
-      time.sleep(0.00001)
+    transition_wait_ns = 200_000
+    if not (getattr(dev, "memx_wait", None) and dev.memx_wait(
+        0x100710, 0x80000000, 0x80000000, transition_wait_ns)):
+      deadline = time.monotonic() + transition_wait_ns / 1_000_000_000
+      while not (dev.read32(0x100710) & 0x80000000):
+        if time.monotonic() >= deadline:
+          if os.environ.get("KEPLER_RAM_STRICT_WAIT") == "1":
+            raise TimeoutError("GK104 0x100710 transition timeout")
+          break
+        time.sleep(0.00001)
   mask(0x10f250, 0x000003f0, b["timing_20_2c_003f"] << 4)
   t10 = (timing[10] >> 24) & 0x7f
   mask(0x10f24c, 0x7f000000,
@@ -2173,14 +2252,22 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   ram_nuts(0x10f200, 0x18808800,
            0x00000800 if cfg.get("rammap_11_08_01", 0) else 0,
            0x18808800)
-  # The second gk104_ram_prog_0() applies the target entry after execution;
-  # this is the same entry for the validated 648-MHz baseline, but retaining
-  # the write makes the transition explicit for future frequency tests.
-  prog0()
+  # Nouveau executes the target gk104_ram_prog_0() only after ram_exec()
+  # returns.  Keep TinyGPU's host-hostile 0x10f4xx stores on MEMX, but use a
+  # second EXEC so a timeout cannot be mistaken for failure to reach LEAVE.
+  atomic = getattr(dev, "atomic", False)
   if getattr(dev, "memx_on", False) or getattr(dev, "_wr32_flushes", 0):
     print(f"[nvbios] MEMX WR32 totals: {dev._wr32_flushes} execs, "
           f"{dev._wr32_words} words", flush=True)
-  dev.stop_memx_buffer()
+  if atomic:
+    dev.stop_memx_buffer(label="RAM transition")
+    if not dev.start_memx_buffer(preflight=False):
+      raise RuntimeError("PMU MEMX unavailable for post-transition target prog0")
+    prog0()
+    dev.stop_memx_buffer(label="target prog0")
+  else:
+    prog0()
+    dev.stop_memx_buffer()
   # TinyGPU bit0 unstub *after* MEMX: mid-sequence bit0 drops BAR0 once the
   # PMU is active (proven 2026-07-16 replug).  Night5 standalone bit0 still
   # converts PRAMIN stub → virgin without clearing 0xaa2.
