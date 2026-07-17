@@ -2673,14 +2673,20 @@ BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.
   and load completed.  Loadback was sixteen `ff` bytes, proving the engine and
   target selection work but pre-bit0 physical VRAM discards stores just like
   PRAMIN.  Bit0 was not crossed.
-- **Patched for night25:** use the already-running FECS transfer engine after
-  bit0.  GK104 `hub.fuc` reserves DMEM `xfer_data` at `0x200..0x2ff` and uses
-  `MEM_BASE`/`MEM_TARGET=VRAM` plus Falcon transfers for physical channel
-  headers.  Before bit0, the three roots are placed in this reserved buffer
-  and FECS physical target registers are read back.  After bit0 makes VRAM
-  real, FECS store→loads all 40 bytes for exact comparison, then BAR1 is
-  enabled and its first page walk validates the roots.  No channel exists yet,
-  so the firmware cannot concurrently consume `xfer_data`.
+- **Night25 crossed bit0 with FECS-staged roots, then lost FECS host MMIO:**
+  `XFER_CTRL`/`XFER_STATUS` became `0xffffffff` immediately after the proven
+  host bit0-only clear — the same permanent aperture loss already seen on
+  PMU.  Host-triggered Falcon DMA cannot complete the post-bit0 store on
+  either engine.  Card left dirty; no retry.
+- **Night26 ran autonomous FECS but BAR1 stayed virgin `ff`:** roots staged,
+  bootstrap armed, bit0 kept `PMC_BOOT_0` live, then two-PTE readback was
+  `ffffffffffffffff`.  Entry was at `0xc20`, outside the live
+  `gk104_fecs_code.bin` IMEM window (`0xc00`; pad is `0xb0a..0xbff`).
+- **Night27 aborted before bit0:** runtime IMEM store at `0xb20` read back
+  `0xbadf5000` after FECS had already run.  Bit0 was not crossed.
+- **Patched for night28:** embed bootstrap into `_fecs_code` before the
+  initial `falcon_write_imem`; arming is halt→ENTRY=`0xb20`→START→PC-in-pad
+  only (no runtime CODE write).
 - Also avoid: early LTC/ZBC after RAM; BLCG `0x4041f0`; PRAMIN literal `0`
   fallback; dirty GPC-awake+PRAMIN-stub without `ALLOW_DIRTY`.
 - **VRAM bit19 alias**: `KEPLER_VRAM_BIT19_SAFE=1`.
@@ -2715,62 +2721,120 @@ BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.
     a discard stub independent of aperture.  **Patched for night25:** stage in
     FECS `xfer_data`, cross bit0, then FECS-DMA store/load roots while VRAM is
     live, before enabling BAR1.
-
-### Code defaults / guards (macOS live)
-
-| Env | Live default | Why |
-| --- | --- | --- |
-| `KEPLER_RAM_BLOCK` | `bit0` | `[0]`-only clear |
-| `KEPLER_RAM_BIT0_DEFER` | `1` | PGRAPH/FECS before unstub |
-| `KEPLER_PRAMIN_MEMX` | `1` | MEMX WR32; host `0x1700` kills |
-| `KEPLER_TINYGPU_ATOMIC_BAR1` | `1` | macOS only; DMA-store/verify BAR1 roots before bit0 |
-| `KEPLER_PRAMIN_LITERAL` | `0` | XOR-only |
-| `KEPLER_BAR1_MAP_SIZE` | `0x1000000` | 16 MiB covers bit19 layout |
-| `KEPLER_POST_RAM_LTC` | `0` | Skip early LTC/ZBC |
-| `KEPLER_PGRAPH_BLCG` | `0` | Skip `0x4041f0` |
-| `KEPLER_REFUSE_DIRTY` | `1` | Refuse half-POST |
-| `KEPLER_COLD_FLR` | `0` | FLR → residual topo=0 |
-
-The atomic path is enabled only by `examples_kepler/add.py`; the shared/Linux
-entrypoint never defaults `KEPLER_TINYGPU_ATOMIC_BAR1`.  Once BAR1 identity is
-ready, post-bit0 PRAMIN reads/repairs use verified BAR1 dword access.
-
-Offline: `--middle-selftest` passes on macOS/software and
-`--mmiotrace-selftest` is **24/24**.
+13. Night25 staged FECS roots and crossed bit0 with live `PMC_BOOT_0`, then
+    immediately saw FECS `XFER_CTRL/STATUS=0xffffffff`.  Host-triggered Falcon
+    DMA is dead after bit0 on both PMU and FECS.  **Patched for night26:**
+    autonomous FECS path — patch `fecs_bar1_bootstrap` into IMEM pad, arm it
+    (halt→entry→start) before bit0, host-clear bit0, let the Falcon `xdst`
+    the three root fragments, then enable `0x1704` and verify via BAR1.
+14. Night26 ran the autonomous path end-to-end on a true-cold card: FECS ready,
+    roots staged, bootstrap "armed", bit0 kept `PMC_BOOT_0` live, then BAR1
+    read back `ffffffff` (virgin).  Root cause: entry was at `0xc20`, past the
+    live `gk104_fecs_code.bin` IMEM window (`0xc00` bytes; last live byte
+    `0xb09`; zeros `0xb0a..0xbff`).  **Patched for night27:** relocate to
+    `0xb20`, require IMEM patch readback + PC in-pad before bit0, wait 100 ms
+    after bit0 before `0x1704`.
+15. Night27 reached FECS ready and staged roots, then aborted before bit0:
+    runtime IMEM store at `0xb20` read back `0xbadf5000`.  **Patched for
+    night28:** embed the bootstrap into `_fecs_code` before the initial
+    `falcon_write_imem`; arming only halt→ENTRY=`0xb20`→START→PC-in-pad.
+16. Night28 embedded+armed (`pc=0xb28` in delay), bit0 OK, BAR1 still
+    virgin `ff`.  Fixed delay finished and `xdst` ran *before* host bit0
+    (pre-bit0 VRAM discard).  **Patched for night29:** poll `0x1620` via
+    `nv_rd32` until bit0 clears, then `xdst`.
+17. Night29 abort before bit0: PC samples stayed `0x567` under a pad-only
+    check.  Poll spends its time in `nv_rd32` at `0x68`, outside the pad.
+    **Patched for night30:** accept PC in pad *or* `nv_rd32` range; poke
+    `UC_PC` while halted before START.
+18. Night30 true cold reached FECS ready, then TinyGPU `Broken pipe` during
+    LTC sysmem map (before BAR1 arm).  Bit0 not crossed.
+19. Night30b true cold: ENTRY=`0xb20` but after START CPUCTL=`0x20` (SLEEPING)
+    and PC stuck at main `0x567` — `nv_rd32(0x1620)` poll leaves the pad and
+    traps back to main.  **Patched for night31:** long in-pad delay only
+    (`sethi 0x10000000`, no calls; host waits 5s after bit0).  Each of the
+    three root stores is now serialized with its own `xdwait`; assembled code
+    is 80 bytes at `0xb20..0xb70`.  Shared and wrapper middle selftests,
+    software demos, and mmiotrace 24/24 pass.
+20. Night31 true cold: bootstrap started in the local loop (`pc=0xb29`), host
+    crossed bit0 with live `PMC_BOOT_0`, but after the 5-second wait BAR1 was
+    still virgin `ff`.  No channel launch/retry followed.  At the cold
+    FECS/HUB clock, `0x10000000` iterations can exceed the host wait.
+    **Patched for night32:** `0x01000000` iterations and a 10-second host wait;
+    keep the per-transfer `xdwait`s.  Observed START-to-bit0 latency is only
+    about 1.4 ms, so this leaves a wide pre/post-bit0 timing bracket.
+21. Night32 true cold: the shortened loop started at `pc=0xb29`, bit0 crossed
+    cleanly, and the complete 10-second wait still ended with virgin `ff` BAR1
+    roots.  Delay duration is not the blocker.  The remaining ordering bug is
+    that nights26-32 wrote FECS `xfer_data` and `MEM_BASE/MEM_TARGET` while the
+    firmware was running, then called `falcon_stop()` afterward.  **Patched
+    for night33:** halt first; stage and exactly read back every DMEM root while
+    stopped; configure/read back the transfer target; then START at `0xb20`
+    without another stop.  A staging mismatch aborts before bit0.
+22. Night33 true cold: halt-first guard worked and aborted before bit0.  The
+    first two staged instance dwords read back exactly, but the next two were
+    `0xbadf5000`: wanted
+    `0000110000000000ffffff0000000000`, got
+    `00001100000000000050dfba0050dfba`.  The cold FECS DMEM port cannot be
+    trusted to autoincrement across this transfer.  **Patched for night34:**
+    explicitly program `DATA_INDEX` for every staged and read-back dword,
+    retaining halt-first ordering and exact pre-bit0 verification.
+23. Night34 true cold: explicit `DATA_INDEX` still returned `0xbadf5000` for
+    all four instance-root dwords while halted, and the guard again aborted
+    before bit0.  This is post-init FECS host-DMEM aperture loss, not an
+    autoincrement error.  **Patched for night35:** remove host DMEM staging
+    entirely.  The embedded Falcon pad now constructs all ten fixed root
+    dwords locally in `xfer_data`, then performs the three serialized `xdst`s.
+    Host code only validates the fixed root/layout constants and configures
+    `MEM_BASE/MEM_TARGET` after halt.  Bootstrap is 156 bytes at
+    `0xb20..0xbbc`; assembly/Python sync, middle, software, and mmiotrace 24/24
+    pass.
+24. Night35 true cold: Falcon-local root construction ran, but arm reported
+    `pc=0xb2f`—the first instruction *after* the `0xb29..0xb2e` delay loop—
+    before host bit0.  The short loop had already expired, so local stores and
+    `xdst` could reach the pre-bit0 discard stub; BAR1 remained `ff` after the
+    crossing.  **Patched for night36:** restore `0x10000000` iterations,
+    accept only PC in `0xb29..0xb2e` (anything later aborts before bit0), and
+    wait 30 seconds after crossing.  Falcon-local root construction and the
+    per-transfer `xdwait`s remain.
+25. Night36 true cold: arm sampled `pc=0xb29` inside the guarded long delay,
+    bit0 crossed cleanly, and BAR1 was still virgin `ff` after the complete
+    30-second wait.  This rules out both pre-bit0 timing and host-DMEM root
+    staging.  **Patched for night37:** the running Falcon now programs its own
+    `MEM_BASE=0x1000` and `MEM_TARGET=0x80000002` immediately before `xdst`,
+    matching Nouveau `hub.fuc` `ctx_load` ordering instead of relying on target
+    state written through the host aperture before START.
+26. Night37 true cold: Falcon-local target programming also armed in the long
+    loop at `pc=0xb29`; bit0 stayed live, but the two control PTEs were still
+    all `ff` after 30 seconds.  Recomparison with Nouveau found the host path
+    omitted `gf100_bar_bar1_wait()` after enabling `0x1704`.  **Patched for
+    night38:** reproduce the full golden-trace activation order after `xdst`:
+    flush → HUB-only PDB invalidate (`0x100cb8/0x100cbc`) → flush → enable
+    `0x1704` → flush twice.  Do not read the post-bit0-inaccessible status
+    registers; night20 proves trigger writes complete while only reads stall.
+27. Night38 true cold reached the complete post-`xdst` activation sequence,
+    but the first following `PMC_BOOT_0` read took 43 ms and returned `ff`.
+    TinyGPU reported every trigger write as accepted, so RPC completion does
+    not imply the post-bit0 BAR/LTC/VMM block survived.  **Patched for night39:**
+    while Falcon PC is still in the guarded delay and bit0 remains set, enable
+    `0x1704` and complete Nouveau's two readable `0x070000` flushes.  Then clear
+    bit0, let the serialized `xdst`s create the roots, and make BAR1 readback
+    the first page-table lookup; issue no post-bit0 BAR0 writes.
 
 ### Still missing for `hardware_demo=ok N=8`
 
-1. PMU direct-VRAM DMA store/load verifies, then the two-page BAR1 bootstrap reads back
-2. Expand BAR1 identity + channel RAMIN / GPFIFO (bit19-safe layout coded)
-3. Launch + signal → `hardware_demo=ok N=8`
-4. Later: optional LTC/ZBC, fuller GDDR train
+1. Night39 cold run: pre-bit0 BAR1 activation + post-bit0 roots → two-PTE match
+2. Expand BAR1 + channel (coded)
+3. Launch → `hardware_demo=ok N=8`
 
 ### Current hardware state / next step
 
-- The first night23 invocation was safely refused before PMU DMA: boot was
-  already `GPC topology=0x40004` with PRAMIN/DMEM `badf` sentinels.  The trace
-  stops after 22 map/boot-state operations; bit0 was not crossed and no
-  probe/FLR/retry followed.  A cable replug did not remove auxiliary GPU power.
-- After a full power removal, night23b was genuinely cold and reached FECS
-  ready, then stopped on the first DMA store with `CTRL=0x220` and
-  `STATUS=0x10012`.  Bit0 was not crossed.  The card is now dirty from that
-  cold initialization and must be power-cycled again.
-- Night24 was also genuinely cold.  PMU DMA completed but confirmed that
-  pre-bit0 VRAM discards stores; bit0 was not crossed.  The card is dirty from
-  initialization and needs another full power cycle for the FECS experiment.
-- Fully power off the eGPU enclosure, wait for its PSU/GPU LEDs and fans to go
-  dark, then power it back on.  Start a fresh TinyGPU server and run exactly
-  one cold invocation (no probe, no FLR):
+- Night38 ran from a true-cold state, then its post-bit0 activation writes
+  collapsed BAR0 before BAR1 readback.  The card is dirty.  Fully remove
+  enclosure/card power, then start a fresh server and run night39 exactly once
+  with the pre-bit0 Nouveau BAR1 activation:
 
 ```bash
-/Applications/TinyGPU.app/Contents/MacOS/TinyGPU server \
-  "$PWD/logs/tinygpu-night25.sock" &
-APL_REMOTE_SOCK="$PWD/logs/tinygpu-night25.sock" \
-  KEPLER_LIVE_ACK=completion-abort-risk KEPLER_RPC_TRACE=logs/rpc-n8-night25.log \
+/Applications/TinyGPU.app/Contents/MacOS/TinyGPU server /tmp/tinygpu.sock &
+KEPLER_LIVE_ACK=completion-abort-risk KEPLER_RPC_TRACE=logs/rpc-n8-night39.log \
   KEPLER_N=8 KEPLER_COLD_FLR=0 python3 -u examples_kepler/add.py
 ```
-
-Expect: … → FECS ready → **roots staged in FECS xfer_data** → host bit0 →
-**FECS physical-VRAM DMA store/load verified (40 bytes)** → BAR1 enable →
-exact two-PTE readback → expanded/verified BAR1
-identity → channel → `hardware_demo=ok N=8`.

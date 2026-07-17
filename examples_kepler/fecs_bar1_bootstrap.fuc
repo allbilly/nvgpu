@@ -1,45 +1,98 @@
 /* GK104 FECS autonomous BAR1-root bootstrap.
  *
- * Loaded into the unused 0xb20..0xbff padding of Nouveau's 0xc00-byte
- * gk104_grhub image.  FECS is halted (not reset), so its initialized stack,
- * interrupt vector, and firmware state remain intact.  The host starts this
- * entry before clearing 0x1620[0].  A bounded local loop lets the host cross
- * bit0; the Falcon then stores the three root fragments already staged in
- * hub.fuc's xfer_data (DMEM 0x200..), waits for completion, and rejoins the
- * original firmware at main (0x56a).
+ * Embedded into gk104_fecs_code.bin pad 0xb0a..0xbff before falcon_write_imem.
+ *
+ * Night28: short delay (0x100000) finished before host bit0 → xdst hit discard.
+ * Night29/30: polling 0x1620 via nv_rd32 trapped back to main (PC=0x567,
+ * CPUCTL SLEEPING) — START never stayed in the pad.  This revision uses a
+ * long in-pad delay only (no calls) so PC stays local; host must clear bit0
+ * during the wait, then Falcon xdsts into live VRAM.
+ *
+ * Night31: 0x10000000 iterations had not produced roots by the 5-second host
+ * check.  Night32 tried 0x01000000 plus a 10-second host wait.
+ * Night32: the shorter loop plus full 10-second wait still produced virgin
+ * BAR1 roots, ruling out delay duration.  Night33 halts FECS before the host
+ * stages xfer_data and MEM_BASE/MEM_TARGET, then starts this entry directly.
+ * Night33/34: halted host DMEM access returned partial/all 0xbadf5000.  Build
+ * the ten fixed root dwords locally in xfer_data before issuing any xdst.
+ * Night35 armed at PC 0xb2f, already past the short delay, so xdst ran before
+ * bit0.  Restore 0x10000000; host now requires PC 0xb29..0xb2e and waits 30s.
+ * Night36 met that timing guard but roots remained ff.  Program FECS-local
+ * MEM_BASE/MEM_TARGET immediately before xdst, like hub.fuc ctx_load does.
+ * Night37 still produced ff.  Night38's post-bit0 host BAR activation killed
+ * BAR0; night39 pre-activates BAR1 while this routine remains in its delay.
  */
 
 .section #fecs_bar1_bootstrap 0xb20
-.equ main 0x056a
+.equ #main 0x056a
 
 bootstrap:
 	clear b32 $r0
-	/* Roughly milliseconds at the cold GPC clock; host bit0 takes <100 us. */
+	/* 0x10000000 iters: host requires PC still in this loop before bit0. */
 	mov $r1 0
-	sethi $r1 0x00100000
+	sethi $r1 0x10000000
 delay:
 	sub b32 $r1 1
 	bra ne #delay
 
-	/* FECS MEM_BASE/MEM_TARGET were configured by the host. */
 	mov $xdbase $r0
 	mov $xtargets $r0
 
-	/* instance +0x200: DMEM 0x200, 16 bytes, external offset 0x200 */
+	/* Construct the fixed 16-MiB bootstrap roots in local DMEM xfer_data. */
+	movw $r4 0x0200
+	sethi $r4 0
+	movw $r3 0
+	sethi $r3 0x00110000
+	st b32 D[$r4 + 0x00] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x04] $r3
+	movw $r3 0xffff
+	sethi $r3 0x00ff0000
+	st b32 D[$r4 + 0x08] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x0c] $r3
+	st b32 D[$r4 + 0x10] $r3
+	movw $r3 0x1201
+	sethi $r3 0
+	st b32 D[$r4 + 0x14] $r3
+	st b32 D[$r4 + 0x20] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x24] $r3
+	movw $r3 0x1001
+	sethi $r3 0
+	st b32 D[$r4 + 0x28] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x2c] $r3
+
+	/* nv_iowr(0x409a04, 0, 0x1000): physical base = 0x100000. */
+	movw $r0 0x8100
+	sethi $r0 0x00020000
+	movw $r3 0x1000
+	sethi $r3 0
+	iowr I[$r0] $r3
+	clear b32 $r0
+	/* nv_iowr(0x409a20, 0, 0x80000002): direct VRAM target. */
+	movw $r0 0x8800
+	sethi $r0 0x00020000
+	movw $r3 0x0002
+	sethi $r3 0x80000000
+	iowr I[$r0] $r3
+	clear b32 $r0
+
 	movw $r1 0x0200
 	sethi $r1 0x00020000
 	movw $r2 0x0200
 	sethi $r2 0
 	xdst $r2 $r1
+	xdwait
 
-	/* page directory: DMEM 0x210, 8 bytes, external offset 0x10000 */
 	movw $r1 0x0210
 	sethi $r1 0x00010000
 	mov $r2 0
 	sethi $r2 0x00010000
 	xdst $r2 $r1
+	xdwait
 
-	/* first two SPT entries: DMEM 0x220, 16 bytes, offset 0x20000 */
 	movw $r1 0x0220
 	sethi $r1 0x00020000
 	mov $r2 0

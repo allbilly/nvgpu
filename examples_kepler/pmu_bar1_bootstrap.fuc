@@ -1,0 +1,74 @@
+/* GK104 PMU autonomous BAR1-root bootstrap (Falcon v4).
+ *
+ * The standard PMU MEMIF port0 is configured by the host as direct VRAM with
+ * CTRL.ENABLE|IGNORE_ACTIVATION while bit0 is still set.  Unlike FECS
+ * MEM_TARGET, this path has no active-channel dependency (night24 proved the
+ * same port completes store/load requests before bit0, when VRAM discards).
+ *
+ * Embedded in the zero pad at 0xb20..0xbff of gk104_pmu_code.bin.  Host must
+ * observe PC in the long delay, activate BAR1, then clear bit0.  This routine
+ * constructs the fixed roots in local DMEM and xdsts them after the delay.
+ */
+
+.section #pmu_bar1_bootstrap 0xb20
+
+bootstrap:
+	clear b32 $r0
+	mov $xdbase $r0
+	mov $xtargets $r0
+	mov $r1 0
+	sethi $r1 0x10000000
+delay:
+	sub b32 $r1 1
+	bra ne #delay
+
+	/* Local scratch 0xd80: instance root, PDE, and two bootstrap PTEs. */
+	movw $r4 0x0d80
+	sethi $r4 0
+	movw $r3 0
+	sethi $r3 0x00110000
+	st b32 D[$r4 + 0x00] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x04] $r3
+	movw $r3 0xffff
+	sethi $r3 0x00ff0000
+	st b32 D[$r4 + 0x08] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x0c] $r3
+	st b32 D[$r4 + 0x10] $r3
+	movw $r3 0x1201
+	sethi $r3 0
+	st b32 D[$r4 + 0x14] $r3
+	st b32 D[$r4 + 0x20] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x24] $r3
+	movw $r3 0x1001
+	sethi $r3 0
+	st b32 D[$r4 + 0x28] $r3
+	clear b32 $r3
+	st b32 D[$r4 + 0x2c] $r3
+
+	/* PMU MEMIF has no FECS MEM_BASE: use absolute physical offsets. */
+	movw $r1 0x0d80
+	sethi $r1 0x00020000
+	movw $r2 0x0200
+	sethi $r2 0x00100000
+	xdst $r2 $r1
+	xdwait
+
+	movw $r1 0x0d90
+	sethi $r1 0x00010000
+	movw $r2 0x0000
+	sethi $r2 0x00110000
+	xdst $r2 $r1
+	xdwait
+
+	movw $r1 0x0da0
+	sethi $r1 0x00020000
+	movw $r2 0x0000
+	sethi $r2 0x00120000
+	xdst $r2 $r1
+	xdwait
+
+done:
+	bra #done
