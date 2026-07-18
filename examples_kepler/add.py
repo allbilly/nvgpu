@@ -124,11 +124,20 @@ class APLRemotePCIDevice(RemotePCIDevice):
     self._endpoint_freeze_reason = None
     self._final_rpc_budget = None
     self._trace_fd = None
+    self._trace_light = os.environ.get("KEPLER_RPC_LIGHT", "1") != "0"
+    self._trace_mmio_count = 0
+    self._trace_mmio_logged = 0
+    # Light mode keeps PHASE/FREEZE + non-MMIO RPCs; skips per-dword MMIO
+    # BEGIN/END (those were ~2 GiB/run and dominated wall time).
+    self._trace_mmio_sample = int(os.environ.get("KEPLER_RPC_MMIO_SAMPLE", "0") or "0")
     trace_path = os.environ.get("KEPLER_RPC_TRACE")
     if trace_path:
       flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
       if hasattr(os, "O_CLOEXEC"): flags |= os.O_CLOEXEC
       self._trace_fd = os.open(trace_path, flags, 0o600)
+      mode = "light" if self._trace_light else "full"
+      self._trace_record(
+          f"TRACE_MODE mode={mode} mmio_sample={self._trace_mmio_sample}")
     try:
       self.set_phase("connect")
       self._connect(timeout_ms)
@@ -188,7 +197,9 @@ class APLRemotePCIDevice(RemotePCIDevice):
     self._trace_record(
         f"FREEZE monotonic_ns={time.monotonic_ns()} thread={threading.get_ident()} "
         f"phase={self._trace_atom(self._rpc_phase)} "
-        f"reason={self._trace_atom(self._endpoint_freeze_reason)}")
+        f"reason={self._trace_atom(self._endpoint_freeze_reason)} "
+        f"mmio_count={getattr(self, '_trace_mmio_count', 0)} "
+        f"mmio_logged={getattr(self, '_trace_mmio_logged', 0)}")
 
   def _recvall(self, n):
     buf = bytearray(n)
@@ -237,14 +248,25 @@ class APLRemotePCIDevice(RemotePCIDevice):
           f"bar={bar} offset={offset} size={size} config_offset={config_offset} "
           f"args={self._trace_atom(repr(tuple(args)))} "
           f"readout={readout} payload_len={len(payload)} payload_sha256={payload_hash}")
-      self._trace_record(f"BEGIN {common}")
+      is_mmio = cmd_id in (int(RemoteCmd.MMIO_READ), int(RemoteCmd.MMIO_WRITE))
+      log_rpc = True
+      if is_mmio:
+        self._trace_mmio_count = getattr(self, "_trace_mmio_count", 0) + 1
+        if getattr(self, "_trace_light", False):
+          sample = getattr(self, "_trace_mmio_sample", 0)
+          log_rpc = bool(sample and (self._trace_mmio_count % sample) == 0)
+          if log_rpc:
+            self._trace_mmio_logged = getattr(self, "_trace_mmio_logged", 0) + 1
+      if log_rpc:
+        self._trace_record(f"BEGIN {common}")
       try:
         self._sock.sendall(struct.pack("<BIIQQQ", cmd_id, self.dev_id, bar,
                                        *padded_args) + payload)
         if payload:  # writes: server sends no response (matches examples/add.py)
-          self._trace_record(
-              f"END {common} status=ok bytes={len(payload)} "
-              f"duration_us={(time.monotonic_ns() - start_ns) // 1000}")
+          if log_rpc:
+            self._trace_record(
+                f"END {common} status=ok bytes={len(payload)} "
+                f"duration_us={(time.monotonic_ns() - start_ns) // 1000}")
           return None
         if has_fd:
           msg, anc, _, _ = self._sock.recvmsg(17, socket.CMSG_LEN(4))
@@ -256,11 +278,13 @@ class APLRemotePCIDevice(RemotePCIDevice):
           err = self._recvall(value1).decode('utf-8') if value1 > 0 else 'unknown error'
           raise RuntimeError(f"TinyGPU RPC cmd={cmd_id} bar={bar} args={args} failed: {err}")
         data = self._recvall(readout) if readout else b""
-        self._trace_record(
-            f"END {common} status=ok bytes={len(data)} "
-            f"duration_us={(time.monotonic_ns() - start_ns) // 1000}")
+        if log_rpc:
+          self._trace_record(
+              f"END {common} status=ok bytes={len(data)} "
+              f"duration_us={(time.monotonic_ns() - start_ns) // 1000}")
         return value1, value2, data, fd
       except BaseException as exc:
+        # Always record exceptions even in light mode.
         self._trace_record(
             f"END {common} status=exception "
             f"exception={self._trace_atom(type(exc).__name__ + ':' + str(exc))} "
@@ -828,7 +852,6 @@ def main():
   # register and then programs the wrong M0205/M0209 training tables; pin the
   # known strap unless the caller overrides it.
   os.environ.setdefault("KEPLER_RAMCFG_STRAP", "6")
-  os.environ.setdefault("KEPLER_PMU_MEMX", "1")
   os.environ.setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")
   os.environ.setdefault("KEPLER_RAM_MEMX_WR", "1")
   if "--probe" in sys.argv:
@@ -847,54 +870,42 @@ def main():
   offline = any(x in sys.argv for x in (
       "--middle-selftest", "--mmiotrace-selftest",
       "--vbios-info", "--vbios-init-info", "--compare-cubin"))
-  # Live TinyGPU only: one atomic PMU RAM transition.  Keep offline golden
-  # selftests on KEPLER_RAM_BLOCK=0.
+  # Live TinyGPU: proven classic BAR1 + literal PRAMIN (Night41ay/bc).
+  # Keep offline golden selftests on KEPLER_RAM_BLOCK=0.
   if not offline:
-    # Run the complete Nouveau memory transition inside one PMU script.  ENTER
-    # may hide host MMIO transiently; LEAVE restores it before the reply.
-    os.environ.setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")
-    # Night40ah: stock memx.fuc waits on FB_PAUSE during atomic ram_program.
-    # Early PMU still loads with ENTER_NOWAIT; add.py reloads waits before RAM.
-    # Skip ENTER+LEAVE preflight under stock wait (can hang before MC train).
+    # Proven path: classic BAR1 + literal PRAMIN after POST.  Old atomic MEMX
+    # defaults got FECS-ready then NaN on the first cold launch.
+    os.environ.setdefault("KEPLER_POST_BEFORE_PMC", "1")
+    os.environ.setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "0")
+    os.environ.setdefault("KEPLER_PRAMIN_MEMX", "0")
+    os.environ.setdefault("KEPLER_PRAMIN_LITERAL", "1")
+    os.environ.setdefault("KEPLER_PRAMIN_LITERAL_FIRST", "1")
+    os.environ.setdefault("KEPLER_RAM_BIT0_DEFER", "0")
+    os.environ.setdefault("KEPLER_PMU_MEMX", "0")
+    os.environ.setdefault("KEPLER_RAM_PROGRAM", "0")
+    os.environ.setdefault("KEPLER_USERD_ALIAS", "0")
+    os.environ.setdefault("KEPLER_RAM_MEMX_ATOMIC", "0")
     os.environ.setdefault("KEPLER_RAM_ENTER_WAIT", "1")
     os.environ.setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "0")
-    os.environ.setdefault("KEPLER_RAM_BLOCK", "atomic")
-    # Never host-program GDDR5 without MEMX (kills BAR0). Soft PRAMIN live
-    # skips the destructive PRAMIN window poke until BAR1 bootstrap.
-    os.environ.setdefault("KEPLER_RAM_REQUIRE_MEMX", "1")
+    os.environ.setdefault("KEPLER_RAM_BLOCK", "0")
+    os.environ.setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")
     os.environ.setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")
-    # Refuse GPC-awake+PRAMIN-stub half-POST (dirty) — that path hung USB4 /
-    # WindowServer.  Enclosure power-cycle required; KEPLER_ALLOW_DIRTY=1 opts in.
+    # Refuse GPC-awake+PRAMIN-stub half-POST (dirty) — hung USB4 /
+    # WindowServer.  Auto warm-continue sets ALLOW_DIRTY for pass 2.
     os.environ.setdefault("KEPLER_REFUSE_DIRTY", "1")
-    # Night10: post-MEMX bit0 then LTC/ZBC (0x100c80/0x17ea*) collapsed TinyGPU BAR0.
-    # Night40aj: with KEPLER_RAM_BIT0_DEFER=1, run Nouveau post-RAM fb_init_page
-    # + LTC/ZBC in golden order *before* bit0.
     os.environ.setdefault("KEPLER_POST_RAM_LTC", "1")
-    # Host write to 0x4041f0 after bit0 collapses BAR0 (even no-op).
     os.environ.setdefault("KEPLER_PGRAPH_BLCG", "0")
-    # Keep ENTER/XFER/LEAVE inside one autonomous PMU routine; standalone
-    # ENTER hides host PMU MMIO before a separate LEAVE can be submitted.
-    os.environ.setdefault("KEPLER_RAM_BIT0_DEFER", "1")
-    # Full pack is OK *before* bit0 (night13 FECS ready); keep default on.
     os.environ.setdefault("KEPLER_PGRAPH_PACK", "1")
-    # Literal PRAMIN 0 on XOR virgin cannot stick and hung TinyGPU (night13).
-    os.environ.setdefault("KEPLER_PRAMIN_LITERAL", "0")
-    # Host 0x1700 after bit0 kills BAR0 (night14); store PRAMIN via MEMX WR32.
-    os.environ.setdefault("KEPLER_PRAMIN_MEMX", "1")
-    # Retained for the legacy post-bit0 WR32 path; the default uses MEMIF.
     os.environ.setdefault("KEPLER_BAR1_MEMX_LITERAL", "1")
-    # Store minimal BAR1 roots with PMU xdst inside autonomous ENTER/LEAVE.
-    # The option name is retained for compatibility with night40o-r.
     os.environ.setdefault("KEPLER_BAR1_DIRECT_PHYS", "1")
-    # macOS/TinyGPU only: the embedded PMU pad owns ENTER→xdst→LEAVE and
-    # publishes DONE after host visibility is restored.  Shared/Linux never
-    # enables this experimental bootstrap.
-    os.environ.setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "1")
-    # 16 MiB BAR1 covers bit19-safe GR/attrib; keeps MEMX PRAMIN tractable.
     os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")
-    # Default all-MEMX (host-then-MEMX timed out on cold); opt-in host prog0.
     os.environ.setdefault("KEPLER_RAM_HOST_PROG0", "0")
-    # Experimental early bit0 path: skip RAMMAP unless continuing into MEMX.
+    # Cold first launch often NaNs while FECS is ready; one in-process warm
+    # reopen finishes add (Night41bc). Opt out with =0.
+    os.environ.setdefault("KEPLER_AUTO_WARM_CONTINUE", "1")
+    # Default light RPC: PHASE/FREEZE + non-MMIO only (full MMIO was ~2GiB/run).
+    # Set KEPLER_RPC_LIGHT=0 for the old full flight recorder.
+    os.environ.setdefault("KEPLER_RPC_LIGHT", "1")
     if os.environ.get("KEPLER_RAM_PROGRAM") == "bit0-only":
       if os.environ.get("KEPLER_RAM_AFTER_BIT0") != "memx":
         os.environ.setdefault("KEPLER_RAM_INIT", "0")

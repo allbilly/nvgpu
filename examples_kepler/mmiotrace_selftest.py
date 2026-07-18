@@ -765,51 +765,41 @@ def test_11_intentional_divergences_are_explicit() -> None:
 
 
 def test_12_macos_replug_preflight() -> None:
-  """macOS TinyGPU wrapper must pin golden strap/MEMX and allow this gate offline."""
+  """macOS TinyGPU wrapper pins proven classic+literal defaults (Night41ay/bc)."""
   src = MACOS_WRAPPER.read_text(encoding="utf-8")
   assert 'setdefault("KEPLER_RAMCFG_STRAP", "6")' in src, \
       "macOS wrapper must default KEPLER_RAMCFG_STRAP=6 for Palit golden"
-  assert 'setdefault("KEPLER_PMU_MEMX", "1")' in src, \
-      "macOS wrapper must default KEPLER_PMU_MEMX=1 (MEMX WR32 path)"
   assert 'setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")' in src, \
-      "macOS wrapper must default KEPLER_PMU_ENTER_NOWAIT=1 (patch FB_PAUSE hang)"
-  assert 'setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")' in src
-  assert 'setdefault("KEPLER_RAM_ENTER_WAIT", "1")' in src, \
-      "macOS live path must restore Nouveau FB_PAUSE wait for ram_program"
-  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "0")' in src, \
-      "macOS live path must skip ENTER+LEAVE preflight under stock wait"
-  assert 'setdefault("KEPLER_RAM_BLOCK", "atomic")' in src, \
-      "macOS live path must keep ENTER/program/LEAVE in one PMU script"
-  assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in src, \
-      "macOS offline path must default KEPLER_RAM_BLOCK=0 (golden mmiotrace)"
-  assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in src, \
-      "macOS wrapper must default KEPLER_RAM_MEMX_WR=1"
-  assert 'setdefault("KEPLER_RAM_REQUIRE_MEMX", "1")' in src, \
-      "macOS live path must refuse host GDDR5 without MEMX"
-  assert 'setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")' in src, \
-      "macOS live path must soft-accept virgin PRAMIN (no writeback probe)"
-  assert 'setdefault("KEPLER_REFUSE_DIRTY", "1")' in src, \
-      "macOS live path must refuse GPC-awake+PRAMIN-stub without power cycle"
-  assert 'setdefault("KEPLER_POST_RAM_LTC", "1")' in src, \
-      "macOS live path must run Nouveau fb_init_page/LTC before deferred bit0"
-  assert 'setdefault("KEPLER_PGRAPH_BLCG", "0")' in src, \
-      "macOS live path must skip PGRAPH BLCG writes after bit0 (kills BAR0)"
-  assert 'setdefault("KEPLER_RAM_BIT0_DEFER", "1")' in src, \
-      "macOS live path must defer bit0 until first PRAMIN (pack before bit0)"
-  assert 'setdefault("KEPLER_PRAMIN_LITERAL", "0")' in src, \
-      "macOS live path must skip PRAMIN literal fallback on XOR virgin"
-  assert 'setdefault("KEPLER_PRAMIN_MEMX", "1")' in src, \
-      "macOS live path must PRAMIN-store via MEMX after bit0 (host 0x1700 kills)"
-  assert 'setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "1")' in src, \
-      "macOS live path must opt into pre-bit0 BAR1 root staging"
-  assert 'setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")' in src, \
-      "macOS offline path must allow host ram_program for golden mmiotrace"
+      "macOS wrapper must default KEPLER_PMU_ENTER_NOWAIT=1"
+  assert 'setdefault("KEPLER_POST_BEFORE_PMC", "1")' in src
+  assert 'setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "0")' in src, \
+      "macOS live path must default classic BAR1 (not atomic MEMX pad)"
+  assert 'setdefault("KEPLER_PRAMIN_MEMX", "0")' in src
+  assert 'setdefault("KEPLER_PRAMIN_LITERAL", "1")' in src
+  assert 'setdefault("KEPLER_PRAMIN_LITERAL_FIRST", "1")' in src
+  assert 'setdefault("KEPLER_RAM_BIT0_DEFER", "0")' in src
+  assert 'setdefault("KEPLER_PMU_MEMX", "0")' in src
+  assert 'setdefault("KEPLER_RAM_PROGRAM", "0")' in src
+  assert 'setdefault("KEPLER_USERD_ALIAS", "0")' in src
+  assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in src
+  assert 'setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")' in src
+  assert 'setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")' in src
+  assert 'setdefault("KEPLER_REFUSE_DIRTY", "1")' in src
+  assert 'setdefault("KEPLER_PGRAPH_BLCG", "0")' in src
+  assert 'setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")' in src
+  assert 'setdefault("KEPLER_AUTO_WARM_CONTINUE", "1")' in src, \
+      "macOS live path must auto warm-continue after cold NaN demo"
+  assert 'setdefault("KEPLER_RPC_LIGHT", "1")' in src, \
+      "macOS live path must default light RPC (skip per-MMIO flight log)"
+  assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in src
   assert "--mmiotrace-selftest" in src, \
       "macOS wrapper must treat --mmiotrace-selftest as an offline flag"
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
   pcie_src = pcie.read_text(encoding="utf-8")
   assert 'setdefault("KEPLER_TINYGPU_ATOMIC_BAR1"' not in pcie_src, \
       "shared/Linux entrypoint must not enable TinyGPU BAR1 root staging"
+  assert "KEPLER_AUTO_WARM_CONTINUE" in pcie_src, \
+      "shared launcher must implement in-process warm-continue"
   assert "_gk104_post_ram_fb_ltc" in pcie_src, \
       "live cold path must call shared _gk104_post_ram_fb_ltc"
 
@@ -847,26 +837,28 @@ def test_13_live_source_cold_order() -> None:
 
 
 def test_14_oneshot_env_defaults() -> None:
-  """Defaults required for first-shot cold Palit bring-up after replug."""
+  """Defaults required for one-command cold→ok after replug (Night41bc)."""
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
   src = pcie.read_text(encoding="utf-8")
   assert 'os.environ.get("KEPLER_RAM_PROGRAM", "0")' in src, \
       "cold default must preserve the trained gk104_ram_init state"
   assert 'os.environ.get("KEPLER_RAM_FREQ", "648")' in src
   assert 'get("KEPLER_RAM_INIT", "1")' in src
+  assert "KEPLER_AUTO_WARM_CONTINUE" in src
+  assert "auto warm-continue once" in src
   mac = MACOS_WRAPPER.read_text(encoding="utf-8")
   assert 'setdefault("KEPLER_RAMCFG_STRAP", "6")' in mac
-  assert 'setdefault("KEPLER_PMU_MEMX", "1")' in mac
   assert 'setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")' in mac
-  assert 'setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")' in mac
-  assert 'setdefault("KEPLER_RAM_ENTER_WAIT", "1")' in mac
-  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "0")' in mac
-  assert 'setdefault("KEPLER_RAM_BLOCK", "atomic")' in mac
-  assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in mac
+  assert 'setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "0")' in mac
+  assert 'setdefault("KEPLER_PRAMIN_LITERAL", "1")' in mac
+  assert 'setdefault("KEPLER_PRAMIN_LITERAL_FIRST", "1")' in mac
+  assert 'setdefault("KEPLER_PMU_MEMX", "0")' in mac
+  assert 'setdefault("KEPLER_RAM_PROGRAM", "0")' in mac
+  assert 'setdefault("KEPLER_AUTO_WARM_CONTINUE", "1")' in mac
   assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in mac
-  assert 'setdefault("KEPLER_RAM_REQUIRE_MEMX", "1")' in mac
-  assert 'setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")' in mac
+  assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in mac
   assert 'setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")' in mac
+  assert 'setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")' in mac
 
 
 def test_15_full_cold_orchestrator_exact(
