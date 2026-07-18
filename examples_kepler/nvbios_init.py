@@ -19,6 +19,17 @@ _MEMX_WAIT = 4
 _MEMX_DELAY = 5
 
 
+class NvbiosI2CError(RuntimeError):
+  """Protocol/bus absence error with the errno Nouveau returns to NVINIT."""
+  def __init__(self, message: str, errno: int = 5):
+    super().__init__(message)
+    self.errno = int(errno)
+
+  @property
+  def u8(self) -> int:
+    return (-self.errno) & 0xff
+
+
 class _MemxBus:
   """Optional write buffer that flushes controller stores through PMU MEMX WR32.
 
@@ -122,13 +133,22 @@ class _MemxBus:
       self._wr32_words += len(payload)
       i += chunk_n
 
+  def _enter_wait_allowed(self) -> bool:
+    """True when stock MEMX ENTER/LEAVE FB_PAUSE spins are intentional.
+
+    Default atomic path still requires ``_pmu_memx_nowait`` (TinyGPU hang).
+    ``KEPLER_RAM_ENTER_WAIT=1`` opts into Nouveau's wait (night40ah).
+    """
+    return os.environ.get("KEPLER_RAM_ENTER_WAIT", "0") != "0"
+
   def start_memx_buffer(self, *, preflight: bool = True) -> bool:
     if not self.can_memx:
       return False
-    if self.atomic and not getattr(self.real, "_pmu_memx_nowait", False):
+    nowait = getattr(self.real, "_pmu_memx_nowait", False)
+    if self.atomic and not nowait and not self._enter_wait_allowed():
       raise RuntimeError(
           "atomic MEMX requires patched ENTER/LEAVE firmware "
-          "(_pmu_memx_nowait is false)")
+          "(_pmu_memx_nowait is false) or KEPLER_RAM_ENTER_WAIT=1")
     # Prove EXEC still works (DELAY) before buffering hundreds of WR32s.
     try:
       self.real.pmu_memx_exec_commands([(_MEMX_DELAY, (1000,))], timeout_s=3.0)
@@ -148,8 +168,10 @@ class _MemxBus:
       # long RAM program obscures the boundary.  ENTER and LEAVE share one
       # EXEC, so host MMIO may disappear transiently but must return before
       # the reply.  A timeout proves the pause mechanism itself is the block.
+      # Under stock wait, give the PMU longer than the nowait 5s path.
+      _pf_t = 30.0 if (not nowait and self._enter_wait_allowed()) else 5.0
       self.real.pmu_memx_exec_commands(
-          [(_MEMX_ENTER, ()), (_MEMX_LEAVE, ())], timeout_s=5.0)
+          [(_MEMX_ENTER, ()), (_MEMX_LEAVE, ())], timeout_s=_pf_t)
       print("[nvbios] atomic MEMX ENTER+LEAVE preflight completed", flush=True)
     self.shadow.clear()
     self.memx_on = True
@@ -165,7 +187,10 @@ class _MemxBus:
       if capacity and words * 4 > capacity:
         raise RuntimeError(
             f"atomic MEMX RAM script too large: {words * 4:#x}>{capacity:#x}")
-      self.real.pmu_memx_exec_commands(self.commands, timeout_s=15.0)
+      nowait = getattr(self.real, "_pmu_memx_nowait", False)
+      # Stock ENTER waits forever on FB_PAUSE; host must bound the RPC.
+      _exec_t = 60.0 if (not nowait and self._enter_wait_allowed()) else 15.0
+      self.real.pmu_memx_exec_commands(self.commands, timeout_s=_exec_t)
       print(f"[nvbios] atomic MEMX {label} completed: "
             f"commands={len(self.commands)} bytes={words * 4:#x}", flush=True)
       self.commands.clear()
@@ -230,6 +255,7 @@ class NvbiosInit:
 
     # cache for ramcfg
     self._ramcfg_value = None
+    self._i2c_inited: set[int] = set()
 
   # --------------------------------------------------------------------------
   # BIT table helpers
@@ -314,9 +340,7 @@ class NvbiosInit:
     try:
       return self.dev.read32(reg)
     except Exception as e:
-      if self.debug:
-        print(f"  [nvbios] read32({reg:#010x}) failed: {e}")
-      return 0
+      raise RuntimeError(f"NVINIT read32({reg:#010x}) failed: {e}") from e
 
   def _reg_wr32(self, reg: int, val: int) -> None:
     reg = self._nvreg(reg)
@@ -327,8 +351,8 @@ class NvbiosInit:
       if self.debug:
         print(f"  [nvbios] WR {reg:#010x} = {val:#010x}")
     except Exception as e:
-      if self.debug:
-        print(f"  [nvbios] write32({reg:#010x}, {val:#010x}) failed: {e}")
+      raise RuntimeError(
+          f"NVINIT write32({reg:#010x}, {val:#010x}) failed: {e}") from e
 
   def _reg_mask(self, reg: int, mask: int, val: int) -> int:
     """init_mask: (r & ~mask) | val."""
@@ -336,28 +360,256 @@ class NvbiosInit:
     if not self.init_exec():
       return 0
     try:
-      old = self.dev.read32(reg)
-      new = (old & ~mask) | (val & mask)
+      old = self.dev.read32(reg) & 0xffffffff
+      mask &= 0xffffffff
+      val &= 0xffffffff
+      # Nouveau deliberately does not clip val to mask.  INIT_OR_REG passes
+      # mask=0 and relies on this to OR its payload into the existing value.
+      new = ((old & (~mask & 0xffffffff)) | val) & 0xffffffff
       self.dev.write32(reg, new)
       if self.debug:
         print(f"  [nvbios] MASK {reg:#010x} & ~{mask:#010x} | {val:#010x} = {new:#010x}")
       return old
     except Exception as e:
-      if self.debug:
-        print(f"  [nvbios] mask({reg:#010x}) failed: {e}")
-      return 0
+      raise RuntimeError(f"NVINIT mask({reg:#010x}) failed: {e}") from e
 
   def _vgai_rd(self, port: int, index: int) -> int:
-    """VGA indexed I/O (CRTC/SEQ) - not available on this platform, return 0."""
-    return 0
+    """Read one Nouveau VGA indexed register through the BAR0 VGA window."""
+    if port not in (0x03c4, 0x03ce, 0x03d4) or not self.init_exec():
+      return 0
+    self._port_wr(port, index)
+    value = self._port_rd(port + 1)
+    if os.environ.get("KEPLER_VBIOS_IO_TRACE", "0") == "1":
+      print(f"[nvbios] VGA RD port={port:#06x} index={index:#04x} "
+            f"value={value:#04x}", flush=True)
+    return value
 
   def _vgai_wr(self, port: int, index: int, val: int) -> None:
-    pass
+    if port not in (0x03c4, 0x03ce, 0x03d4) or not self.init_exec():
+      return
+    self._port_wr(port, index)
+    self._port_wr(port + 1, val)
+    if os.environ.get("KEPLER_VBIOS_IO_TRACE", "0") == "1":
+      print(f"[nvbios] VGA WR port={port:#06x} index={index:#04x} "
+            f"value={val & 0xff:#04x}", flush=True)
+
+  def unlock_vga_crtc(self) -> None:
+    """Match ``nvkm_devinit_preinit()`` for NV50-and-newer boards.
+
+    Nouveau unlocks extended CRTC registers before it evaluates any NVINIT
+    condition.  GK104 uses CR3f=0x57 (pre-NV50 chips use CR1f instead).
+    """
+    self._vgai_wr(0x03d4, 0x3f, 0x57)
+
+  def option_rom_vga_enable_prefix(self) -> None:
+    """Replay the reachable legacy-ROM VGA-enable prefix before NVINIT.
+
+    The Palit GK104 x86 image enters this VGA-only sequence through
+    ``0x0050 -> 0x2caa -> 0x657e -> 0x67ae``.  It enables VGA decode through
+    ports 0x3c3/0x3c2, performs the two readbacks in that exact order, and
+    then unlocks the extended CRTC registers.  Later reachable ROM code also
+    uses the device's native PCI I/O BAR; that separate prefix is deliberately
+    not represented here.  The real transport exposes these VGA ports through
+    NVIDIA's BAR0 alias at 0x601000 + port.
+    """
+    self._port_wr(0x03c3, 0x01)
+    self._port_rd(0x03c3)
+    self._port_wr(0x03c2, 0x01)
+    self._port_rd(0x03c3)
+    self.unlock_vga_crtc()
 
   def _port_rd(self, port: int) -> int:
-    return 0
+    if not self.init_exec():
+      return 0
+    reg = 0x601000 + (port & 0xffff)
+    try:
+      if hasattr(self.dev, "read8"):
+        return self.dev.read8(reg) & 0xff
+      # Offline fakes generally expose only dword MMIO.  Real transports use
+      # read8 above because VGA index/data ports have access side effects.
+      word = self.dev.read32(reg & ~3)
+      return (word >> ((reg & 3) * 8)) & 0xff
+    except Exception as e:
+      raise RuntimeError(f"NVINIT rdport({port:#06x}) failed: {e}") from e
+
   def _port_wr(self, port: int, val: int) -> None:
-    pass
+    if not self.init_exec():
+      return
+    reg = 0x601000 + (port & 0xffff)
+    val &= 0xff
+    try:
+      if hasattr(self.dev, "write8"):
+        self.dev.write8(reg, val)
+        return
+      # Test-only compatibility for dword-backed fake MMIO.
+      aligned = reg & ~3
+      shift = (reg & 3) * 8
+      old = self.dev.read32(aligned)
+      self.dev.write32(aligned, (old & ~(0xff << shift)) | (val << shift))
+    except Exception as e:
+      raise RuntimeError(
+          f"NVINIT wrport({port:#06x}, {val:#04x}) failed: {e}") from e
+
+  # ------------------------------------------------------------------------
+  # GK104 DCB I2C (Nouveau gf119_i2c_bus + internal bit transfer)
+  # ------------------------------------------------------------------------
+  def _i2c_bus_reg(self, index: int) -> int:
+    """Resolve an NVINIT I2C index to the GK104 GF119-style bus register."""
+    dcb = self.rd16(0x36)
+    if not dcb or dcb + 6 > len(self.image):
+      raise NvbiosI2CError("NVINIT I2C: DCB table missing", errno=19)
+    table = self.rd16(dcb + 4)
+    if not table or table + 5 > len(self.image):
+      raise NvbiosI2CError("NVINIT I2C: DCB I2C table missing", errno=19)
+    ver = self.rd08(table)
+    hdr = self.rd08(table + 1)
+    count = self.rd08(table + 2)
+    length = self.rd08(table + 3)
+    if ver < 0x30 or ver > 0x41 or not hdr or not length:
+      raise NvbiosI2CError(
+          f"NVINIT I2C: unsupported DCB table version {ver:#x}", errno=19)
+    if index in (0xff, 0x80):
+      index = self.rd08(table + 4) & 0x0f
+    elif index == 0x81:
+      index = (self.rd08(table + 4) >> 4) & 0x0f
+    if index >= count:
+      raise NvbiosI2CError(
+          f"NVINIT I2C: bus index {index:#x} out of range", errno=19)
+    entry = table + hdr + index * length
+    if entry + length > len(self.image):
+      raise NvbiosI2CError("NVINIT I2C: truncated DCB entry", errno=19)
+    if ver >= 0x41:
+      info = self.rd16(entry)
+      drive = info & 0x1f
+      if drive == 0x1f:
+        raise NvbiosI2CError(
+            f"NVINIT I2C: CCB {index:#x} has no I2C drive", errno=19)
+    else:
+      type_ = self.rd08(entry + 3)
+      if type_ != 0x05:  # DCB_I2C_NVIO_BIT
+        raise NvbiosI2CError(
+            f"NVINIT I2C: CCB {index:#x} type {type_:#x} is not NVIO_BIT",
+            errno=19)
+      drive = self.rd08(entry) & 0x0f
+    return 0x00d014 + drive * 0x20
+
+  @staticmethod
+  def _i2c_delay(usec: int) -> None:
+    time.sleep(max(0, int(usec)) / 1_000_000.0)
+
+  def _i2c_mask(self, bus: int, mask: int, data: int) -> None:
+    old = self.dev.read32(bus) & 0xffffffff
+    self.dev.write32(bus, (old & ~mask) | (data & mask))
+
+  def _i2c_scl(self, bus: int, state: bool) -> None:
+    self._i2c_mask(bus, 0x00000001, 0x00000001 if state else 0)
+
+  def _i2c_sda(self, bus: int, state: bool) -> None:
+    self._i2c_mask(bus, 0x00000002, 0x00000002 if state else 0)
+
+  def _i2c_sense_scl(self, bus: int) -> bool:
+    return bool(self.dev.read32(bus) & 0x00000010)
+
+  def _i2c_sense_sda(self, bus: int) -> bool:
+    return bool(self.dev.read32(bus) & 0x00000020)
+
+  def _i2c_raise_scl(self, bus: int) -> None:
+    self._i2c_scl(bus, True)
+    for _ in range(2200):  # Nouveau T_TIMEOUT/T_RISEFALL = 2.2ms/1us
+      self._i2c_delay(1)
+      if self._i2c_sense_scl(bus):
+        return
+    raise NvbiosI2CError(f"NVINIT I2C: SCL stuck low at {bus:#x}")
+
+  def _i2c_start(self, bus: int) -> None:
+    if not self._i2c_sense_scl(bus) or not self._i2c_sense_sda(bus):
+      self._i2c_scl(bus, False)
+      self._i2c_sda(bus, True)
+      self._i2c_raise_scl(bus)
+    self._i2c_sda(bus, False)
+    self._i2c_delay(5)
+    self._i2c_scl(bus, False)
+    self._i2c_delay(5)
+
+  def _i2c_stop(self, bus: int) -> None:
+    self._i2c_scl(bus, False)
+    self._i2c_sda(bus, False)
+    self._i2c_delay(1)
+    self._i2c_scl(bus, True)
+    self._i2c_delay(5)
+    self._i2c_sda(bus, True)
+    self._i2c_delay(5)
+
+  def _i2c_bit_write(self, bus: int, bit: int) -> None:
+    self._i2c_sda(bus, bool(bit))
+    self._i2c_delay(1)
+    self._i2c_raise_scl(bus)
+    self._i2c_delay(5)
+    self._i2c_scl(bus, False)
+    self._i2c_delay(5)
+
+  def _i2c_bit_read(self, bus: int) -> int:
+    self._i2c_sda(bus, True)
+    self._i2c_delay(1)
+    self._i2c_raise_scl(bus)
+    self._i2c_delay(5)
+    bit = int(self._i2c_sense_sda(bus))
+    self._i2c_scl(bus, False)
+    self._i2c_delay(5)
+    return bit
+
+  def _i2c_put_byte(self, bus: int, value: int) -> None:
+    for bit in range(7, -1, -1):
+      self._i2c_bit_write(bus, (value >> bit) & 1)
+    if self._i2c_bit_read(bus):
+      raise NvbiosI2CError(
+          f"NVINIT I2C: NACK writing {value & 0xff:#04x}")
+
+  def _i2c_get_byte(self, bus: int, last: bool) -> int:
+    value = 0
+    for bit in range(7, -1, -1):
+      value |= self._i2c_bit_read(bus) << bit
+    self._i2c_bit_write(bus, 1 if last else 0)
+    return value
+
+  def _i2c_xfer(self, index: int, addr: int,
+                messages: list[tuple[bool, bytes | int]]) -> list[bytes]:
+    bus = self._i2c_bus_reg(index)
+    if bus not in self._i2c_inited:
+      # gf119_i2c_bus_init(): release both lines and enable the port.
+      self.dev.write32(bus, 0x00000007)
+      self._i2c_inited.add(bus)
+    reads: list[bytes] = []
+    try:
+      for is_read, payload in messages:
+        self._i2c_start(bus)
+        self._i2c_put_byte(bus, ((addr & 0x7f) << 1) | int(is_read))
+        if is_read:
+          count = int(payload)
+          reads.append(bytes(self._i2c_get_byte(bus, i + 1 == count)
+                             for i in range(count)))
+        else:
+          for value in bytes(payload):
+            self._i2c_put_byte(bus, value)
+      return reads
+    finally:
+      self._i2c_stop(bus)
+
+  def _i2c_read_reg(self, index: int, addr: int, reg: int) -> int:
+    reads = self._i2c_xfer(index, addr,
+                           [(False, bytes((reg & 0xff,))), (True, 1)])
+    value = reads[0][0]
+    if os.environ.get("KEPLER_VBIOS_I2C_TRACE", "0") == "1":
+      print(f"[nvbios] I2C RD index={index:#x} addr={addr:#x} "
+            f"reg={reg:#x} value={value:#x}", flush=True)
+    return value
+
+  def _i2c_write_reg(self, index: int, addr: int, reg: int, value: int) -> None:
+    self._i2c_xfer(index, addr,
+                   [(False, bytes((reg & 0xff, value & 0xff)))])
+    if os.environ.get("KEPLER_VBIOS_I2C_TRACE", "0") == "1":
+      print(f"[nvbios] I2C WR index={index:#x} addr={addr:#x} "
+            f"reg={reg:#x} value={value & 0xff:#x}", flush=True)
 
   # --------------------------------------------------------------------------
   # Execute flag helpers
@@ -704,26 +956,24 @@ class NvbiosInit:
       return None
     return None
 
-  def dcb_gpio(self, function: int) -> dict | None:
-    """Return a DCB GPIO function descriptor for a GK104 ROM.
-
-    The GDDR5 transition uses DCB tags 0x18 (memory-voltage select) and 0x2e
-    (voltage-control).  Nouveau maps a matching line to ``0xd610 + line*4``
-    and derives the two logical levels from the entry's log bits.
-    """
+  def dcb_gpios(self) -> list[dict]:
+    """Return all DCB GPIO descriptors needed by GK104 ``gpio_reset``."""
+    result = []
     dcb = self.rd16(0x36)
     if not dcb or dcb + 0x0c > len(self.image):
-      return None
+      return result
     dver, dhdr = self.rd08(dcb), self.rd08(dcb + 1)
     if dver < 0x30 or dhdr < 0x0c:
-      return None
+      return result
     table = self.rd16(dcb + 0x0a)
     if not table or table + 4 > len(self.image):
-      return None
+      return result
     ver = self.rd08(table)
-    hdr, count, length = self.rd08(table + 1), self.rd08(table + 2), self.rd08(table + 3)
-    if not hdr or not length:
-      return None
+    hdr = self.rd08(table + 1)
+    count = self.rd08(table + 2)
+    length = self.rd08(table + 3)
+    if not hdr or not length or ver > 0x41:
+      return result
     for i in range(count):
       entry = table + hdr + i * length
       if entry + length > len(self.image):
@@ -733,21 +983,63 @@ class NvbiosInit:
         line = info & 0x1f
         func = (info >> 5) & 0x3f
         log0, log1 = (info >> 11) & 3, (info >> 13) & 3
+        defs = int(bool(info & 0x8000))
+        unk0 = unk1 = 0
       elif ver < 0x41:
         info = self.rd32(entry)
         line = info & 0x1f
         func = (info >> 8) & 0xff
         log0, log1 = (info >> 27) & 3, (info >> 29) & 3
+        defs = int(bool(info & 0x80000000))
+        unk0 = unk1 = 0
       else:
         info = self.rd32(entry)
         info1 = self.rd08(entry + 4)
         line = info & 0x3f
         func = (info >> 8) & 0xff
         log0, log1 = (info1 >> 4) & 3, (info1 >> 6) & 3
-      if func == int(function):
-        return {"line": line, "log0": log0, "log1": log1,
-                "reg": 0x00d610 + line * 4}
+        defs = int(bool(info & 0x80))
+        unk0 = (info >> 16) & 0xff
+        unk1 = (info >> 24) & 0x1f
+      result.append({
+          "line": line, "func": func, "log0": log0, "log1": log1,
+          "defs": defs, "unk0": unk0, "unk1": unk1,
+          "reg": 0x00d610 + line * 4,
+      })
+    return result
+
+  def dcb_gpio(self, function: int) -> dict | None:
+    """Return one DCB GPIO function descriptor for a GK104 ROM.
+
+    The GDDR5 transition uses DCB tags 0x18 (memory-voltage select) and 0x2e
+    (voltage-control).  Nouveau maps a matching line to ``0xd610 + line*4``
+    and derives the two logical levels from the entry's log bits.
+    """
+    for gpio in self.dcb_gpios():
+      if gpio["func"] == int(function):
+        return gpio
     return None
+
+  def _gpio_reset(self, excluded: set[int] | None = None) -> tuple[int, list[int]]:
+    """Port ``gf119_gpio_reset`` for GK104's DCB v0x41 table."""
+    excluded = set() if excluded is None else excluded
+    count = 0
+    changed = []
+    for gpio in self.dcb_gpios():
+      if gpio["func"] == 0xff or gpio["func"] in excluded:
+        continue
+      level = gpio["log1"] if gpio["defs"] else gpio["log0"]
+      want = (level ^ 2) << 12
+      old = self._reg_mask(gpio["reg"], 0x00003000, want)
+      if (old & 0x00003000) != want:
+        changed.append(gpio["func"])
+      self._reg_mask(0x00d604, 0x00000001, 0x00000001)
+      self._reg_mask(gpio["reg"], 0x000000ff, gpio["unk0"])
+      if gpio["unk1"]:
+        self._reg_mask(0x00d740 + (gpio["unk1"] - 1) * 4,
+                       0x000000ff, gpio["line"])
+      count += 1
+    return count, changed
 
   def _m0205_training_entry(self, index: int):
     """Decode one M0205E entry and select its current RAMCFG byte."""
@@ -872,6 +1164,21 @@ class NvbiosInit:
   # Core execution loop
   # --------------------------------------------------------------------------
   def run_script(self, start: int) -> None:
+    if self.nested == 0:
+      # nvbios_init() constructs a fresh execution state for every top-level
+      # script.  Only nested SUB/CALL execution inherits conditions/selectors.
+      self.execute = 1
+      self.repeat = 0
+      self.repend = 0
+      self.ramcfg = 0
+      self.head = -1
+      self.or_ = -1
+      self.link = 0
+      self.outp = None
+      # Nouveau's nvbios_init() stack object is fresh for each top-level
+      # invocation.  The strap cache belongs to that object too; only nested
+      # SUB/CALL execution may inherit it.
+      self._ramcfg_value = None
     self.offset = start
     self.nested += 1
     while self.offset:
@@ -901,6 +1208,11 @@ class NvbiosInit:
   def _op_zm_reg(self):
     addr = self.rd32(self.offset + 1)
     data = self.rd32(self.offset + 5)
+    # Nouveau init_zm_reg(): PMC_ENABLE bit 0 is the master-enable invariant.
+    # The Palit cold script's first write is 0x2020 at ROM 0x87e6, so omitting
+    # this source-level special case transiently disables the master domain.
+    if addr == 0x000200:
+      data |= 0x00000001
     self._reg_wr32(addr, data)
     self.offset += 9
 
@@ -1005,25 +1317,94 @@ class NvbiosInit:
       self.offset += 4
 
   def _op_zm_i2c(self):
+    index = self.rd08(self.offset + 1)
+    addr = self.rd08(self.offset + 2) >> 1
     count = self.rd08(self.offset + 3)
-    self.offset += 4 + count
+    self.offset += 4
+    data = bytes(self.rd08(self.offset + i) for i in range(count))
+    self.offset += count
+    if self.init_exec():
+      try:
+        self._i2c_xfer(index, addr, [(False, data)])
+      except NvbiosI2CError as e:
+        print(f"[nvbios] ZM_I2C protocol failure ignored like Nouveau: {e}",
+              flush=True)
 
   def _op_zm_i2c_byte(self):
+    index = self.rd08(self.offset + 1)
+    addr = self.rd08(self.offset + 2) >> 1
     count = self.rd08(self.offset + 3)
-    self.offset += 4 + count * 2
+    self.offset += 4
+    for _ in range(count):
+      reg = self.rd08(self.offset)
+      data = self.rd08(self.offset + 1)
+      self.offset += 2
+      if self.init_exec():
+        try:
+          self._i2c_write_reg(index, addr, reg, data)
+        except NvbiosI2CError as e:
+          print(f"[nvbios] ZM_I2C_BYTE failure ignored like Nouveau: {e}",
+                flush=True)
 
   def _op_i2c_byte(self):
+    index = self.rd08(self.offset + 1)
+    addr = self.rd08(self.offset + 2) >> 1
     count = self.rd08(self.offset + 3)
-    self.offset += 4 + count * 3
+    self.offset += 4
+    for _ in range(count):
+      reg = self.rd08(self.offset)
+      mask = self.rd08(self.offset + 1)
+      data = self.rd08(self.offset + 2)
+      self.offset += 3
+      if self.init_exec():
+        try:
+          value = self._i2c_read_reg(index, addr, reg)
+        except NvbiosI2CError as e:
+          print(f"[nvbios] I2C_BYTE read failure skipped like Nouveau: {e}",
+                flush=True)
+          continue
+        try:
+          self._i2c_write_reg(index, addr, reg, (value & mask) | data)
+        except NvbiosI2CError as e:
+          print(f"[nvbios] I2C_BYTE write failure ignored like Nouveau: {e}",
+                flush=True)
 
   def _op_i2c_if(self):
+    index = self.rd08(self.offset + 1)
+    addr = self.rd08(self.offset + 2)
+    reg = self.rd08(self.offset + 3)
+    mask = self.rd08(self.offset + 4)
+    data = self.rd08(self.offset + 5)
     self.offset += 6
-    if self.init_exec():
+    self.init_exec_force(True)
+    try:
+      value = self._i2c_read_reg(index, addr, reg)
+    except NvbiosI2CError as e:
+      value = e.u8
+      print(f"[nvbios] I2C_IF read failure -> {value:#x} like Nouveau: {e}",
+            flush=True)
+    if (value & mask) != data:
       self.init_exec_set(False)
+    self.init_exec_force(False)
 
   def _op_i2c_long_if(self):
+    index = self.rd08(self.offset + 1)
+    addr = self.rd08(self.offset + 2) >> 1
+    reglo = self.rd08(self.offset + 3)
+    reghi = self.rd08(self.offset + 4)
+    mask = self.rd08(self.offset + 5)
+    data = self.rd08(self.offset + 6)
     self.offset += 7
-    if self.init_exec():
+    try:
+      reads = self._i2c_xfer(
+          index, addr,
+          [(False, bytes((reghi, reglo))), (True, 1)])
+      matched = (reads[0][0] & mask) == data
+    except NvbiosI2CError as e:
+      print(f"[nvbios] I2C_LONG_IF read failure -> false like Nouveau: {e}",
+            flush=True)
+      matched = False
+    if not matched:
       self.init_exec_set(False)
 
   def _op_tmds(self):
@@ -1034,21 +1415,69 @@ class NvbiosInit:
     self.offset += 3 + count * 2
 
   def _op_cr(self):
+    addr = self.rd08(self.offset + 1)
+    mask = self.rd08(self.offset + 2)
+    data = self.rd08(self.offset + 3)
     self.offset += 4
+    val = self._vgai_rd(0x03d4, addr) & mask
+    self._vgai_wr(0x03d4, addr, val | data)
 
   def _op_zm_cr(self):
+    addr = self.rd08(self.offset + 1)
+    data = self.rd08(self.offset + 2)
     self.offset += 3
+    self._vgai_wr(0x03d4, addr, data)
 
   def _op_zm_cr_group(self):
     count = self.rd08(self.offset + 1)
-    self.offset += 2 + count * 2
+    self.offset += 2
+    for _ in range(count):
+      addr = self.rd08(self.offset)
+      data = self.rd08(self.offset + 1)
+      self.offset += 2
+      self._vgai_wr(0x03d4, addr, data)
 
   def _op_cr_idx_adr_latch(self):
+    addr0 = self.rd08(self.offset + 1)
+    addr1 = self.rd08(self.offset + 2)
+    base = self.rd08(self.offset + 3)
     count = self.rd08(self.offset + 4)
-    self.offset += 5 + count
+    self.offset += 5
+    save0 = self._vgai_rd(0x03d4, addr0)
+    for _ in range(count):
+      data = self.rd08(self.offset)
+      self.offset += 1
+      self._vgai_wr(0x03d4, addr0, base)
+      self._vgai_wr(0x03d4, addr1, data)
+      base = (base + 1) & 0xff
+    self._vgai_wr(0x03d4, addr0, save0)
 
   def _op_io(self):
+    port = self.rd16(self.offset + 1)
+    mask = self.rd08(self.offset + 3)
+    data = self.rd08(self.offset + 4)
     self.offset += 5
+
+    # Literal Nouveau init_io() NV50+ special case.  The Palit script executes
+    # exactly INIT_IO port=0x3c3 mask=0 data=1 before its first DONE.
+    if port == 0x03c3 and data == 0x01:
+      self._reg_mask(0x614100, 0xf0800000, 0x00800000)
+      self._reg_mask(0x00e18c, 0x00020000, 0x00020000)
+      self._reg_mask(0x614900, 0xf0800000, 0x00800000)
+      self._reg_mask(0x000200, 0x40000000, 0x00000000)
+      if self.init_exec():
+        time.sleep(0.010)
+      self._reg_mask(0x00e18c, 0x00020000, 0x00000000)
+      self._reg_mask(0x000200, 0x40000000, 0x40000000)
+      self._reg_wr32(0x614100, 0x00800018)
+      self._reg_wr32(0x614900, 0x00800018)
+      if self.init_exec():
+        time.sleep(0.010)
+      self._reg_wr32(0x614100, 0x10000018)
+      self._reg_wr32(0x614900, 0x10000018)
+
+    value = self._port_rd(port) & mask
+    self._port_wr(port, data | value)
 
   def _op_zm_index_io(self):
     self.offset += 5
@@ -1323,10 +1752,21 @@ class NvbiosInit:
 
   def _op_gpio(self):
     self.offset += 1
+    if self.init_exec():
+      count, changed = self._gpio_reset()
+      if os.environ.get("KEPLER_GPIO_TRACE", "1") != "0":
+        print(f"[nvbios] INIT_GPIO reset count={count} "
+              f"changed={[f'{func:#x}' for func in changed]}", flush=True)
 
   def _op_gpio_ne(self):
     count = self.rd08(self.offset + 1)
+    excluded = {self.rd08(self.offset + 2 + i) for i in range(count)}
     self.offset += 2 + count
+    if self.init_exec():
+      reset, changed = self._gpio_reset(excluded)
+      if os.environ.get("KEPLER_GPIO_TRACE", "1") != "0":
+        print(f"[nvbios] INIT_GPIO_NE reset count={reset} "
+              f"changed={[f'{func:#x}' for func in changed]}", flush=True)
 
   def _op_compute_mem(self):
     self.offset += 1
@@ -1472,6 +1912,7 @@ def find_vbios_scripts(image: bytes) -> list:
 def run_vbios_init(dev, image: bytes, scripts: list | None = None, debug: bool = False) -> None:
   """Execute the VBIOS devinit scripts sequentially."""
   init = NvbiosInit(dev, image, debug=debug)
+  init.unlock_vga_crtc()
   if scripts is None:
     scripts = find_vbios_scripts(image)
   for s in scripts:
@@ -1517,7 +1958,9 @@ def run_vbios_ram_init(dev, image: bytes, debug: bool = False) -> None:
   for i, script in enumerate(scripts):
     if i == selected:
       continue
-    dev.write32(0x10f65c, i << 4)
+    current = dev.read32(0x10f65c)
+    dev.write32(0x10f65c,
+                (current & ~0x000000f0) | ((i << 4) & 0x000000f0))
     init.run_script(script)
   current = dev.read32(0x10f65c)
   dev.write32(0x10f65c, (current & ~0x000000f0) | save)
@@ -1526,6 +1969,15 @@ def run_vbios_ram_init(dev, image: bytes, debug: bool = False) -> None:
   dev.write32(0x10f160, dev.read32(0x10f160) | 0x00000010)
 
   train = init.ram_training()
+  # Nouveau gk104_ram_train_init_0 warns if (mask & 0x03d3) != 0x03d3
+  # (ramgk104.c:1338).  Types 00/01/04/06/07/08/09 → bits → 0x03d3.
+  train_mask = 0
+  for typ in train:
+    train_mask |= 1 << typ
+  print(f"[nvbios] GDDR5 train types={[f'{t:#x}' for t in sorted(train)]} "
+        f"mask={train_mask:#x} (Nouveau wants &0x03d3==0x03d3: "
+        f"{'ok' if (train_mask & 0x03d3) == 0x03d3 else 'MISSING'})",
+        flush=True)
   for i in range(0x30):
     for j in (0, 4):
       dev.write32(0x10f968 + j, i << 8)
@@ -1543,30 +1995,127 @@ def run_vbios_ram_init(dev, image: bytes, debug: bool = False) -> None:
     print("[nvbios] GK104 GDDR5 RAM init/training complete")
 
 
+def _gk104_read_mem_clock_khz(dev, crystal_khz: int = 27_000) -> int:
+  """Port gk104_clk.read_mem/read_pll/read_div for the former RAM clock."""
+  def read_pll(pll: int) -> int:
+    ctrl = dev.read32(pll) & 0xffffffff
+    coef = dev.read32(pll + 4) & 0xffffffff
+    if not (ctrl & 1):
+      return 0
+    p = (coef >> 16) & 0x3f
+    n = (coef >> 8) & 0xff
+    m = coef & 0xff
+    fn = 0xf000
+    if pll in (0x00e800, 0x00e820):
+      source = crystal_khz
+      p = 1
+    elif pll == 0x132000:
+      source = read_pll(0x132020)
+      p = 2 if (coef & 0x10000000) else 1
+    elif pll == 0x132020:
+      source = read_div(0, 0x137320, 0x137330)
+      fn = (dev.read32(pll + 0x10) >> 16) & 0xffff
+    else:
+      return 0
+    if not source or not m:
+      return 0
+    if not p:
+      p = 1
+    source = (source * n) + ((((fn + 4096) & 0xffff) * source) >> 13)
+    return source // (m * p)
+
+  def read_vco(dsrc: int) -> int:
+    source = dev.read32(dsrc) & 0xffffffff
+    return read_pll(0x00e820 if (source & 0x00000100) else 0x00e800)
+
+  def read_div(doff: int, dsrc: int, dctl: int) -> int:
+    source = dev.read32(dsrc + doff * 4) & 0xffffffff
+    control = dev.read32(dctl + doff * 4) & 0xffffffff
+    select = source & 3
+    if select == 0:
+      return 108_000 if (source & 0x00030000) == 0x00030000 else crystal_khz
+    if select == 2:
+      return 100_000
+    if select != 3:
+      return 0
+    clock = read_vco(dsrc + doff * 4)
+    if control & 0x80000000:
+      return (clock * 2) // ((control & 0x3f) + 2)
+    return clock
+
+  mode = dev.read32(0x1373f4) & 0xf
+  if mode == 1:
+    return read_pll(0x132020)
+  if mode == 2:
+    return read_pll(0x132000)
+  return 0
+
+
 def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
-                          debug: bool = False) -> dict:
+                          debug: bool = False, *,
+                          _cfg_override: dict | None = None,
+                          _allow_xition: bool = True) -> dict:
   """Program the cold GDDR5 controller phase used by GK104 reclocking.
 
   A card which was never POSTed has neither the EFI memory-controller state
   nor Nouveau's first ``ram->func->calc/prog`` transition.  The RAMMAP
   scripts alone therefore leave BAR1 writes nondeterministic.  This is the
-  bounded, single-configuration form of ``gk104_ram_calc_gddr5()``: it uses
-  the ROM's RAMCFG/timing entry, initializes the controller/MR/timing ports,
-  and leaves the separate RAMMAP/training pass to ``run_vbios_ram_init``.
+  bounded mode-1 form of ``gk104_ram_calc_gddr5()``: it uses the ROM's
+  RAMCFG/timing entries, including Nouveau's active former→xition→target loop,
+  initializes the controller/MR/timing ports, and leaves the separate
+  RAMMAP/training pass to ``run_vbios_ram_init``.
 
   Board DCB GPIO selection and the ROM-bounded fractional reference PLL are
   included.  Dynamic voltage tables and the high-clock/mode-2 PLL path remain
   deliberately out of scope until the known-good 648-MHz cold path is
   validated.
   """
+  # Falcon TIMER_LOW and the MEMX comments define this raw value in ns.
+  # Night40aq showed that a 50 ms tight MEMX_WAIT can wedge the PMU's repeated
+  # MMIO-read loop instead of returning at its deadline.  Bound diagnostics
+  # before any RAM script executes; Nouveau's stock value is 500 us.
+  train_wait_ns = int(os.environ.get("KEPLER_TRAIN_WAIT_NS", "500000"), 0)
+  if not 1 <= train_wait_ns <= 5_000_000:
+    raise ValueError(
+        "KEPLER_TRAIN_WAIT_NS must be 1..5000000 nanoseconds per partition; "
+        f"got {train_wait_ns}")
+
   init = NvbiosInit(dev, image, debug=debug)
-  cfg = init.rammap_config(int(freq_mhz))
+  target_cfg = init.rammap_config(int(freq_mhz))
+  cfg = target_cfg if _cfg_override is None else _cfg_override
   b = cfg
+
+  # gk104_ram_calc() can require two calc/prog iterations.  For an upward
+  # transition, Nouveau starts xition from the former RAMCFG and copies these
+  # three target fields into it.  If that BIOS image differs from former, the
+  # clock core executes xition first and loops once for the final target.
+  if _allow_xition and _cfg_override is None:
+    pll = init.refpll_limits()
+    crystal_khz = int(pll["refclk"]) if pll is not None else 27_000
+    former_khz = _gk104_read_mem_clock_khz(dev, crystal_khz)
+    target_khz = int(freq_mhz) * 1000
+    if 0 < former_khz < target_khz:
+      former_mhz = former_khz // 1000
+      former_cfg = init.rammap_config(former_mhz)
+      xition = dict(former_cfg)
+      copied = ("ramcfg_11_02_04", "ramcfg_11_02_03", "timing_20_30_07")
+      for field in copied:
+        xition[field] = target_cfg[field]
+      changed = [field for field in copied
+                 if xition[field] != former_cfg[field]]
+      if changed:
+        print(f"[nvbios] Nouveau xition pass former={former_khz}kHz "
+              f"rammap={former_cfg['rammap_index']} target={target_khz}kHz "
+              f"rammap={target_cfg['rammap_index']} copied={changed}",
+              flush=True)
+        run_vbios_ram_program(
+            dev, image, freq_mhz=former_mhz, debug=debug,
+            _cfg_override=xition, _allow_xition=False)
 
   # TinyGPU escape hatch: night5 cleared only 0x1620[0] (not 0x26f0, not
   # unpause) and saw PRAMIN 0xbad0fb → 0xffffffff.  Full pause+unpause of both
   # regs on true cold has killed BAR0 (2026-07-16).  Step carefully.
-  if os.environ.get("KEPLER_RAM_PROGRAM", "1") == "bit0-only":
+  if os.environ.get("KEPLER_RAM_PROGRAM", "0") == "bit0-only":
     def _boot0() -> int:
       return dev.read32(0) & 0xffffffff
     def _alive(label: str) -> None:
@@ -1615,14 +2164,20 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
         "possibly-wedged GPU.  Power-cycle the eGPU enclosure, restart "
         "TinyGPU server, then cold-run add.py once (no probe).")
 
-  def mask(reg: int, m: int, value: int) -> int:
+  def mask(reg: int, m: int, value: int, *, force: bool = False) -> int:
+    """Queue one ``ramfuc_mask`` write only when Nouveau would queue it."""
     old = dev.read32(reg)
-    # All controller masks in this phase originate from Nouveau's
-    # ramfuc_mask(), whose data operand is intentionally *not* clipped to the
-    # mask.  Several GK104 fields use mask=0 or place control bits outside the
-    # method mask, so ordinary nvkm_mask semantics would lose required state.
-    new = (old & ~m) | value
-    dev.write32(reg, new & 0xffffffff)
+    # ramfuc_mask() does not clip data to mask, and suppresses an unchanged
+    # store unless ramfuc_nuke() set force on that register.
+    new = ((old & ~m) | value) & 0xffffffff
+    if force or old != new:
+      dev.write32(reg, new)
+    return old
+
+  def nvkm_mask(reg: int, m: int, value: int) -> int:
+    """Host ``nvkm_mask`` used by prog0: always issue its MMIO write."""
+    old = dev.read32(reg)
+    dev.write32(reg, ((old & ~m) | value) & 0xffffffff)
     return old
 
   def ramfuc_mask(reg: int, m: int, value: int) -> int:
@@ -1643,14 +2198,14 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     time.sleep(nsec / 1_000_000_000)
 
   def _direct_ram_block() -> None:
-    mask(0x001620, 0x00000aa2, 0)
-    mask(0x001620, 0x00000001, 0)
-    mask(0x0026f0, 0x00000001, 0)
+    nvkm_mask(0x001620, 0x00000aa2, 0)
+    nvkm_mask(0x001620, 0x00000001, 0)
+    nvkm_mask(0x0026f0, 0x00000001, 0)
 
   def _direct_ram_unblock() -> None:
-    mask(0x0026f0, 0x00000001, 0x00000001)
-    mask(0x001620, 0x00000001, 0x00000001)
-    mask(0x001620, 0x00000aa2, 0x00000aa2)
+    nvkm_mask(0x0026f0, 0x00000001, 0x00000001)
+    nvkm_mask(0x001620, 0x00000001, 0x00000001)
+    nvkm_mask(0x001620, 0x00000aa2, 0x00000aa2)
 
   def ram_block() -> None:
     """Begin the GDDR5 reprogram window.
@@ -1752,14 +2307,28 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     """Apply one Nouveau DCB GPIO level and pulse the GPIO trigger if needed."""
     gpio = init.dcb_gpio(function)
     if gpio is None:
+      print(f"[nvbios] GPIO func={function:#x}: DCB entry MISSING — skipped",
+            flush=True)
       return
     # `logical` selects the DCB log[0]/log[1] entry; the entry itself carries
     # the polarity encoding that Nouveau XORs with 2 before writing GPIO.
     level = gpio["log1"] if int(logical) else gpio["log0"]
-    old = mask(gpio["reg"], 0x00003000, (int(level) ^ 2) << 12)
-    if old != dev.read32(gpio["reg"]):
+    want = (int(level) ^ 2) << 12
+    old = mask(gpio["reg"], 0x00003000, want)
+    # Nouveau: temp = ram_mask(...); if (temp != ram_rd32(...)) trigger.
+    # In atomic MEMX, host read32 still sees pre-buffer HW, so comparing a
+    # re-read to ``old`` never sees a change (night40ap).  Compare the bits
+    # we just programmed instead — equivalent when the write is visible.
+    changed = (old & 0x00003000) != (want & 0x00003000)
+    if changed:
       dev.write32(0x00d604, 1)
       delay_ns(delay_nsec)
+    if os.environ.get("KEPLER_GPIO_TRACE", "1") != "0":
+      print(f"[nvbios] GPIO func={function:#x} line={gpio['line']} "
+            f"reg={gpio['reg']:#x} logical={int(logical)} "
+            f"log={level} want_bits={want:#x} old={old:#x} "
+            f"changed={changed} trig={'yes' if changed else 'no'}",
+            flush=True)
 
   # Nouveau's transition program only masks RAMMAP fields which differ across
   # the ROM's entries.  Compute those flags once; testing the selected value
@@ -1770,18 +2339,32 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   # 0x110204 configuration differs from the first active partition.  Compute
   # that mask once, so the direct host path can reproduce ram_nuts() without
   # assuming all eight GK104 partitions are identical.
-  _parts = dev.read32(0x022438) & 0xff
+  _parts_hw = dev.read32(0x022438) & 0xff
+  _parts = _parts_hw
   _pmask = dev.read32(0x022554)
+  if _parts == 0:
+    # Nouveau carries ram->parts from FB one-init.  A cold TinyGPU script
+    # build can read zero here before that topology register is latched, so
+    # retain the same bounded board fallback used by train().
+    _parts = int(os.environ.get("KEPLER_RAM_PARTS", "4"), 0)
+  _parts = max(0, min(_parts, 16))
   _pnuts = 0
   _first_cfg = None
+  _part_cfgs = []
   for _part in range(min(_parts, 16)):
     if _pmask & (1 << _part):
       continue
     _cfg1 = dev.read32(0x110204 + _part * 0x1000)
+    _part_cfgs.append((_part, _cfg1 & 0xffffffff))
     if _first_cfg is not None and _first_cfg != _cfg1:
       _pnuts |= 1 << _part
     else:
       _first_cfg = _cfg1
+  if os.environ.get("KEPLER_TRAIN_TRACE", "1") != "0":
+    print(f"[nvbios] partition topology hw_parts={_parts_hw} parts={_parts} "
+          f"pmask={_pmask:#x} pnuts={_pnuts:#x} "
+          f"cfg={[f'{part}:{value:#x}' for part, value in _part_cfgs]}",
+          flush=True)
 
   def ram_nuts(reg: int, m: int, value: int, copy: int,
                reg_data: int | None = None) -> None:
@@ -1804,51 +2387,77 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     if not (value & 0x80000000):
       return
     parts = dev.read32(0x022438) & 0xff
-    pmask = dev.read32(0x022554)
+    pmask = dev.read32(0x022554) & 0xffffffff
+    # Night40ao (H25): cold script-build can see 0x022438==0 before PFB
+    # topology is latched; Nouveau uses ram->parts from fb oneinit, not a
+    # mid-script host peek.  Fall back so MEMX_WAIT is actually queued.
+    if parts == 0:
+      parts = int(os.environ.get("KEPLER_RAM_PARTS", "4"), 0)
+      print(f"[nvbios] train: 0x022438 was 0; using parts={parts} "
+            f"(KEPLER_RAM_PARTS)", flush=True)
+    waits = 0
     for part in range(min(parts, 16)):
       if pmask & (1 << part):
         continue
       addr = 0x110974 + part * 0x1000
+      waits += 1
       # Nouveau ram_wait → MEMX_WAIT while buffering; else host poll.
+      # Nouveau uses 500,000 ns; a timeout falls through silently (H24).
       if getattr(dev, "memx_wait", None) and dev.memx_wait(
-          addr, 0x0000000f, 0x00000000, 500000):
+          addr, 0x0000000f, 0x00000000, train_wait_ns):
         continue
-      deadline = time.monotonic() + 0.5
+      deadline = time.monotonic() + max(0.5, train_wait_ns / 1e9)
       while dev.read32(addr) & 0xf:
         if time.monotonic() >= deadline:
           raise TimeoutError(f"GK104 RAM training timeout on partition {part}")
         time.sleep(0.00001)
+    if os.environ.get("KEPLER_TRAIN_TRACE", "1") != "0":
+      print(f"[nvbios] train trigger mask={m:#x} data={value:#x} "
+            f"parts={parts} pmask={pmask:#x} waits={waits}", flush=True)
 
-  def prog0() -> None:
-    """Port gk104_ram_prog_0() for the selected RAMMAP entry."""
-    if _diff["rammap_11_0a_03fe"] or _diff["rammap_11_09_01ff"]:
-      _m = ((0x001ff000 if _diff["rammap_11_0a_03fe"] else 0) |
-            (0x000001ff if _diff["rammap_11_09_01ff"] else 0))
-      _v = ((b["rammap_11_0a_03fe"] << 12) |
-            b["rammap_11_09_01ff"])
-      mask(0x10f468, _m, _v)
-    if _diff["rammap_11_0a_0400"]:
-      mask(0x10f420, 0x00000001, b["rammap_11_0a_0400"])
-    if _diff["rammap_11_0a_0800"]:
-      mask(0x10f430, 0x00000001, b["rammap_11_0a_0800"])
-    if _diff["rammap_11_0b_01f0"]:
-      mask(0x10f400, 0x0000001f, b["rammap_11_0b_01f0"])
-    if _diff["rammap_11_0b_0200"]:
-      mask(0x10f410, 0x00000200, b["rammap_11_0b_0200"] << 9)
-    if _diff["rammap_11_0d"] or _diff["rammap_11_0f"]:
-      _m = ((0x00ff0000 if _diff["rammap_11_0d"] else 0) |
-            (0x0000ff00 if _diff["rammap_11_0f"] else 0))
-      mask(0x10f440, _m,
-           (b["rammap_11_0d"] << 16) | (b["rammap_11_0f"] << 8))
-    if (_diff["rammap_11_0e"] or _diff["rammap_11_0b_0800"] or
-        _diff["rammap_11_0b_0400"]):
-      _m = ((0x0000ff00 if _diff["rammap_11_0e"] else 0) |
-            (0x00000080 if _diff["rammap_11_0b_0800"] else 0) |
-            (0x00000020 if _diff["rammap_11_0b_0400"] else 0))
-      mask(0x10f444, _m,
-           (b["rammap_11_0e"] << 8) |
-           (b["rammap_11_0b_0800"] << 7) |
-           (b["rammap_11_0b_0400"] << 5))
+  def prog0(cfg_src: dict | None = None) -> None:
+    """Port gk104_ram_prog_0() for a RAMMAP entry's frequency tables.
+
+    Nouveau's ``gk104_ram_prog`` calls this twice: once at 1000 MHz *before*
+    ``ram_exec``, then again at ``next->freq`` after EXEC returns.  Pass
+    ``cfg_src`` to select which RAMMAP entry's ``rammap_11_*`` fields to apply;
+    default is the target ``freq_mhz`` config already in ``b``.
+    """
+    c = b if cfg_src is None else cfg_src
+    _m = ((0x001ff000 if _diff["rammap_11_0a_03fe"] else 0) |
+          (0x000001ff if _diff["rammap_11_09_01ff"] else 0))
+    _v = (((c["rammap_11_0a_03fe"] << 12)
+           if _diff["rammap_11_0a_03fe"] else 0) |
+          (c["rammap_11_09_01ff"]
+           if _diff["rammap_11_09_01ff"] else 0))
+    nvkm_mask(0x10f468, _m, _v)
+    nvkm_mask(0x10f420,
+              0x00000001 if _diff["rammap_11_0a_0400"] else 0,
+              c["rammap_11_0a_0400"] if _diff["rammap_11_0a_0400"] else 0)
+    nvkm_mask(0x10f430,
+              0x00000001 if _diff["rammap_11_0a_0800"] else 0,
+              c["rammap_11_0a_0800"] if _diff["rammap_11_0a_0800"] else 0)
+    nvkm_mask(0x10f400,
+              0x0000001f if _diff["rammap_11_0b_01f0"] else 0,
+              c["rammap_11_0b_01f0"] if _diff["rammap_11_0b_01f0"] else 0)
+    nvkm_mask(0x10f410,
+              0x00000200 if _diff["rammap_11_0b_0200"] else 0,
+              (c["rammap_11_0b_0200"] << 9)
+              if _diff["rammap_11_0b_0200"] else 0)
+    _m = ((0x00ff0000 if _diff["rammap_11_0d"] else 0) |
+          (0x0000ff00 if _diff["rammap_11_0f"] else 0))
+    _v = (((c["rammap_11_0d"] << 16) if _diff["rammap_11_0d"] else 0) |
+          ((c["rammap_11_0f"] << 8) if _diff["rammap_11_0f"] else 0))
+    nvkm_mask(0x10f440, _m, _v)
+    _m = ((0x0000ff00 if _diff["rammap_11_0e"] else 0) |
+          (0x00000080 if _diff["rammap_11_0b_0800"] else 0) |
+          (0x00000020 if _diff["rammap_11_0b_0400"] else 0))
+    _v = (((c["rammap_11_0e"] << 8) if _diff["rammap_11_0e"] else 0) |
+          ((c["rammap_11_0b_0800"] << 7)
+           if _diff["rammap_11_0b_0800"] else 0) |
+          ((c["rammap_11_0b_0400"] << 5)
+           if _diff["rammap_11_0b_0400"] else 0))
+    nvkm_mask(0x10f444, _m, _v)
 
   # nvkm_gddr5_calc(): derive the mode registers from the timing entry.
   timing = b["timing"]
@@ -1872,6 +2481,12 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
            ((b["timing_20_2e_c0"] & 3) << 4) |
            ((b["timing_20_2e_03"] & 3) << 2) |
            (b["timing_20_2f_03"] & 3) | (xd << 7))
+  # nvkm_gddr5_calc() saves the ordinary at[0] image for partition mirrors,
+  # then switches the main MR1 to at[1] only when ram->pnuts is nonzero.
+  mr1_nuts = mr[1]
+  if _pnuts:
+    mr[1] = ((mr[1] & ~0x030) |
+             ((b["timing_20_2e_30"] & 3) << 4))
   mr[3] = (mr[3] & ~0x020) | (int(freq_mhz < 1000) << 5)
   mr[5] = (mr[5] & ~0x004) | (int(not b["ramcfg_11_07_02"]) << 2)
   vo = b["ramcfg_11_06"] or ((mr[6] >> 4) & 0xff)
@@ -1881,15 +2496,18 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
            ((b["ramcfg_11_02_10"] & 1) << 7) |
            ((b["ramcfg_11_01_40"] & 1) << 3))
   mr[8] = (mr[8] & ~3) | ((wr & 0x10) >> 3) | ((cl & 0x10) >> 4)
-  mr1_nuts = ((mr[1] & ~0x030) |
-              ((b["timing_20_2e_30"] & 3) << 4))
-
-  # MR1 + prog0: default all-MEMX; optional host-then-MEMX for A/B.
-  if (mr[1] & 0x03c) != 0x030:
-    mask(0x10f330, 0x0000003c, mr[1] & 0x0000003c)
-    ram_nuts(0x10f330, 0x0000003c, mr1_nuts & 0x0000003c,
-             0x00000000, reg_data=mr1_nuts)
-  prog0()
+  # prog0: default all-MEMX; optional host-then-MEMX for A/B.
+  # Nouveau gk104_ram_prog(): prog0(1000) BEFORE ram_exec, prog0(target) after.
+  # Night40ai: apply the 1000 MHz RAMMAP tables here (pre-ENTER), not target.
+  _pre_mhz = int(os.environ.get("KEPLER_RAM_PROG0_PRE_MHZ", "1000"))
+  if _pre_mhz > 0 and _pre_mhz != int(freq_mhz):
+    b_pre = init.rammap_config(_pre_mhz)
+    print(f"[nvbios] pre-transition prog0 at {_pre_mhz} MHz "
+          f"(rammap={b_pre['rammap_index']} vs target "
+          f"{b['rammap_index']}@{freq_mhz})", flush=True)
+    prog0(b_pre)
+  else:
+    prog0()
 
   if not getattr(dev, "memx_on", False):
     if dev.start_memx_buffer():
@@ -1954,6 +2572,13 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   _, actual, p1, n1, m1, fn1 = best
 
   _pll_from = dev.read32(0x1373f4) & 0x0000000f
+  # gk104_ram_calc() first asks gk104_clk_read(nv_clk_src_mem) for the
+  # *former* clock.  read_mem() returns zero unless this selector is 1 or 2;
+  # in that state a literal Nouveau reclock aborts before building RAMFUC.
+  print(f"[nvbios] Nouveau former-memory selector 0x1373f4[3:0]="
+        f"{_pll_from:#x} "
+        f"({'clock path present' if _pll_from in (1, 2) else 'read_mem=0; literal reclock prerequisite missing'})",
+        flush=True)
 
   def finish_refpll() -> None:
     """Apply the source's r1373f4_fini() sequence."""
@@ -1979,33 +2604,56 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
       ramfuc_mask(0x1373f4, 0x00000000, 0x00010010)
     ramfuc_mask(0x1373f4, 0x00000003, 0x00000000)
     ramfuc_mask(0x1373f4, 0x00000010, 0x00000000)
-    mask(0x132000, 0x00000001, 0)
-    mask(0x132020, 0x00000001, 0)
-    dev.write32(0x137320, 0)
-    mask(0x132030, 0xffff0000, fn1 << 16)
-    mask(0x132034, 0x0000ffff, fn1)
-    dev.write32(0x132024, (p1 << 16) | (n1 << 8) | m1)
-    mask(0x132028, 0x00080000, 0x00080000)
-    mask(0x132020, 0x00000001, 0x00000001)
-    # Nouveau's MEMX program waits for REFPLL_LOCK (0x137390[17]) for at
-    # most 64 us.  Poll the same condition on the direct host path rather
-    # than assuming a fixed delay was sufficient.
-    refpll_wait_ns = 64_000
-    deadline = time.monotonic() + refpll_wait_ns / 1_000_000_000
-    if not (getattr(dev, "memx_wait", None) and dev.memx_wait(
-        0x137390, 0x00020000, 0x00020000, refpll_wait_ns)):
-      while not (dev.read32(0x137390) & 0x00020000):
-        if time.monotonic() >= deadline:
-          if os.environ.get("KEPLER_RAM_STRICT_WAIT", "1") != "0":
-            raise TimeoutError("GK104 reference PLL lock timeout (0x137390[17])")
-          break
-        time.sleep(0.00001)
-    mask(0x132028, 0x00080000, 0)
+    rcoef = (p1 << 16) | (n1 << 8) | m1
+    coef_before = dev.read32(0x132024) & 0xffffffff
+    frac_before = dev.read32(0x132034) & 0x0000ffff
+    reprogram = coef_before != rcoef or frac_before != fn1
+    print(f"[nvbios] REFPLL coefficient current={coef_before:#x}/"
+          f"{frac_before:#x} wanted={rcoef:#x}/{fn1:#x} "
+          f"reprogram={'yes' if reprogram else 'no'}", flush=True)
+    if reprogram:
+      mask(0x132000, 0x00000001, 0)
+      mask(0x132020, 0x00000001, 0)
+      dev.write32(0x137320, 0)
+      mask(0x132030, 0xffff0000, fn1 << 16)
+      mask(0x132034, 0x0000ffff, fn1)
+      dev.write32(0x132024, rcoef)
+      mask(0x132028, 0x00080000, 0x00080000)
+      mask(0x132020, 0x00000001, 0x00000001)
+      # Nouveau's MEMX program waits for REFPLL_LOCK (0x137390[17]) for at
+      # most 64 us.  Poll the same condition on the direct host path rather
+      # than assuming a fixed delay was sufficient.
+      refpll_wait_ns = 64_000
+      deadline = time.monotonic() + refpll_wait_ns / 1_000_000_000
+      if not (getattr(dev, "memx_wait", None) and dev.memx_wait(
+          0x137390, 0x00020000, 0x00020000, refpll_wait_ns)):
+        while not (dev.read32(0x137390) & 0x00020000):
+          if time.monotonic() >= deadline:
+            if os.environ.get("KEPLER_RAM_STRICT_WAIT", "1") != "0":
+              raise TimeoutError(
+                  "GK104 reference PLL lock timeout (0x137390[17])")
+            break
+          time.sleep(0.00001)
+      mask(0x132028, 0x00080000, 0)
+    # r1373f4_init(): mode 1 selects refpll as the memory-clock source and
+    # arms the transition before r1373f4_fini commits selector 1.
+    ramfuc_mask(0x1373f4, 0x00000000, 0x00010100)
+    ramfuc_mask(0x1373f4, 0x00000000, 0x00000010)
     if finish:
       finish_refpll()
 
   mask(0x10f808, 0x40000000, 0x40000000)
   ram_block()
+  # gk104_ram_calc_gddr5() quiesces display memory clients for every card
+  # with a display subdevice, then restores them immediately after unblock.
+  # A normal GK104 Nouveau device has that subdevice even with no monitor.
+  dev.write32(0x62c000, 0x0f0f0000)
+  # gk104_ram_calc_gddr5(): early MR1 termination is part of the transition
+  # script *after* ENTER.  The old port queued it before prog0/ENTER (H32).
+  if (mr[1] & 0x03c) != 0x030:
+    mask(0x10f330, 0x0000003c, mr[1] & 0x0000003c)
+    ram_nuts(0x10f330, 0x0000003c, mr1_nuts & 0x0000003c,
+             0x00000000, reg_data=mr1_nuts)
   # vc == !ramcfg_11_02_08; select the DCB tag-0x2e level before refresh
   # sequencing, matching Nouveau's source ordering.
   if not b["ramcfg_11_02_08"]:
@@ -2082,8 +2730,15 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   dev.write32(0x10f65c, 0x11 * cfg["rammap_11_11_0c"])
   dev.write32(0x10f6b8, 0x01010101 * b["ramcfg_11_09"])
   dev.write32(0x10f6bc, 0x01010101 * b["ramcfg_11_09"])
-  dev.write32(0x10f698, 0)
-  dev.write32(0x10f69c, 0)
+  if not b["ramcfg_11_07_08"] and not b["ramcfg_11_07_04"]:
+    data_698 = 0x01010101 * b["ramcfg_11_04"]
+    dev.write32(0x10f698, data_698)
+    dev.write32(0x10f69c, data_698)
+  elif not b["ramcfg_11_07_08"]:
+    dev.write32(0x10f698, 0)
+    dev.write32(0x10f69c, 0)
+  # ram_nuke sets force for the following ramfuc_mask without clearing data.
+  mask(0x10f694, 0xff00ff00, 0x01000100 * b["ramcfg_11_04"], force=True)
   mask(0x10f60c, 0x00000080, 0)
   mask_824 = 0x00070000
   data_824 = 0
@@ -2100,17 +2755,19 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   mask(0x10f824, mask_824, data_824)
   mask(0x10f200, 0x00001000, 0x00000000 if b["ramcfg_11_01_08"] else 0x00001000)
   if dev.read32(0x10f670) & 0x80000000:
-    delay_ns(10_000_000)
+    delay_ns(10_000)
     mask(0x10f670, 0x80000000, 0)
   mask(0x10f82c, 0x00100000, 0x00100000 if b["ramcfg_11_08_01"] else 0)
   mask(0x10f830, 0x00007000,
        (b["ramcfg_11_08_08"] << 13) |
        (b["ramcfg_11_08_04"] << 12) |
        (b["ramcfg_11_08_02"] << 14))
-  # PFB timing registers, copied in the same order as ramgk104.c.
+  # PFB timing registers.  Nouveau rotates the VBIOS array: timing[10] is
+  # 0x10f248, followed by timing[0..9] at 0x10f290..0x10f2e8.
+  timing_values = (timing[10], *timing[:10])
   for reg, value in zip((0x10f248, 0x10f290, 0x10f294, 0x10f298,
                          0x10f29c, 0x10f2a0, 0x10f2a4, 0x10f2a8,
-                         0x10f2ac, 0x10f2cc, 0x10f2e8), timing):
+                         0x10f2ac, 0x10f2cc, 0x10f2e8), timing_values):
     dev.write32(reg, value)
   if _diff["ramcfg_11_08_20"]:
     mask(0x10f200, 0x01000000,
@@ -2124,7 +2781,8 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     data_604 |= b["ramcfg_11_02_03"] << 8
   if _diff["ramcfg_11_01_10"]:
     mask_604 |= 0x70000000
-    data_604 |= 0x70000000
+    if b["ramcfg_11_01_10"]:
+      data_604 |= 0x70000000
   mask(0x10f604, mask_604, data_604)
   mask_614 = 0
   data_614 = 0
@@ -2133,7 +2791,8 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     data_614 |= b["timing_20_30_07"] << 28
   if _diff["ramcfg_11_01_01"]:
     mask_614 |= 0x00000100
-    data_614 |= 0x00000100
+    if b["ramcfg_11_01_01"]:
+      data_614 |= 0x00000100
   mask(0x10f614, mask_614, data_614)
   mask_610 = 0
   data_610 = 0
@@ -2142,7 +2801,8 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     data_610 |= b["timing_20_30_07"] << 28
   if _diff["ramcfg_11_01_02"]:
     mask_610 |= 0x00000100
-    data_610 |= 0x00000100
+    if b["ramcfg_11_01_02"]:
+      data_610 |= 0x00000100
   mask(0x10f610, mask_610, data_610)
 
   mask_808 = 0x33F00000
@@ -2163,23 +2823,31 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   else:
     mask_808 |= 0x40000020
     data_808 |= 0x00000004
-  mask(0x10f808, mask_808, data_808)
-  mask(0x10f694, 0xffffffff, 0)
-  mask(0x10f694, 0xff00ff00, 0x01000100 * b["ramcfg_11_04"])
+  # Final 0x10f808: Nouveau ram_mask preserves bits outside ``mask_808``.
+  # Cold eGPU power-on leaves residual bits (night40ah live ended
+  # ``0x7aa00050`` vs offline golden ``0x72a00000``, xor ``0x08000050``).
+  # Absolute write matches the computed field image on a zero baseline.
+  if os.environ.get("KEPLER_RAM_808_ABSOLUTE", "1") != "0":
+    final_808 = (data_808 & mask_808) | 0x40000000
+    # Keep any bits Nouveau's earlier 0x40000000 set; drop cold residuals.
+    old_808 = dev.read32(0x10f808) & 0xffffffff
+    if (old_808 & mask_808) != (final_808 & mask_808) or (
+        old_808 & ~mask_808 & ~0x40000000):
+      print(f"[nvbios] 0x10f808 absolute {old_808:#x}->{final_808:#x} "
+            f"(clear cold residuals outside mask {mask_808:#x})", flush=True)
+    dev.write32(0x10f808, final_808)
+  else:
+    mask(0x10f808, mask_808, data_808)
   dev.write32(0x10f870, 0x11111111 * b["ramcfg_11_03_0f"])
-  mask(0x100778, 0x00000700,
-       (b["timing_20_30_07"] << 8) |
-       (0x80000000 if b["ramcfg_11_01_01"] else 0))
   mask_100770 = ((0x00000003 if _diff["ramcfg_11_02_03"] else 0) |
                  (0x00000004 if _diff["ramcfg_11_01_10"] else 0))
-  old_100770 = dev.read32(0x100770)
-  if mask_100770:
-    new_100770 = ((old_100770 & ~mask_100770) |
-                  (b["ramcfg_11_02_03"] |
-                   (0x00000004 if b["ramcfg_11_01_10"] else 0)))
-    dev.write32(0x100770, new_100770)
-  if ((_diff["ramcfg_11_01_10"] and b["ramcfg_11_01_10"]) and
-      ((old_100770 & 4) != 4)):
+  data_100770 = ((b["ramcfg_11_02_03"]
+                  if _diff["ramcfg_11_02_03"] else 0) |
+                 (0x00000004
+                  if (_diff["ramcfg_11_01_10"] and
+                      b["ramcfg_11_01_10"]) else 0))
+  old_100770 = mask(0x100770, mask_100770, data_100770)
+  if ((old_100770 & mask_100770 & 4) != (data_100770 & 4)):
     mask(0x100750, 0x00000008, 0x00000008)
     dev.write32(0x100710, 0)
     transition_wait_ns = 200_000
@@ -2192,6 +2860,9 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
             raise TimeoutError("GK104 0x100710 transition timeout")
           break
         time.sleep(0.00001)
+  mask(0x100778, 0x00000700,
+       (b["timing_20_30_07"] << 8) |
+       (0x80000000 if b["ramcfg_11_01_01"] else 0))
   mask(0x10f250, 0x000003f0, b["timing_20_2c_003f"] << 4)
   t10 = (timing[10] >> 24) & 0x7f
   mask(0x10f24c, 0x7f000000,
@@ -2238,15 +2909,16 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
   if not cfg.get("rammap_11_08_10", 0): train_data |= 0x00080000
   train(0xbc0f0000, train_data)
   delay_ns(1_000)
+  # Nouveau restores LP3 immediately after the final train wait and before
+  # pulsing 0x10f830[24].  The old port reversed those operations (H31).
+  if mask(0x10f340, 0x00000fff, mr[5]) != mr[5]:
+    delay_ns(1_000)
   mask(0x10f830, 0x01000000, 0x01000000)
   mask(0x10f830, 0x01000000, 0)
   if b["ramcfg_11_07_02"]:
     train(0x80020000, 0x01000000)
-  # Restore LP3 bit from the original MR5 after the temporary training value;
-  # Nouveau waits one microsecond when that write changes state.
-  if mask(0x10f340, 0x00000fff, mr[5]) != mr[5]:
-    delay_ns(1_000)
   ram_unblock()
+  dev.write32(0x62c000, 0x0f0f0f00)
   mask(0x10f200, 0x00000800,
        0x00000800 if cfg.get("rammap_11_08_01", 0) else 0)
   ram_nuts(0x10f200, 0x18808800,

@@ -375,9 +375,202 @@ def _probe():
   finally:
     dev.fini()
 
+def _probe_post_ownership():
+  """Read the inherited Nouveau POST boundary and exit without GPU writes."""
+  dev = APLRemotePCIDevice.probe()
+  if dev is None:
+    print("probe-post-ownership: TinyGPU.app socket is not reachable")
+    raise SystemExit(1)
+  try:
+    boot0, _meta = shared._gk104_ensure_bar0_mmio(dev)
+    class BAR0Dev:
+      def read32(self, r): return dev.mmio_read32(0, r)
+    snap = shared._gk104_post_entry_probe(BAR0Dev())
+    if snap["boot0"] != boot0:
+      raise RuntimeError("PMC_BOOT_0 changed during POST ownership probe")
+    print("probe-post-ownership: " +
+          ("READY for posted Night41h" if snap["night41h_ready"] else
+           "NOT posted/PRAMIN-visible; do not repeat cold BAR1 run"))
+  finally:
+    dev.fini()
+
+def _probe_rom_shadow_ownership():
+  """Read Nouveau's inherited PRAMIN VBIOS-source predicates; write nothing."""
+  dev = APLRemotePCIDevice.probe()
+  if dev is None:
+    print("probe-rom-shadow-ownership: TinyGPU.app socket is not reachable")
+    raise SystemExit(1)
+  try:
+    shared._gk104_ensure_bar0_mmio(dev)
+    class BAR0Dev:
+      def read32(self, r): return dev.mmio_read32(0, r)
+    snap = shared._gk104_rom_shadow_entry_probe(BAR0Dev())
+    print("probe-rom-shadow-ownership: " +
+          ("READY: inherited Nouveau RAMIN source is present" if
+           snap["firmware_shadow_ready"] else
+           "MISSING: cold firmware RAMIN source is not present"))
+  finally:
+    dev.fini()
+
+def _probe_golden_preinit():
+  """Compare all seven safe pre-init golden reads without GPU writes."""
+  dev = APLRemotePCIDevice.probe()
+  if dev is None:
+    print("probe-golden-preinit: TinyGPU.app socket is not reachable")
+    raise SystemExit(1)
+  try:
+    shared._gk104_ensure_bar0_mmio(dev)
+    class BAR0Dev:
+      def read32(self, r): return dev.mmio_read32(0, r)
+    snap = shared._gk104_golden_preinit_entry_probe(BAR0Dev())
+    print(f"probe-golden-preinit: mismatches="
+          f"{[hex(reg) for reg in snap['mismatch_regs']]}")
+  finally:
+    dev.fini()
+
+def _probe_option_rom_vga_preamble():
+  """A/B the proven x86-ROM VGA prefix against immediate PRAMIN state."""
+  dev = APLRemotePCIDevice.probe()
+  if dev is None:
+    print("probe-option-rom-vga-preamble: TinyGPU.app socket is not reachable")
+    raise SystemExit(1)
+  try:
+    shared._gk104_ensure_bar0_mmio(dev)
+    class BAR0Dev:
+      def read32(self, r): return dev.mmio_read32(0, r)
+      def write32(self, r, v): dev.mmio_write32(0, r, v)
+      def read8(self, r): return dev.mmio_read(0, r, 1)[0]
+      def write8(self, r, v): dev.mmio_write(0, r, bytes((v & 0xff,)))
+    bar0 = BAR0Dev()
+    before = shared._gk104_post_entry_probe(bar0)
+    image = shared.nvbios_init.find_vbios_image(
+        pathlib.Path(shared.DEFAULT_VBIOS).read_bytes())
+    shared.nvbios_init.NvbiosInit(bar0, image).option_rom_vga_enable_prefix()
+    after = shared._gk104_post_entry_probe(bar0)
+    activated = bool(after["pramin_positive"] and
+                     not before["pramin_positive"])
+    print("probe-option-rom-vga-preamble: "
+          f"before={before['pramin_word']:#010x} "
+          f"after={after['pramin_word']:#010x} activated={activated}")
+  finally:
+    dev.fini()
+
+def _probe_nouveau_init_io():
+  """A/B the executed Palit INIT_IO special case before any other init."""
+  dev = APLRemotePCIDevice.probe()
+  if dev is None:
+    print("probe-nouveau-init-io: TinyGPU.app socket is not reachable")
+    raise SystemExit(1)
+  try:
+    shared._gk104_ensure_bar0_mmio(dev)
+    class BAR0Dev:
+      def read32(self, r): return dev.mmio_read32(0, r)
+      def write32(self, r, v): dev.mmio_write32(0, r, v)
+      def read8(self, r): return dev.mmio_read(0, r, 1)[0]
+      def write8(self, r, v): dev.mmio_write(0, r, bytes((v & 0xff,)))
+    bar0 = BAR0Dev()
+    before = shared._gk104_post_entry_probe(bar0)
+    image = shared.nvbios_init.find_vbios_image(
+        pathlib.Path(shared.DEFAULT_VBIOS).read_bytes())
+    init = shared.nvbios_init.NvbiosInit(bar0, image)
+    if init.rd08(0x85bb) != 0x69:
+      raise RuntimeError("Palit VBIOS INIT_IO opcode moved from 0x85bb")
+    init.offset = 0x85bb
+    init._op_io()
+    if init.offset != 0x85c0:
+      raise RuntimeError(f"INIT_IO ended at unexpected {init.offset:#x}")
+    after = shared._gk104_post_entry_probe(bar0)
+    activated = bool(after["pramin_positive"] and
+                     not before["pramin_positive"])
+    print("probe-nouveau-init-io: "
+          f"before={before['pramin_word']:#010x} "
+          f"after={after['pramin_word']:#010x} activated={activated}")
+  finally:
+    dev.fini()
+
+def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
+  """Bisect Nouveau's POST and base FB/RAM boundaries on one cold entry.
+
+  ``bisect_post_scripts`` keeps one Nouveau interpreter alive, executes the
+  BIT-I top-level scripts in order, and samples the same fixed PRAMIN PA after
+  each script.  The selector is restored after every sample.  Stop at the
+  first positive boundary so a cold cycle identifies one causal script
+  without entering RAM initialization.
+  """
+  dev = APLRemotePCIDevice.probe()
+  if dev is None:
+    print("probe-nouveau-base-lifecycle: TinyGPU.app socket is not reachable")
+    raise SystemExit(1)
+  try:
+    _boot0, ensure_meta = shared._gk104_ensure_bar0_mmio(
+        dev, allow_reset=False)
+    if ensure_meta.get("did_reset"):
+      raise RuntimeError("lifecycle probe forbids PCI reset")
+    class BAR0Dev:
+      def read32(self, r): return dev.mmio_read32(0, r)
+      def write32(self, r, v): dev.mmio_write32(0, r, v)
+      def read8(self, r): return dev.mmio_read(0, r, 1)[0]
+      def write8(self, r, v): dev.mmio_write(0, r, bytes((v & 0xff,)))
+    bar0 = BAR0Dev()
+    before = shared._gk104_post_entry_probe(bar0)
+    if (not shared._gk104_boot0_looks_live(before["boot0"]) or
+        before["posted_marker"] or before["pramin_positive"]):
+      raise RuntimeError(
+          "lifecycle probe requires a live, unposted, PRAMIN-negative cold "
+          f"entry (boot0={before['boot0']:#010x} "
+          f"posted={before['posted_marker']} "
+          f"pramin={before['pramin_word']:#010x}); replug without retry")
+    if os.environ.get("KEPLER_RAMCFG_STRAP") not in (None, ""):
+      raise RuntimeError(
+          "lifecycle probe forbids KEPLER_RAMCFG_STRAP override; "
+          "the post-POST live strap must select RAMCFG")
+    def pramin_positive(words):
+      return any(not shared._gk104_pramin_word_is_stub(word) and
+                 word not in (0x00000000, 0xffffffff) for word in words)
+    image, _bit_i, scripts = shared.vbios_init_info(shared.DEFAULT_VBIOS)
+    os.environ.setdefault("KEPLER_VBIOS_I2C_TRACE", "1")
+    if bisect_post_scripts:
+      init = shared.nvbios_init.NvbiosInit(bar0, image, debug=False)
+      init.unlock_vga_crtc()
+      for index, script in enumerate(scripts):
+        init.run_script(script)
+        words = shared._gk104_pramin_stage_snapshot(
+            bar0, f"POST script[{index}]={script:#06x}", pa=0xfffe0000)
+        if pramin_positive(words):
+          print("probe-nouveau-post-script-bisect: "
+                f"activated=script[{index}]={script:#06x}; "
+                "intentional causal stop before the next script and RAM")
+          return
+      print("probe-nouveau-post-script-bisect: activated=none; "
+            "intentional causal stop before RAM")
+      return
+    shared.nvbios_init.run_vbios_init(bar0, image, scripts, debug=False)
+    after_post = shared._gk104_pramin_stage_snapshot(
+        bar0, "nouveau-measure after POST", pa=0xfffe0000)
+    if pramin_positive(after_post):
+      print("probe-nouveau-base-lifecycle: activated=after-post; "
+            "intentional causal stop before RAM")
+      return
+    shared.nvbios_init.run_vbios_ram_init(bar0, image, debug=False)
+    after_ram = shared._gk104_pramin_stage_snapshot(
+        bar0, "nouveau-measure after RAM", pa=0xfffe0000)
+    stage = "after-ram" if pramin_positive(after_ram) else "none"
+    print("probe-nouveau-base-lifecycle: "
+          f"entry={before['pramin_word']:#010x} "
+          f"post={[hex(word) for word in after_post]} "
+          f"ram={[hex(word) for word in after_ram]} activated={stage}")
+  finally:
+    dev.fini()
+
 def main():
   shared.set_pci_transport_factory(_MacPCIDeviceFactory())
   os.environ.setdefault("KEPLER_NO_AUTO_SUDO", "1")
+  # This diagnostic must observe the cold strap and forbids PCI reset.  Dispatch
+  # before the normal launcher pins the known Palit strap for recovery paths.
+  if "--probe-nouveau-base-lifecycle" in sys.argv:
+    _probe_nouveau_base_lifecycle(); return
+  if "--probe-nouveau-post-script-bisect" in sys.argv:
+    _probe_nouveau_base_lifecycle(bisect_post_scripts=True); return
   # Nouveau golden mmiotrace for this Palit GTX 770 reads 0x101000=0x8040509a
   # (RAMCFG strap 6).  Cold eGPU bring-up sometimes returns 0 from that
   # register and then programs the wrong M0205/M0209 training tables; pin the
@@ -388,6 +581,16 @@ def main():
   os.environ.setdefault("KEPLER_RAM_MEMX_WR", "1")
   if "--probe" in sys.argv:
     _probe(); return
+  if "--probe-post-ownership" in sys.argv:
+    _probe_post_ownership(); return
+  if "--probe-rom-shadow-ownership" in sys.argv:
+    _probe_rom_shadow_ownership(); return
+  if "--probe-golden-preinit" in sys.argv:
+    _probe_golden_preinit(); return
+  if "--probe-option-rom-vga-preamble" in sys.argv:
+    _probe_option_rom_vga_preamble(); return
+  if "--probe-nouveau-init-io" in sys.argv:
+    _probe_nouveau_init_io(); return
   backend = os.environ.get("NV_BACKEND", "kepler")
   offline = any(x in sys.argv for x in (
       "--middle-selftest", "--mmiotrace-selftest",
@@ -398,7 +601,11 @@ def main():
     # Run the complete Nouveau memory transition inside one PMU script.  ENTER
     # may hide host MMIO transiently; LEAVE restores it before the reply.
     os.environ.setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")
-    os.environ.setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "1")
+    # Night40ah: stock memx.fuc waits on FB_PAUSE during atomic ram_program.
+    # Early PMU still loads with ENTER_NOWAIT; add.py reloads waits before RAM.
+    # Skip ENTER+LEAVE preflight under stock wait (can hang before MC train).
+    os.environ.setdefault("KEPLER_RAM_ENTER_WAIT", "1")
+    os.environ.setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "0")
     os.environ.setdefault("KEPLER_RAM_BLOCK", "atomic")
     # Never host-program GDDR5 without MEMX (kills BAR0). Soft PRAMIN live
     # skips the destructive PRAMIN window poke until BAR1 bootstrap.
@@ -407,8 +614,10 @@ def main():
     # Refuse GPC-awake+PRAMIN-stub half-POST (dirty) — that path hung USB4 /
     # WindowServer.  Enclosure power-cycle required; KEPLER_ALLOW_DIRTY=1 opts in.
     os.environ.setdefault("KEPLER_REFUSE_DIRTY", "1")
-    # post-MEMX bit0 then LTC/ZBC (0x100c80/0x17ea*) collapses TinyGPU BAR0.
-    os.environ.setdefault("KEPLER_POST_RAM_LTC", "0")
+    # Night10: post-MEMX bit0 then LTC/ZBC (0x100c80/0x17ea*) collapsed TinyGPU BAR0.
+    # Night40aj: with KEPLER_RAM_BIT0_DEFER=1, run Nouveau post-RAM fb_init_page
+    # + LTC/ZBC in golden order *before* bit0.
+    os.environ.setdefault("KEPLER_POST_RAM_LTC", "1")
     # Host write to 0x4041f0 after bit0 collapses BAR0 (even no-op).
     os.environ.setdefault("KEPLER_PGRAPH_BLCG", "0")
     # Keep ENTER/XFER/LEAVE inside one autonomous PMU routine; standalone

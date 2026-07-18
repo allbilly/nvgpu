@@ -483,9 +483,9 @@ def test_00b_cold_slice_fixture_matches_gz() -> None:
 
 def test_00c_live_ram_program_preserves_golden_slice(
     run_cold: Callable[[FakeMMIO, bytes], None], image: bytes) -> None:
-  """Live default inserts ``ram_program`` between train and LTC.
+  """Explicit reclock diagnostics preserve the RAM-init/LTC golden slices.
 
-  One-shot replug always runs that path (``KEPLER_RAM_PROGRAM=1``).  Assert the
+  ``KEPLER_RAM_PROGRAM=1`` runs that optional path.  Assert the
   golden 1636-write slice still appears as pre (RAMMAP+train) + tail (fb/ZBC/LTC)
   around the direct-host controller block — ram_program must not clobber tables.
   """
@@ -774,7 +774,10 @@ def test_12_macos_replug_preflight() -> None:
   assert 'setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")' in src, \
       "macOS wrapper must default KEPLER_PMU_ENTER_NOWAIT=1 (patch FB_PAUSE hang)"
   assert 'setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")' in src
-  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "1")' in src
+  assert 'setdefault("KEPLER_RAM_ENTER_WAIT", "1")' in src, \
+      "macOS live path must restore Nouveau FB_PAUSE wait for ram_program"
+  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "0")' in src, \
+      "macOS live path must skip ENTER+LEAVE preflight under stock wait"
   assert 'setdefault("KEPLER_RAM_BLOCK", "atomic")' in src, \
       "macOS live path must keep ENTER/program/LEAVE in one PMU script"
   assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in src, \
@@ -787,8 +790,8 @@ def test_12_macos_replug_preflight() -> None:
       "macOS live path must soft-accept virgin PRAMIN (no writeback probe)"
   assert 'setdefault("KEPLER_REFUSE_DIRTY", "1")' in src, \
       "macOS live path must refuse GPC-awake+PRAMIN-stub without power cycle"
-  assert 'setdefault("KEPLER_POST_RAM_LTC", "0")' in src, \
-      "macOS live path must skip post-RAM LTC/ZBC after bit0 (kills BAR0)"
+  assert 'setdefault("KEPLER_POST_RAM_LTC", "1")' in src, \
+      "macOS live path must run Nouveau fb_init_page/LTC before deferred bit0"
   assert 'setdefault("KEPLER_PGRAPH_BLCG", "0")' in src, \
       "macOS live path must skip PGRAPH BLCG writes after bit0 (kills BAR0)"
   assert 'setdefault("KEPLER_RAM_BIT0_DEFER", "1")' in src, \
@@ -812,7 +815,7 @@ def test_12_macos_replug_preflight() -> None:
 
 
 def test_13_live_source_cold_order() -> None:
-  """Live bring-up source must keep golden order: RAM → ram_program → fb/LTC → FECS."""
+  """Optional reclock source must stay between RAM init and fb/LTC."""
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
   src = pcie.read_text(encoding="utf-8")
   # Use the cold-path block markers (unique enough in this file).
@@ -847,7 +850,8 @@ def test_14_oneshot_env_defaults() -> None:
   """Defaults required for first-shot cold Palit bring-up after replug."""
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
   src = pcie.read_text(encoding="utf-8")
-  assert 'os.environ.get("KEPLER_RAM_PROGRAM", "1")' in src
+  assert 'os.environ.get("KEPLER_RAM_PROGRAM", "0")' in src, \
+      "cold default must preserve the trained gk104_ram_init state"
   assert 'os.environ.get("KEPLER_RAM_FREQ", "648")' in src
   assert 'get("KEPLER_RAM_INIT", "1")' in src
   mac = MACOS_WRAPPER.read_text(encoding="utf-8")
@@ -855,7 +859,8 @@ def test_14_oneshot_env_defaults() -> None:
   assert 'setdefault("KEPLER_PMU_MEMX", "1")' in mac
   assert 'setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")' in mac
   assert 'setdefault("KEPLER_RAM_MEMX_ATOMIC", "1")' in mac
-  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "1")' in mac
+  assert 'setdefault("KEPLER_RAM_ENTER_WAIT", "1")' in mac
+  assert 'setdefault("KEPLER_RAM_ATOMIC_PREFLIGHT", "0")' in mac
   assert 'setdefault("KEPLER_RAM_BLOCK", "atomic")' in mac
   assert 'setdefault("KEPLER_RAM_BLOCK", "0")' in mac
   assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in mac
@@ -1004,6 +1009,9 @@ def test_20_gk104_boot0_and_dead_bar_guards(add_src: str) -> None:
   assert "physical power or Thunderbolt link cycle required" in add_src
   assert "_gk104_pramin_looks_live" in add_src
   assert "_gk104_pramin_word_is_stub" in add_src
+  assert "_gk104_post_ownership_snapshot" in add_src
+  assert "_gk104_post_entry_probe" in add_src
+  assert "firmware_posted_bit" in add_src
   # Golden Nouveau on this card: PMC_BOOT_0 chip_id 0xe4 (GK104).
   assert GOLDEN_PMC_BOOT0_CHIP == 0xE4
 
@@ -1015,9 +1023,12 @@ def test_21_replug_runbook_in_wrappers() -> None:
   assert "--mmiotrace-selftest" in mac
   # Probe is a separate path; full-add after replug must not depend on probe.
   assert "def _probe" in mac or '"--probe"' in mac
+  assert "--probe-post-ownership" in mac
+  assert "_gk104_post_entry_probe" in mac
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
   pcie_src = pcie.read_text(encoding="utf-8")
   assert "--mmiotrace-selftest" in pcie_src
+  assert "--probe-post-ownership" in pcie_src
   assert "no hardware / pagemap" in pcie_src or "mmiotrace-selftest" in pcie_src
 
 
