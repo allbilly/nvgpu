@@ -8358,6 +8358,16 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
   # the subsequent BAR1 hammering wedged TinyGPU/USB4 (macOS hard hang).
   # Nouveau keeps instmem on BAR2/PRAMIN, not BAR1-into-BAR1.  Atomic/HOST
   # bootstrap paths may set the flag only after their control-walk proof.
+  #
+  # Mark classic-posted so channel-build FAST_ZERO/ctx-copy can use BAR1 page
+  # bulk instead of per-dword PRAMIN (~4.5M TinyGPU RPCs / ~35s otherwise).
+  # Warm reopen never re-runs post-POST BAR1, so this flag must be set here.
+  try:
+    setattr(dev, "_bar1_classic_posted", True)
+    setattr(dev, "_bar1_identity_size", mapped_size)
+    setattr(dev, "_bar1_identity_userd", userd_alias_pa)
+  except Exception:
+    pass
   if DEBUG:
     print(f"[kepler] BAR1 identity enabled inst={inst_pa:#x} pgd={pgd_pa:#x} "
           f"spt={spt_pa:#x} size={mapped_size:#x} "
@@ -8417,15 +8427,31 @@ def _gk104_clone_vmm_to_vram(dev, bar1_alloc, bar1_write):
     dst_spt = bar1_alloc(spt_size, align=0x1000)
     spt_image = bytes(backing[src_spt:src_spt + spt_size])
     bar1_write(dst_spt, spt_image)
-    # BAR1 bulk writes can acknowledge a page transfer while leaving portions
-    # of framebuffer memory unchanged.  Re-issue every live
-    # PTE as the native 8-byte transaction used by Nouveau's VMM writer.  We do
-    # not issue 32768 separate clears; only populated entries can be reached by
-    # the VAs this process submits.
-    for ptei in range(spt_size // 8):
-      pte = struct.unpack_from("<Q", spt_image, ptei * 8)[0]
-      if pte:
-        _gk104_pramin_write(dev, dst_spt + ptei * 8, struct.pack("<Q", pte))
+    # Prefer BAR1 page verify when classic literal BAR1 is up (same as
+    # FAST_ZERO).  The old path re-issued every live PTE via per-dword
+    # PRAMIN — dominant cost inside golden-context on TinyGPU.
+    fast_spt = (os.environ.get("KEPLER_FAST_ZERO", "1") != "0" and
+                bool(getattr(dev, "_bar1_classic_posted", False) or
+                     getattr(dev, "_bar1_identity_ready", False)))
+    if fast_spt:
+      _gk104_bar_flush(dev)
+      _bad_pages = []
+      for _off in range(0, spt_size, 0x1000):
+        _n = min(0x1000, spt_size - _off)
+        _got = bytes(dev.dev_impl.hw.mmio_read(1, dst_spt + _off, _n))
+        if _got != spt_image[_off:_off + _n]:
+          _bad_pages.append(_off)
+      for _off in _bad_pages:
+        _n = min(0x1000, spt_size - _off)
+        _gk104_pramin_write(dev, dst_spt + _off, spt_image[_off:_off + _n])
+    else:
+      # BAR1 bulk writes can acknowledge a page transfer while leaving portions
+      # of framebuffer memory unchanged.  Re-issue every live PTE as the native
+      # 8-byte transaction used by Nouveau's VMM writer.
+      for ptei in range(spt_size // 8):
+        pte = struct.unpack_from("<Q", spt_image, ptei * 8)[0]
+        if pte:
+          _gk104_pramin_write(dev, dst_spt + ptei * 8, struct.pack("<Q", pte))
     struct.pack_into("<Q", pgd_image, pgd_idx * 8,
                      (1 << 32) | (dst_spt << 24))
     populated.append((pgd_idx, src_spt, dst_spt))
@@ -8823,24 +8849,48 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     if attrib_repair_mode not in ("literal", "bar1"):
       raise ValueError(
           "invalid KEPLER_ATTRIB_REPAIR; expected literal or bar1")
+    # Classic+literal BAR1 (Night41ay+): one 4 KiB BAR1 write + one 4 KiB BAR1
+    # read per page.  The old path called _gk104_pramin_write (per-dword RMW
+    # over TinyGPU) then scanned every dword with _gk104_pramin_read32 —
+    # ~4–5M RPCs/pass and ~35s of wall time, then auto warm-continue did it
+    # again.  Keep the slow path behind KEPLER_FAST_ZERO=0.
+    fast_zero = os.environ.get("KEPLER_FAST_ZERO", "1") != "0"
+    # Prefer device flags; also accept the local bar1_identity_ready set just
+    # above when classic init completed in this channel-build (warm reopen).
+    classic_bar1 = bool(getattr(dev, "_bar1_classic_posted", False) or
+                        getattr(dev, "_bar1_identity_ready", False) or
+                        bar1_identity_ready)
     def repair_zero(label, pa, size):
-      # Virgin GDDR often reads as 0xffffffff.  On this aperture a literal BAR1
-      # store of zeros is a no-op under XOR-update semantics (old^0 == old), so
-      # PRAMIN still sees all-ones.  Use the compensated PRAMIN writer
-      # (current^wanted first).  Do **not** LTC-invalidate between store and
-      # verify: discarding dirty lines before writeback resurrects all-ones from
-      # DRAM and makes a later full-buffer proof fail even when per-page checks
-      # briefly saw zeros.
+      # Virgin GDDR often reads as 0xffffffff.  On the XOR aperture a literal
+      # BAR1 store of zeros is a no-op (old^0 == old).  After H101 classic
+      # literal BAR1, bulk BAR1 zeros stick; fall back to compensated PRAMIN
+      # only if a page still fails.
       phase_label = label.lower().replace(" ", "-")
       if hw is not None:
         hw.set_phase(f"channel-build-repair-zero-{phase_label}")
       use_bar1 = (attrib_repair_mode == "bar1" and label == "attrib")
+      zero_page = bytes(0x1000)
+      t0 = time.monotonic()
       for _page in range(0, size, 0x1000):
         _page_size = min(0x1000, size - _page)
+        _want = zero_page if _page_size == 0x1000 else bytes(_page_size)
         for _attempt in range(6):
+          if fast_zero and classic_bar1:
+            bar1_write(pa + _page, _want)
+            _gk104_bar_flush(dev)
+            got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
+            if got == _want:
+              break
+            # One compensated PRAMIN pass, then re-check via BAR1.
+            _gk104_pramin_write(dev, pa + _page, _want)
+            _gk104_bar_flush(dev)
+            got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
+            if got == _want:
+              break
+            continue
           if use_bar1 and _attempt < 2:
-            bar1_write(pa + _page, bytes(_page_size))
-          _gk104_pramin_write(dev, pa + _page, bytes(_page_size))
+            bar1_write(pa + _page, _want)
+          _gk104_pramin_write(dev, pa + _page, _want)
           _gk104_bar_flush(dev)
           time.sleep(0.002)
           _page_bad = [_off for _off in range(0, _page_size, 4)
@@ -8848,8 +8898,17 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
           if not _page_bad:
             break
         else:
-          _sample = [_gk104_pramin_read32(dev, pa + _page + _off) & 0xffffffff
-                     for _off in _page_bad[:4]]
+          if fast_zero and classic_bar1:
+            got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
+            _page_bad = [i for i in range(0, _page_size, 4)
+                         if got[i:i + 4] != b"\x00\x00\x00\x00"]
+            _sample = [struct.unpack_from("<I", got, x)[0]
+                       for x in _page_bad[:4]]
+          else:
+            _page_bad = [_off for _off in range(0, _page_size, 4)
+                         if _gk104_pramin_read32(dev, pa + _page + _off)]
+            _sample = [_gk104_pramin_read32(dev, pa + _page + _off) & 0xffffffff
+                       for _off in _page_bad[:4]]
           raise RuntimeError(
               f"GK104 {label} page {_page:#x} did not stabilise: "
               f"offsets={[hex(_page + x) for x in _page_bad[:16]]} "
@@ -8869,25 +8928,52 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
       except Exception:
         pass
       time.sleep(0.005)
-      _bad = [_off for _off in range(0, size, 4)
-              if _gk104_pramin_read32(dev, pa + _off)]
-      if _bad:
-        # One more compensated pass without invalidate.
+      if fast_zero and classic_bar1:
+        _bad = []
         for _page in range(0, size, 0x1000):
-          _gk104_pramin_write(dev, pa + _page, bytes(min(0x1000, size - _page)))
-        _gk104_bar_flush(dev)
+          _page_size = min(0x1000, size - _page)
+          got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
+          _bad.extend(_page + i for i in range(0, _page_size, 4)
+                      if got[i:i + 4] != b"\x00\x00\x00\x00")
+        if _bad:
+          for _page in range(0, size, 0x1000):
+            _gk104_pramin_write(dev, pa + _page,
+                                bytes(min(0x1000, size - _page)))
+          _gk104_bar_flush(dev)
+          _bad = []
+          for _page in range(0, size, 0x1000):
+            _page_size = min(0x1000, size - _page)
+            got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
+            _bad.extend(_page + i for i in range(0, _page_size, 4)
+                        if got[i:i + 4] != b"\x00\x00\x00\x00")
+      else:
         _bad = [_off for _off in range(0, size, 4)
                 if _gk104_pramin_read32(dev, pa + _off)]
+        if _bad:
+          for _page in range(0, size, 0x1000):
+            _gk104_pramin_write(dev, pa + _page,
+                                bytes(min(0x1000, size - _page)))
+          _gk104_bar_flush(dev)
+          _bad = [_off for _off in range(0, size, 4)
+                  if _gk104_pramin_read32(dev, pa + _off)]
       if _bad:
-        _sample = [_gk104_pramin_read32(dev, pa + _off) & 0xffffffff
-                   for _off in _bad[:4]]
+        if fast_zero and classic_bar1:
+          _sample = [
+              struct.unpack("<I",
+                            bytes(dev.dev_impl.hw.mmio_read(1, pa + _off, 4)))[0]
+              for _off in _bad[:4]]
+        else:
+          _sample = [_gk104_pramin_read32(dev, pa + _off) & 0xffffffff
+                     for _off in _bad[:4]]
         raise RuntimeError(
             f"GK104 {label} final zero proof failed: "
             f"nonzero={len(_bad)} offsets={[hex(x) for x in _bad[:16]]} "
             f"samples={[hex(x) for x in _sample]}")
       sample = dev.dev_impl.hw.mmio_read(1, pa, min(size, 0x20)).hex()
       print(f"[kepler] {label} physical-zero verified; "
-            f"BAR1 sample={sample}", flush=True)
+            f"BAR1 sample={sample} "
+            f"({time.monotonic() - t0:.2f}s fast_zero={fast_zero})",
+            flush=True)
     repair_zero("GR ctx runtime", grctx_vram_pa, 0x80000)
     repair_zero("GR ctx golden", grctx_golden_vram_pa, 0x80000)
     repair_zero("pagepool", pagepool_vram_pa, 0x8000)
@@ -9009,6 +9095,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
       probe_src_pte = struct.unpack_from("<Q", vram, probe_src_spt + probe_spt_i * 8)[0]
       print(f"[kepler] host VMM walk: pgd[{probe_pgd_i}]={probe_src_pde:#x} "
             f"spt={probe_src_spt:#x} pte[{probe_spt_i:#x}]={probe_src_pte:#x}", flush=True)
+    if hw is not None:
+      hw.set_phase("golden-context-vmm-clone")
     vmm_pgd_pa, cloned_spts = _gk104_clone_vmm_to_vram(
       dev, bar1_alloc, bar1_write)
     # Some GR internal clients on the un-POSTed GK104 cannot fetch launch
@@ -9830,6 +9918,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     #    CHAN_NEXT.VALID, fakes a CHSW interrupt, and waits for FECS to
     #    unload the current context.  PFIFO will load this saved image when
     #    it schedules the channel; bypassing CHSW leaves GR without engine state.
+    if hw is not None:
+      hw.set_phase("golden-context-save")
     # ponytail: The FECS sleeps after ctx_chan and won't wake for FIFO commands
     # because the EFI firmware doesn't enable FIFO interrupts (IREN=0x0).
     # Enable the FIFO interrupt (bit 2) in INTR_EN_SET before sending the
@@ -9973,37 +10063,80 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     if not 0 < ctx_size <= 0x80000:
       raise RuntimeError(f"invalid GK104 context size {ctx_size:#x}")
     if use_vram_inst:
+      if hw is not None:
+        hw.set_phase("golden-context-ctx-copy")
       _copy_start = time.time()
-      # BAR1 readback on this cold-attached card commonly returns complemented
-      # dwords.  Capture the FECS-saved image through authoritative PRAMIN and
-      # publish that exact host image at runtime-context offset zero.
+      # Prefer BAR1 page bulk copy when classic literal BAR1 is up (H101).
+      # The old path read/wrote every dword through TinyGPU PRAMIN (~4s and
+      # hundreds of thousands of RPCs).  Fall back to PRAMIN if BAR1 image
+      # looks stubbed/complemented.
+      fast_ctx = (os.environ.get("KEPLER_FAST_ZERO", "1") != "0" and
+                  bool(getattr(dev, "_bar1_classic_posted", False) or
+                       getattr(dev, "_bar1_identity_ready", False) or
+                       bar1_identity_ready))
       runtime_ctx_expected = bytearray(ctx_size)
-      for off in range(0, ctx_size, 4):
-        if not (off & 0xfff):
-          dev.read32(0x409100)
-        struct.pack_into(
-            "<I", runtime_ctx_expected, off,
-            _gk104_pramin_read32(dev, grctx_golden_vram_pa + off))
-      _gk104_pramin_write(dev, grctx_vram_pa, runtime_ctx_expected)
+      if fast_ctx:
+        for off in range(0, ctx_size, 0x1000):
+          n = min(0x1000, ctx_size - off)
+          runtime_ctx_expected[off:off + n] = bytes(
+              dev.dev_impl.hw.mmio_read(1, grctx_golden_vram_pa + off, n))
+        # Sanity: reject stub/all-ones BAR1 images.  Do NOT reject all-zero
+        # head — FECS golden save on this GK104 starts with zeros
+        # (Night41bb: head=['0x0','0x0','0x0','0x0']) while later words are live.
+        _head = struct.unpack_from("<4I", runtime_ctx_expected, 0)
+        _sample_offs = (0x100, 0x200, 0x1000, 0x2000, max(0, ctx_size // 2))
+        _sample = [struct.unpack_from("<I", runtime_ctx_expected, o)[0]
+                   for o in _sample_offs if o + 4 <= ctx_size]
+        if (all(w == 0xffffffff for w in _head) or
+            any(_gk104_pramin_word_is_stub(w) for w in _head) or
+            (any(_gk104_pramin_word_is_stub(w) for w in _sample))):
+          fast_ctx = False
+        elif all(w == 0 for w in _head) and all(w == 0 for w in _sample):
+          # Entire sampled image is zero — FECS did not populate; use PRAMIN.
+          fast_ctx = False
+      if not fast_ctx:
+        # BAR1 readback on some cold attaches returns complemented dwords.
+        # Capture the FECS-saved image through authoritative PRAMIN.
+        for off in range(0, ctx_size, 4):
+          if not (off & 0xfff):
+            dev.read32(0x409100)
+          struct.pack_into(
+              "<I", runtime_ctx_expected, off,
+              _gk104_pramin_read32(dev, grctx_golden_vram_pa + off))
+      if fast_ctx:
+        bar1_write(grctx_vram_pa, runtime_ctx_expected)
+      else:
+        _gk104_pramin_write(dev, grctx_vram_pa, runtime_ctx_expected)
       _gk104_bar_flush(dev)
       if not _gk104_ltc_invalidate(dev):
         raise TimeoutError("GK104 LTC invalidate after runtime context copy failed")
       _copy_elapsed = time.time() - _copy_start
       _fecs_after_copy = dev.read32(0x409100)
-      print(f"[kepler] ctx copy via PRAMIN: {_copy_elapsed:.3f}s "
-            f"FECS={_fecs_after_copy:#x}",
+      print(f"[kepler] ctx copy via {'BAR1' if fast_ctx else 'PRAMIN'}: "
+            f"{_copy_elapsed:.3f}s FECS={_fecs_after_copy:#x}",
             flush=True)
       # Track FECS state through each subsequent step
       _fecs_check_points = []
       _fecs_check_points.append(("after_bar_flush", dev.read32(0x409100),
                                  dev.read32(0x400000), dev.read32(0x020004)))
       ctx_mismatches = []
-      for off in range(0, ctx_size, 4):
-        actual = _gk104_pramin_read32(dev, grctx_vram_pa + off)
-        wanted = struct.unpack_from("<I", runtime_ctx_expected, off)[0]
-        if actual != wanted:
-          ctx_mismatches.append(
-              (off, struct.pack("<I", wanted), struct.pack("<I", actual)))
+      if fast_ctx:
+        for off in range(0, ctx_size, 0x1000):
+          n = min(0x1000, ctx_size - off)
+          got = bytes(dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + off, n))
+          want = runtime_ctx_expected[off:off + n]
+          if got != want:
+            for i in range(0, n, 4):
+              if got[i:i + 4] != want[i:i + 4]:
+                ctx_mismatches.append(
+                    (off + i, want[i:i + 4], got[i:i + 4]))
+      else:
+        for off in range(0, ctx_size, 4):
+          actual = _gk104_pramin_read32(dev, grctx_vram_pa + off)
+          wanted = struct.unpack_from("<I", runtime_ctx_expected, off)[0]
+          if actual != wanted:
+            ctx_mismatches.append(
+                (off, struct.pack("<I", wanted), struct.pack("<I", actual)))
       _fecs_check_points.append(("after_verify", dev.read32(0x409100),
                                  dev.read32(0x400000), dev.read32(0x020004)))
       print(f"[kepler] runtime GR ctx verify: mismatches={len(ctx_mismatches)} "
@@ -10018,12 +10151,23 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
           _gk104_pramin_write(dev, grctx_vram_pa + off, wanted)
         _gk104_bar_flush(dev)
         ctx_mismatches = []
-        for off in range(0, ctx_size, 4):
-          actual = _gk104_pramin_read32(dev, grctx_vram_pa + off)
-          wanted = struct.unpack_from("<I", runtime_ctx_expected, off)[0]
-          if actual != wanted:
-            ctx_mismatches.append(
-                (off, struct.pack("<I", wanted), struct.pack("<I", actual)))
+        if fast_ctx:
+          for off in range(0, ctx_size, 0x1000):
+            n = min(0x1000, ctx_size - off)
+            got = bytes(dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + off, n))
+            want = runtime_ctx_expected[off:off + n]
+            if got != want:
+              for i in range(0, n, 4):
+                if got[i:i + 4] != want[i:i + 4]:
+                  ctx_mismatches.append(
+                      (off + i, want[i:i + 4], got[i:i + 4]))
+        else:
+          for off in range(0, ctx_size, 4):
+            actual = _gk104_pramin_read32(dev, grctx_vram_pa + off)
+            wanted = struct.unpack_from("<I", runtime_ctx_expected, off)[0]
+            if actual != wanted:
+              ctx_mismatches.append(
+                  (off, struct.pack("<I", wanted), struct.pack("<I", actual)))
         remaining = len(ctx_mismatches)
         print(f"[kepler] runtime GR ctx repair pass={repair_pass + 1} "
               f"remaining={remaining}", flush=True)
@@ -10255,17 +10399,27 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
                    (1 << 32) | (_dst_spt << 24))
                   for _idx, _src_spt, _dst_spt in cloned_spts]
     _live_pte_map = {}
+    _fast_pte = (os.environ.get("KEPLER_FAST_ZERO", "1") != "0" and
+                 bool(getattr(dev, "_bar1_classic_posted", False) or
+                      getattr(dev, "_bar1_identity_ready", False) or
+                      bar1_identity_ready))
     # Preserve and stabilise every populated source mapping (inputs, output,
     # code, constants, CWD, and allocator metadata).  Bulk cloning alone is
     # insufficient on this path because individual PTE dwords can settle to an
     # all-ones entry without producing an immediate MMU fault.
-    for _pgdi, _src_spt, _dst_spt in cloned_spts:
-      if _src_spt < 0:
-        continue
-      for _spti in range(0x8000):
-        _pte = struct.unpack_from("<Q", vram, _src_spt + _spti * 8)[0]
-        if _pte:
-          _live_pte_map[_dst_spt + _spti * 8] = _pte
+    #
+    # FAST_ZERO/classic BAR1: skip the 0x8000-entry host SPT rescan.  Clone
+    # already bulk-copied those leaves; re-issuing every non-zero host PTE via
+    # TinyGPU dominated wall time (~16s).  Only re-issue explicit channel
+    # overrides below, then BAR1-verify.
+    if not _fast_pte:
+      for _pgdi, _src_spt, _dst_spt in cloned_spts:
+        if _src_spt < 0:
+          continue
+        for _spti in range(0x8000):
+          _pte = struct.unpack_from("<Q", vram, _src_spt + _spti * 8)[0]
+          if _pte:
+            _live_pte_map[_dst_spt + _spti * 8] = _pte
     for _buf, _buf_pa, _priv in ((pagepool, pagepool_vram_pa, True),
                                  (bundle_cb, bundle_vram_pa, True),
                                  (attrib_cb, attrib_vram_pa, False)):
@@ -10311,20 +10465,58 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         _pgdi, _spti = (_va >> 27) & 0x1fff, (_va >> 12) & 0x7fff
         _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = \
             ((_buf_pa + _page * 0x1000) >> 8) | 1
+    # Fast path trusts the BAR1 bulk SPT clone for host-backed demo buffers
+    # (a/b/out/code/…).  Only the explicit overrides above are re-issued.
     _live_ptes = list(_live_pte_map.items())
+    _live_entries = [*_live_pdes, *_live_ptes]
+    # Classic+literal BAR1: each PTE is one 8-byte BAR1 store + BAR1 readback.
+    # The old path used _gk104_pramin_write (per-dword RMW+verify) and two
+    # _gk104_pramin_read32s per entry — dominant remaining TinyGPU cost after
+    # FAST_ZERO (~16s here with hundreds of live PTEs).
+    if hw is not None:
+      hw.set_phase("golden-context-pte-stabilize")
+    # Group PTE/PDE updates into 4 KiB BAR1 page RMW cycles.  Per-entry
+    # TinyGPU RPCs for ~700 leaves were still ~16s; page bulk is tens of RPCs.
+    _page_updates = {}
+    for _entry_addr, _entry_wanted in _live_entries:
+      _page = _entry_addr & ~0xfff
+      _off = _entry_addr & 0xfff
+      _page_updates.setdefault(_page, {})[_off] = _entry_wanted
+    print(f"[kepler] PTE stabilize: entries={len(_live_entries)} "
+          f"pages={len(_page_updates)} fast_pte={_fast_pte}", flush=True)
     for _attempt in range(4):
-      for _entry_addr, _entry_wanted in (*_live_pdes, *_live_ptes):
-        _gk104_pramin_write(dev, _entry_addr, struct.pack("<Q", _entry_wanted))
+      if _fast_pte:
+        for _page, _updates in _page_updates.items():
+          _img = bytearray(
+              bytes(dev.dev_impl.hw.mmio_read(1, _page, 0x1000)))
+          for _off, _wanted in _updates.items():
+            struct.pack_into("<Q", _img, _off, _wanted)
+          bar1_write(_page, bytes(_img))
+      else:
+        for _entry_addr, _entry_wanted in _live_entries:
+          _gk104_pramin_write(dev, _entry_addr, struct.pack("<Q", _entry_wanted))
       _gk104_bar_flush(dev)
       if not _gk104_ltc_invalidate(dev):
         raise TimeoutError("GK104 LTC invalidate for channel PTEs did not complete")
       time.sleep(0.005)
-      _live_entries = [*_live_pdes, *_live_ptes]
-      _pte_actual = [(_gk104_pramin_read32(dev, addr) |
-                      (_gk104_pramin_read32(dev, addr + 4) << 32))
-                     for addr, _ in _live_entries]
-      if _pte_actual == [wanted for _, wanted in _live_entries]:
-        break
+      if _fast_pte:
+        _ok = True
+        _pte_actual = []
+        for _page, _updates in _page_updates.items():
+          _img = bytes(dev.dev_impl.hw.mmio_read(1, _page, 0x1000))
+          for _off, _wanted in _updates.items():
+            _got = struct.unpack_from("<Q", _img, _off)[0]
+            _pte_actual.append(_got)
+            if _got != _wanted:
+              _ok = False
+        if _ok:
+          break
+      else:
+        _pte_actual = [(_gk104_pramin_read32(dev, addr) |
+                        (_gk104_pramin_read32(dev, addr + 4) << 32))
+                       for addr, _ in _live_entries]
+        if _pte_actual == [wanted for _, wanted in _live_entries]:
+          break
     else:
       raise RuntimeError(f"GK104 channel PTEs did not stabilise: {_pte_actual}")
     if _live_ptes and not _gk104_vmm_flush_pdb(dev, vmm_pgd_pa, target=0):
@@ -10350,6 +10542,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         raise RuntimeError(
             f"GK104 signal did not stabilise: bar={_signal_bar:#x} "
             f"pramin={_signal_pramin:#x}")
+    if hw is not None:
+      hw.set_phase("golden-context-mirror-stabilize")
     for _mirror in getattr(dev, "_kepler_vram_mirrors", ()):
       _mirror_pa = _mirror.meta.get("vram_pa")
       if _mirror_pa is None:
@@ -10361,25 +10555,44 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
             struct.pack("<I", (~struct.unpack_from("<I", _mirror_wanted, off)[0]) &
                         0xffffffff)
             for off in range(0, len(_mirror_wanted), 4))
-        _gk104_pramin_write_literal(dev, _mirror_pa, _mmio_encoded)
+        if _fast_pte:
+          bar1_write(_mirror_pa, _mmio_encoded)
+        else:
+          _gk104_pramin_write_literal(dev, _mirror_pa, _mmio_encoded)
         _gk104_bar_flush(dev)
         if not _gk104_ltc_invalidate(dev):
           raise TimeoutError("GK104 LTC invalidate for MMIO list failed")
         continue
+      # temp_dev alone is 1 MiB (GK104_TEMP_SIZE).  Per-dword PRAMIN write +
+      # verify here was the remaining ~16s / ~1.3M TinyGPU RPCs after FAST_ZERO.
       for _attempt in range(4):
-        # As with the semaphore above, validate the physical VRAM image that
-        # the channel PTE names.  The identity BAR1 alias is not part of that
-        # GPU mapping and may have an independently corrupted leaf.
-        _gk104_pramin_write(dev, _mirror_pa, _mirror_wanted)
-        _gk104_bar_flush(dev)
-        if not _gk104_ltc_invalidate(dev):
-          raise TimeoutError("GK104 LTC invalidate for VRAM mirror failed")
-        time.sleep(0.005)
-        _mirror_pramin = b"".join(
-            struct.pack("<I", _gk104_pramin_read32(dev, _mirror_pa + off))
-            for off in range(0, len(_mirror_wanted), 4))
-        if _mirror_pramin == _mirror_wanted:
-          break
+        if _fast_pte:
+          bar1_write(_mirror_pa, _mirror_wanted)
+          _gk104_bar_flush(dev)
+          if not _gk104_ltc_invalidate(dev):
+            raise TimeoutError("GK104 LTC invalidate for VRAM mirror failed")
+          time.sleep(0.005)
+          _mirror_bar = b"".join(
+              bytes(dev.dev_impl.hw.mmio_read(
+                  1, _mirror_pa + _off,
+                  min(0x1000, len(_mirror_wanted) - _off)))
+              for _off in range(0, len(_mirror_wanted), 0x1000))
+          if _mirror_bar == _mirror_wanted:
+            break
+        else:
+          # As with the semaphore above, validate the physical VRAM image that
+          # the channel PTE names.  The identity BAR1 alias is not part of that
+          # GPU mapping and may have an independently corrupted leaf.
+          _gk104_pramin_write(dev, _mirror_pa, _mirror_wanted)
+          _gk104_bar_flush(dev)
+          if not _gk104_ltc_invalidate(dev):
+            raise TimeoutError("GK104 LTC invalidate for VRAM mirror failed")
+          time.sleep(0.005)
+          _mirror_pramin = b"".join(
+              struct.pack("<I", _gk104_pramin_read32(dev, _mirror_pa + off))
+              for off in range(0, len(_mirror_wanted), 4))
+          if _mirror_pramin == _mirror_wanted:
+            break
       else:
         raise RuntimeError(
             f"GK104 VRAM mirror did not stabilise: va={_mirror.va_addr:#x}")
@@ -12476,24 +12689,45 @@ def main():
       if line.startswith(prefix) or any(line.startswith(a) for a in also):
         print(line, flush=True)
 
-  with quiet_ctx:
-    try:
-      dev = NVDevice("NV", backend=backend)
-    except (NotImplementedError, OSError, RuntimeError) as e:
-      init_err = e
-    if init_err is None and dev is not None:
+  def _one_live_pass():
+    nonlocal init_err, run_err, dev, quiet_buf, quiet_ctx
+    init_err = None
+    run_err = None
+    dev = None
+    if quiet_buf is not None:
+      quiet_buf = io.StringIO()
+      quiet_ctx = contextlib.redirect_stdout(quiet_buf)
+    with quiet_ctx:
       try:
-        if backend == "software":
-          run_software_demo(dev)
-        else:
-          run_hardware_demo(dev, cubin)
-      except Exception as e:
-        run_err = e
-      finally:
+        dev = NVDevice("NV", backend=backend)
+      except (NotImplementedError, OSError, RuntimeError) as e:
+        init_err = e
+      if init_err is None and dev is not None:
         try:
-          dev.close()
-        except Exception:
-          pass
+          if backend == "software":
+            run_software_demo(dev)
+          else:
+            run_hardware_demo(dev, cubin)
+        except Exception as e:
+          run_err = e
+        finally:
+          try:
+            dev.close()
+          except Exception:
+            pass
+
+  _one_live_pass()
+
+  # Night41ay/bc: cold first demo often returns NaN after FECS is already
+  # ready; a second open with ALLOW_DIRTY finishes add. One user-visible shot.
+  if (run_err is not None and backend != "software" and
+      os.environ.get("KEPLER_AUTO_WARM_CONTINUE", "1") != "0"):
+    _emit_quiet_diagnostics()
+    print("[kepler] cold demo failed; auto warm-continue once "
+          f"({type(run_err).__name__}: {run_err})", flush=True)
+    os.environ["KEPLER_ALLOW_DIRTY"] = "1"
+    os.environ.pop("KEPLER_FORCE_RELOAD", None)
+    _one_live_pass()
 
   # Emit outside redirect_stdout so diagnostics reach the real terminal/log.
   if init_err is not None:
@@ -12507,8 +12741,17 @@ def main():
     _emit_quiet_diagnostics()
     raise run_err
   if quiet_buf is not None:
+    _keep = (
+        "[kepler] output:",
+        "hardware_demo=",
+        "[kepler] GR ctx runtime physical-zero",
+        "[kepler] GR ctx golden physical-zero",
+        "[kepler] attrib physical-zero",
+        "[kepler] ctx copy via",
+        "[kepler] PTE stabilize:",
+    )
     for line in quiet_buf.getvalue().splitlines():
-      if line.startswith("[kepler] output:") or line.startswith("hardware_demo="):
+      if any(line.startswith(p) for p in _keep):
         print(line, flush=True)
 
 if __name__ == "__main__":

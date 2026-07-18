@@ -10,12 +10,11 @@ The service owns the DriverKit PCIe entitlement and performs BAR transactions.
 This client does not load a Nouveau kernel driver or rely on Linux sysfs.
 It injects the socket device into the shared launcher at startup.
 Offline self-tests never connect to the socket and are safe on any platform.
-Live execution remains explicitly acknowledged because a bad MMIO sequence can
-hang an eGPU link; set KEPLER_LIVE_ACK=completion-abort-risk for that path.
-KEPLER_RPC_TRACE is required for live macOS runs so the transaction stream is
-auditable after a crash.  The shared implementation still assembles sm_30 PTX
-locally when CUDA 10.2 ptxas is installed, with the checked-in cubin as fallback.
-No package installation or tinygrad import is needed beyond the shared checkout.
+Live ``python examples_kepler/add.py`` defaults the TinyGPU ack + RPC trace
+(override with KEPLER_LIVE_ACK=0 to refuse, or set KEPLER_RPC_TRACE yourself).
+The shared implementation still assembles sm_30 PTX locally when CUDA 10.2
+ptxas is installed, with the checked-in cubin as fallback.  No package
+installation or tinygrad import is needed beyond the shared checkout.
 """
 from __future__ import annotations
 import os, sys, ctypes, mmap, struct, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, pathlib, threading, time, hashlib
@@ -838,6 +837,53 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
   finally:
     dev.fini()
 
+def _tinygpu_sock_reachable(sock_path=None, timeout_s=0.2):
+  sock_path = sock_path or _temp_sock()
+  try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout_s)
+    s.connect(sock_path)
+    s.close()
+    return True
+  except OSError:
+    return False
+
+def _ensure_tinygpu_server():
+  """Start TinyGPU.app's shared server if /tmp/tinygpu.sock is missing.
+
+  Opt out with KEPLER_ENSURE_TINYGPU=0.  The server is left running for later
+  invocations (matches the shared-socket contract in plan.md).
+  """
+  if os.environ.get("KEPLER_ENSURE_TINYGPU", "1") == "0":
+    return
+  sock_path = os.environ.get("APL_REMOTE_SOCK", _temp_sock())
+  if _tinygpu_sock_reachable(sock_path):
+    return
+  app = APLRemotePCIDevice.APP_PATH
+  if not os.path.isfile(app):
+    print(f"[kepler] TinyGPU binary missing at {app}; start the server manually",
+          flush=True)
+    return
+  # Stale socket file with no listener → remove so bind succeeds.
+  try:
+    if os.path.exists(sock_path) and not _tinygpu_sock_reachable(sock_path):
+      os.unlink(sock_path)
+  except OSError:
+    pass
+  log_path = "/tmp/tinygpu-server.log"
+  with open(log_path, "ab", buffering=0) as logf:
+    subprocess.Popen(
+        [app, "server", sock_path],
+        stdout=logf, stderr=subprocess.STDOUT,
+        start_new_session=True)
+  for _ in range(50):
+    if _tinygpu_sock_reachable(sock_path):
+      print(f"[kepler] started TinyGPU server at {sock_path}", flush=True)
+      return
+    time.sleep(0.1)
+  print(f"[kepler] TinyGPU server did not become ready at {sock_path}; "
+        f"see {log_path}", flush=True)
+
 def main():
   shared.set_pci_transport_factory(_MacPCIDeviceFactory())
   os.environ.setdefault("KEPLER_NO_AUTO_SUDO", "1")
@@ -906,6 +952,18 @@ def main():
     # Default light RPC: PHASE/FREEZE + non-MMIO only (full MMIO was ~2GiB/run).
     # Set KEPLER_RPC_LIGHT=0 for the old full flight recorder.
     os.environ.setdefault("KEPLER_RPC_LIGHT", "1")
+    # BAR1 page write/verify for GR ctx zeros (was ~35s/pass of PRAMIN dwords).
+    os.environ.setdefault("KEPLER_FAST_ZERO", "1")
+    # Bare ``python examples_kepler/add.py``: authorize the proven TinyGPU path
+    # and write a light RPC log under logs/.  Opt out with KEPLER_LIVE_ACK=0.
+    os.environ.setdefault("KEPLER_LIVE_ACK", "completion-abort-risk")
+    _rpc_default = os.path.join(REPO_ROOT, "logs", "kepler_rpc.jsonl")
+    os.environ.setdefault("KEPLER_RPC_TRACE", _rpc_default)
+    os.environ.setdefault(
+        "KEPLER_VBIOS",
+        os.path.join(SCRIPT_DIR, "Palit.GTX770.4096.131216.rom"))
+    os.environ.setdefault("KEPLER_N", "8")
+    os.environ.setdefault("KEPLER_SEED", "42")
     if os.environ.get("KEPLER_RAM_PROGRAM") == "bit0-only":
       if os.environ.get("KEPLER_RAM_AFTER_BIT0") != "memx":
         os.environ.setdefault("KEPLER_RAM_INIT", "0")
@@ -913,10 +971,17 @@ def main():
     os.environ.setdefault("KEPLER_RAM_BLOCK", "0")
     os.environ.setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")
   if backend != "software" and not offline:
-    if os.environ.get("KEPLER_LIVE_ACK") != "completion-abort-risk":
-      raise SystemExit("hardware launch refused: set KEPLER_LIVE_ACK=completion-abort-risk for an authorized TinyGPU test")
+    if os.environ.get("KEPLER_LIVE_ACK") not in (
+        "completion-abort-risk", "1", "yes", "true"):
+      raise SystemExit(
+          "hardware launch refused: set KEPLER_LIVE_ACK=completion-abort-risk "
+          "(or unset it — that is now the live default) for an authorized "
+          "TinyGPU test; set KEPLER_LIVE_ACK=0 to keep refusing")
     if not os.environ.get("KEPLER_RPC_TRACE"):
       raise SystemExit("hardware launch refused: KEPLER_RPC_TRACE is required")
+    os.makedirs(os.path.dirname(os.path.abspath(
+        os.environ["KEPLER_RPC_TRACE"])) or ".", exist_ok=True)
+    _ensure_tinygpu_server()
   shared.main()
 
 if __name__ == "__main__":

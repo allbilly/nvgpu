@@ -4,15 +4,8 @@
 Same TinyGPU transport and bring-up as ``examples_kepler/add.py``, but launches
 the sm_30 ``mul`` cubin (``out[i] = a[i] * b[i]``) and checks that result.
 
-Live path (warm recipe that already proved add)::
+Live path::
 
-  KEPLER_LIVE_ACK=completion-abort-risk \\
-  KEPLER_RPC_TRACE=logs/mul.rpc \\
-  KEPLER_N=8 KEPLER_SEED=42 KEPLER_PRINT_IO=1 \\
-  KEPLER_TINYGPU_ATOMIC_BAR1=0 KEPLER_PRAMIN_MEMX=0 KEPLER_RAM_BIT0_DEFER=0 \\
-  KEPLER_PMU_MEMX=0 KEPLER_PRAMIN_LITERAL=1 KEPLER_PRAMIN_LITERAL_FIRST=1 \\
-  KEPLER_USERD_ALIAS=0 KEPLER_BAR1_MAP_SIZE=0x1000000 KEPLER_PGRAPH_BLCG=0 \\
-  KEPLER_RAM_PROGRAM=0 \\
   python3 examples_kepler/mul.py
 """
 from __future__ import annotations
