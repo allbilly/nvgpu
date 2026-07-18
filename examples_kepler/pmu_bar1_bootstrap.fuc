@@ -1,16 +1,13 @@
 /* GK104 PMU autonomous BAR1-root bootstrap (Falcon v4) @ 0xb14.
  *
- * Night40u proved a standalone MEMX ENTER cannot return to the host: clearing
- * 0x1620[0] hides PMU host MMIO until LEAVE.  Own the complete critical section
- * here instead: enter with the same steady-state values observed on GK104,
- * xdst the three roots through direct-VRAM MEMIF, restore LEAVE state, publish
- * DONE, and let the host enable+flush BAR1 only after DONE is visible.
+ * Own the complete ENTER -> direct-VRAM root transfer -> LEAVE boundary.
+ * The host stages the Nouveau BAR1 instance/PDE/PTE roots at DMEM 0xd80 and
+ * configures PMU MEMIF port0 for direct VRAM before signaling GO.
  */
 
 .section #pmu_bar1_bootstrap 0xb14
 
 bootstrap:
-	/* Armed magic (roots already staged by host at 0xd80). */
 	movw $r3 0xb002
 	sethi $r3 0x40c00000
 	movw $r4 0x0d7c
@@ -26,7 +23,6 @@ wait_go:
 	sub b32 $r3 $r2
 	bra ne #wait_go
 
-	/* MEMX ENTER end state for cold GK104: 0x1620=0x8, 0x26f0=0. */
 	movw $r14 0x1620
 	sethi $r14 0
 	movw $r13 0x0008
@@ -35,56 +31,50 @@ wait_go:
 	movw $r14 0x26f0
 	movw $r13 0x0000
 	call 0x34
-	/* MEMX ENTER asserts FB_PAUSE even when its cold-eGPU ack wait is skipped. */
-	movw $r0 0x07e0
-	sethi $r0 0
+	movw $r0 0x07e4
 	mov $r3 4
 	iowr I[$r0] $r3
-	clear b32 $r0
+	movw $r0 0x07e0
+	mov $r3 4
+	iowr I[$r0] $r3
+	mov $r5 0xff
+pause_poll:
+	movw $r0 0x07c0
+	iord $r6 I[$r0]
+	and $r6 4
+	bra nz #pause_done
+	sub b32 $r5 1
+	bra nz #pause_poll
+pause_done:
 
-	clear b32 $r0
-	mov $xtargets $r0
-
-	/* Store instance+0x200 (16B) at PA 0x100200. */
-	movw $r3 0x1002
-	sethi $r3 0
-	mov $xdbase $r3
+	/* Root instance +0x200: DMEM 0xd80 -> VRAM 0x60200, 16 bytes. */
 	clear b32 $r2
+	movw $r3 0x0602
+	mov $xdbase $r3
 	movw $r1 0x0d80
 	sethi $r1 0x00020000
 	xdst $r2 $r1
 	xdwait
-	xdld $r2 $r1
-	xdwait
 
-	/* PDE 8B at 0x110000. */
-	movw $r3 0x1100
+	/* BAR1 PDE: DMEM 0xd90 -> VRAM 0x40000, 8 bytes. */
+	movw $r3 0x0400
 	mov $xdbase $r3
-	clear b32 $r2
 	movw $r1 0x0d90
 	sethi $r1 0x00010000
 	xdst $r2 $r1
 	xdwait
-	xdld $r2 $r1
-	xdwait
 
-	/* Two PTEs 16B at 0x120000. */
-	movw $r3 0x1200
+	/* Bootstrap PTEs: DMEM 0xda0 -> VRAM 0x50000, 16 bytes. */
+	movw $r3 0x0500
 	mov $xdbase $r3
-	clear b32 $r2
 	movw $r1 0x0da0
 	sethi $r1 0x00020000
 	xdst $r2 $r1
 	xdwait
-	xdld $r2 $r1
-	xdwait
 
-	/* MEMX LEAVE clears FB_PAUSE before restoring the register steady state. */
 	movw $r0 0x07e4
-	sethi $r0 0
 	mov $r3 4
 	iowr I[$r0] $r3
-	clear b32 $r0
 	movw $r14 0x26f0
 	movw $r13 0x0001
 	call 0x34
@@ -92,11 +82,9 @@ wait_go:
 	movw $r13 0x0aab
 	call 0x34
 
-	/* Publish completion only after framebuffer host visibility is restored. */
 	movw $r3 0xb005
 	sethi $r3 0x40c00000
 	movw $r4 0x0d70
-	sethi $r4 0
 	st b32 D[$r4] $r3
 
 done:

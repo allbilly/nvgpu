@@ -2960,8 +2960,898 @@ BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.
     The fake now rejects MEMIF root transfers outside ENTER and verifies
     `ENTER < store/load < LEAVE < enable < first BAR1 access`.
 
+
+54. **Night40ac true cold:** Nouveau comparison confirmed join/PDE/PTE encodings
+    match `gf100_vmm_join_` / `gf100_vmm_pgd_pde` / `gf100_vmm_valid`.  Architectural
+    gap is INST: Nouveau writes BAR instance via PRAMIN/BAR2 (`NVKM_MEM_TARGET_INST`);
+    we cannot.  HOST-PDB experiment staged instance+PGD+SPT in sysmem at
+    `bus_base+{0x100000,0x110000,0x120000}` with HOST join/PDE and pointed
+    `0x1704` at `bus_base+inst` (`ctl=0x80080100`, inst=`0x80100000`).  First BAR1
+    walk returned the same `bad0fb` sentinel — PBUS BAR1 CHAN has no aperture field,
+    so instance fetch is VRAM-only.  HOST escape hatch closed.  `KEPLER_BAR1_HOST_PDB`
+    kept for offline coverage, default off.
+55. **Patched for night40ad:** Nouveau `memx.fuc` ENTER sets `NV_PPWR_OUTPUT_SET`
+    (`0x07e0`) FB_PAUSE then **waits forever** on `OUTPUT` (`0x07c0`) bit2; LEAVE
+    clears and waits bit2 clear.  Our pad previously SET then immediately `xdst`
+    (host ENTER_NOWAIT patches the same infinite wait out of stock MEMX).  Pad now
+    bounded-polls bit2 (≤255 iters), stores `0` or `4` to DMEM `0xd6c`, then `xdst`.
+    Fits exactly in IMEM `0xb14..0xc00` (MEMIF re-arm removed).  Host prints status
+    after DONE.  Live verdict: if status=`4` and loadback still `ff`, pause is not
+    the discard cause; if status=`0`, FB never quiesces under our ENTER masks.
+56. **Night40ad true cold:** pad published `FB_PAUSE_status=0x4 (acked)` then all three
+    post-LEAVE MEMIF loadbacks returned virgin `ff`.  So either (a) pause ack is real
+    and physical VRAM still discards `xdst`, or (b) bit2 was **sticky** after nowait
+    MEMX LEAVE during ram_program (CLR issued, wait-for-clear patched out) and the
+    "ack" was not a rising edge.  Night40ae distinguishes these.
+57. **Patched for night40ae:** rising-edge pause — CLR→poll-clear (`0xd68`)→SET→
+    poll-set (`0xd6c`) before `xdst`.  IMEM budget forces pad to only `xdst` the
+    16-byte join; PGD/SPT skipped until pause edge is proven.
+58. **Night40ae true cold:** `FB_PAUSE_clear=0x0 (ok)` and `FB_PAUSE_set=0x4 (acked)`
+    — rising edge is real; night40ad ack was not sticky.  Join loadback still
+    virgin `ff`.  **FB_PAUSE wait is closed as the discard cause.**  Physical VRAM
+    rejects falcon `xdst` even under Nouveau-correct ENTER masks + rising-edge pause.
+59. **Patched for night40af:** line-by-line Nouveau INST bootstrap is
+    `nv50_instobj_wr32_slow` — `0x001700 = pa>>16` then literal `0x700000+(pa&0xfffff)`
+    (`instmem/nv50.c:62-71`); BAR2 (`0x1714`) is only the fast CPU map after PTs exist
+    (`bar/gf100.c:72-80,130-137`).  Pad PRAMIN-writes the join via `call 0x34`
+    (kernel `wr32`) under rising-edge pause instead of `xdst`.
+60. **Night40af bug:** `nv_iowr` clears `$r0` (`macros.fuc:193-197`); using `$r0` as the
+    PRAMIN loop counter hangs after the first dword (DONE unread).
+62. **Night40ag true cold:** Nouveau PRAMIN pad DONE (`0x40c0b005`) with
+    `FB_PAUSE_set=0x4`, store=`PRAMIN(0x1700/0x700000) r5-loop`, join at
+    `pa=0x30200` (first 512 KiB).  Post-LEAVE MEMIF loadback still virgin `ff`.
+    PRAMIN client path is Nouveau-correct; physical VRAM still rejects stores
+    after cold GDDR under **nowait** atomic `ram_program`.
+63. **Patched for night40ah:** Nouveau `gk104_ram_prog` → `ram_exec(true)` runs
+    GDDR WR32s inside MEMX ENTER that *waits* on `OUTPUT` FB_PAUSE
+    (`memx.fuc:110-115`); LEAVE waits clear (`:131-136`).  Live still loads PMU
+    with `ENTER_NOWAIT` for early MEMX, then reloads stock wait bras before
+    atomic `ram_program` (`KEPLER_RAM_ENTER_WAIT=1`, preflight off).  On EXEC
+    timeout, fall back to nowait once.  Dump MC regs after RAM.  Offline
+    selftest covers refuse-without-opt-in and allow-with-`ENTER_WAIT`.
+64. **Night40ah true cold:** stock ENTER wait during atomic `ram_program`
+    **completed** (no timeout): `FB_PAUSE_wait=on`, `atomic MEMX RAM transition
+    completed`.  MC dump after: `0x10f808=0x7aa00050` (offline golden
+    `0x72a00000`), `0x1620=0xaab`, REFPLL `0x137390=0x30001` (lock bit17 set).
+    Pad still DONE+PRAMIN+pause ack; MEMIF loadback still virgin `ff`.
+    **Closed:** missing FB_PAUSE wait during GDDR `ram_program` is not why
+    physical VRAM discards stores.
+65. **Patched for night40ai:** two Nouveau deltas still open after night40ah:
+    (a) `gk104_ram_prog` does `prog0(1000)` *before* `ram_exec` then
+    `prog0(target)` after — we only applied target tables pre-ENTER;
+    (b) cold `0x10f808` residuals outside Nouveau's mask survive (`xor
+    0x08000050`).  Default `KEPLER_RAM_PROG0_PRE_MHZ=1000` and
+    `KEPLER_RAM_808_ABSOLUTE=1`.
+66. **Night40ai true cold:** `0x10f808 absolute 0x7aa00050->0x72a00000` and
+    MC dump confirms `0x10f808=0x72a00000`; ENTER wait still completes; pad
+    DONE+PRAMIN+pause ack; MEMIF loadback still virgin `ff`.  On this Palit
+    ROM, prog0(1000) and prog0(648) select the **same** RAMMAP entry 2 — so
+    (a) was a no-op.  **Closed:** cold `0x10f808` residuals are not why VRAM
+    discards stores.
+67. **Patched for night40aj:** Nouveau golden order after RAM is
+    `fb_init_page(0x100c80)` then LTC/ZBC (`gf100.c:68-73`, mmiotrace
+    @~0.393s).  Live had `KEPLER_POST_RAM_LTC=0` because night10 collapsed
+    BAR0 when that ran *after* bit0.  With `KEPLER_RAM_BIT0_DEFER=1`, restore
+    `KEPLER_POST_RAM_LTC=1` so post-RAM LTC runs before bit0.
+68. **Night40aj true cold:** post-RAM LTC ran (`ltc_nr=4 parts=4 mask=0x0
+    lpg128=True`) and BAR0 stayed live through FECS + pad.  Pad DONE+PRAMIN+
+    pause ack; MEMIF loadback still virgin `ff`.  **Closed:** skipping
+    Nouveau `fb_init_page`/LTC before deferred bit0 is not why VRAM discards
+    stores.  (LTC `mask=0` with `ltc_nr=4` is Nouveau-correct: no disabled
+    partitions.)
+69. **Patched for night40ak:** pad does Nouveau PRAMIN store then **in-pause**
+    `call 0x4` (`rd32`) of join dword0; DMEM `0xd6c` = expected−got (`0`=match).
+    Fits IMEM exactly `0xb14..0xc00`.  Distinguishes H12 (LEAVE destroys) from
+    “never visible under pause”.
+70. **Night40ak true cold:** `DONE` published;
+    `inpause_rb_delta=0x453004fd (PRAMIN MISMATCH under pause)`; post-LEAVE
+    MEMIF still virgin `ff`.  **Closed H12:** a good PRAMIN store is **not**
+    being destroyed by LEAVE — falcon PRAMIN readback already mismatches while
+    FB_PAUSE is still held.  Physical/client visibility fails inside ENTER.
+    (Delta decode: expected join dword0 `0x10000` − got `0xbad0fb03` =
+    `0x453004fd` — same stub night40al later names absolutely.)
+71. **Night40al true cold (H21):** pad writes known `0xa5a5a5a5` via Nouveau
+    PRAMIN (`0x1700=0`, `0x730200=0x700000+0x30200`) under rising-edge pause;
+    DMEM `0xd6c` = **absolute** got.
+    `inpause_pramin_got=0xbad0fb03 (stub bad0fb; wrote 0xa5a5a5a5)`.
+    **Closed H21:** in-pause PRAMIN is not returning VRAM (neither literal nor
+    virgin `ff`) — it returns the same structured `bad0fb03` sentinel as a
+    broken BAR1 walk.  Address math matches `nv50_instobj_*_slow`
+    (`instmem/nv50.c:62-71`, `set_bar0_window_addr` → `0x1700=pa>>16`).
+72. **Night40am true cold (H22/H23):** host PRAMIN literal at pa `0x30200` with
+    `0x1620=0xaab` (bit0 still set), **no** pad ENTER — Nouveau INST shape
+    (`nv50_instobj_wr32_slow`).
+    `host_pramin_got=0xbad0fb03 (stub bad0fb; wrote 0xa5a5a5a5)`.
+    **Closed H22:** ENTER-scoped PRAMIN is not the differentiator — host outside
+    pause fails identically.  **Closed H23:** all tested FB clients still see the
+    pre-RAM `bad0fb` stub after `ram_program`+LTC.  Stop iterating PRAMIN pads.
+    Note: `0x10f210=0x80000404` this night (was `0x80000303` on al/ak); Nouveau
+    writes absolute `0x80000000` (`ramgk104.c:583,908`).  `0x110974=0xa` still
+    (Nouveau `ram_wait` wants low nibble **0**, `ramgk104.c:149-152`).
+73. **Night40an true cold (H14/H24):** per-part train dump after `ram_program`:
+    `part0..3` at `0x110974/111974/112974/113974` **all** `=0xa` (nibble `0xa`).
+    Nouveau `gk104_ram_train` waits `(st & 0xf)==0` (`ramgk104.c:149-152`).
+    **Closed H14 as present:** training status never clears on any partition.
+    **Closed H24:** PMU `wait` (`kernel.fuc:118-134`) falls through on timeout
+    without failing EXEC — so atomic MEMX_WAIT can “succeed” while nibble stays
+    `0xa`.  Bug was also that H14 `RuntimeError` was swallowed as
+    `MC dump skipped:` — fixed to re-raise.  Run continued into H21 pad (same
+    `bad0fb03`); next cold must stop at H14.
+74. **Night40ao true cold (H25):** H14 now **aborts** bring-up (no H21 pad).
+    Trace: `train trigger mask=0xbc0f0000 data=0x980a0000 parts=4 pmask=0x0
+    waits=4`.  Host 100ms re-poll: status **STUCK** at `0xa`.
+    **Closed H25:** link-train never completes despite correct tables/waits.
+75. **Patched + night40ap (H27):** atomic `set_gpio_level` compared a host
+    re-read to `old` after a *buffered* MEMX write (almost never triggered).
+    Fixed to Nouveau-equivalent `(old&0x3000) != want`.  Live: GPIO `0x18`
+    pulsed; GPIO `0x2e` already at want `0x3000` (`old=0x700a`, `trig=no`).
+    Train still stuck `0xa`.  **Closed H27:** 0x2e pulse not the blocker.
+76. **Night40aq true cold (H29):** requested `KEPLER_TRAIN_WAIT_NS=50000000`
+    to test a presumed 50 ms wait.  The stock-ENTER EXEC hit its exact 60 s
+    host timeout; the nowait fallback hit its exact 15 s timeout.  Later
+    cross-check against MEMX DELAY proves the raw TIMER_LOW unit remains ns;
+    the 50 ms tight wait instead wedged the Falcon's repeated MMIO-read loop.
+    ao/ap already showed `0xa` after Nouveau's 500 us plus host re-poll, so
+    **H29 is closed** and waits above 5 ms/part are now rejected before MEMX.
+    Card dirty; no PRAMIN/BAR1 ran.
+77. **Patched for next cold (H31):** line-by-line audit found the port restored
+    MR5/LP3 *after* the mode-1 `0x10f830[24]` set/clear pulse.  Nouveau does
+    final train + wait, MR5/LP3 restore (+ optional 1 us), then the pulse
+    (`ramgk104.c:642-657`).  Reordered the port and added an atomic-script
+    ordering assertion.  This sits directly at the stuck train-completion
+    boundary; live effect remains unverified until an enclosure power cycle.
+78. **Patched for next cold (H32):** a broader execution-order audit found the
+    port queued early MR1 termination before `prog0(1000)`, `0x10f808`, and
+    MEMX ENTER.  Nouveau executes `prog0(1000)` first, then its transition is
+    `0x10f808 → ENTER → early MR1` (`ramgk104.c:260-269,1231-1245`).  Moved
+    MR1 after ENTER and added script-order assertions.  Unlike H31, this is
+    before the failing train and is now the leading causal hypothesis.
+79. **Night40ar true cold:** H32/H31 exact ordering completed, but all four
+    train nibbles remained `0xa` through the stock wait plus 1 s host re-poll.
+    **Closed H31/H32 as blockers.**  Strict H14 stopped before PRAMIN/BAR1.
+80. **Patched for next cold (H33):** source audit found the active
+    `0x10f670[31]` settling delay was 10,000,000 ns in the port versus exactly
+    10,000 ns in Nouveau (`ramgk104.c:440-443`)—1000× too long immediately
+    before PFB timing/MR setup.  Corrected to 10 us.
+81. **Patched for next cold (H34):** the port unconditionally zeroed
+    `0x10f698/69c`, then much later cleared all of `0x10f694` before applying
+    its RAMCFG field.  Nouveau conditionally programs `0x10f698/69c` and
+    immediately forces one *preserved* `0x10f694[ff00ff00]` update
+    (`ramgk104.c:397-412`).  Strap 6 takes the zero branch for 698/69c, but
+    the late destructive 694 sequence was active.  Replaced it with one early
+    preserved write and asserted its exact command-stream position.
+82. **Patched for next cold (H35):** Nouveau updates `0x100770`, performs the
+    bit-2 transition wait if its selected value changed, and only then masks
+    `0x100778` (`ramgk104.c:554-574`).  The port wrote 778 first and built the
+    770 full value with unmasked selected fields.  Reordered and rebuilt the
+    masked data exactly.  Also fixed selected-value handling for the
+    `0x10f604/610/614` diff fields; the 610/614 differences are dormant on
+    this ROM, while the 604/770 path is active.
+83. **Patched for next cold (H36, leading):** all eleven PFB timing words were
+    shifted by one register.  Nouveau writes `timing[10]` to `0x10f248`, then
+    `timing[0..9]` to `0x10f290..0x10f2e8` (`ramgk104.c:461-471`); the port
+    zipped `timing[0..10]` straight across those addresses.  Corrected the
+    rotation and added an exact address/value assertion over the flattened
+    atomic MEMX script.  This is pre-training and changes every timing register,
+    making it the strongest current explanation for all parts sticking at
+    `0xa`.
+84. **Patched/instrumented (H37):** `nvkm_gddr5_calc()` saves the ordinary
+    MR1 termination image for partition mirrors and selects the alternate
+    image for the main controller only when `pnuts != 0`; the port had those
+    images reversed.  Corrected it and made early zero `0x022438` use the same
+    bounded four-part topology fallback as the train waits.  Next cold logs
+    `0x110204` values and computed `pnuts`.  Both Palit timing fields equal 3,
+    so the MR1 inversion itself is dormant for this ROM; topology fallback
+    matters only if the live partition configurations differ.
+85. **Night40as true cold:** the complete H33–H37 command image executed.
+    Live topology was exact and homogeneous: `parts=4`, `pmask=0`,
+    `0x110204..113204=0x0255a000`, `pnuts=0`.  All four train nibbles still
+    stayed `0xa` through Nouveau's 500 us waits plus 1 s host re-poll; strict
+    H14 aborted before PRAMIN/BAR1.  **Closed H33–H37 as blockers.**
+86. **Closed H38:** Nouveau `nvbios_post()` executes a separate BIT-I `+14`
+    script after the normal script table.  This Palit ROM points it at
+    `0xacfa`, which is a single `DONE` opcode, so omitting it has no hardware
+    effect.
+87. **Patched for next cold (H39, leading):** dynamic strap-6 replay covered
+    580 NVINIT opcode dispatches and found no executed PLL, COMPUTE_MEM,
+    CONFIGURE_MEM, or CONFIGURE_CLK opcodes.  It did find one executed
+    `INIT_GPIO` at ROM `0x8b2d`; the Python interpreter treated it as a no-op.
+    Nouveau resets every non-unused DCB entry to its default, pulses
+    `0x00d604`, writes each GPIO low-byte metadata field, and installs the
+    `0x00d740` routing entries (`bios/init.c:1960-1973`,
+    `gpio/gf119.c:27-50`).  Ported that behavior for all 23 active Palit GPIOs,
+    implemented `GPIO_NE` too, and added exact offline state/trigger assertions.
+88. **Opened H40/H41 (literal-port boundary):** `gk104_ram_calc/prog` is a
+    reclocking transition built after devinit, GPIO, FB construction, topology,
+    and a readable former memory clock; this userspace path invokes it against
+    a cold un-POSTed card.  H40 asks whether missing/invalid former state—not a
+    remaining line inside `gk104_ram_calc_gddr5()`—is the blocker.  H41 asks
+    whether TinyGPU-required execution differences (all-MEMX prog0, ENTER wait
+    patching, no Linux IRQ/subdev lifecycle) change semantics despite matching
+    register order.  Prove both with a source-literal command/state oracle and
+    stop at its first divergence; do not blindly translate unrelated Nouveau.
+89. **Night40at true cold (H39):** live devinit selected `INIT_GPIO_NE`, reset
+    18 non-excluded functions, and changed eight (`0x18,0x23,0x34,0x2e,0x79,
+    0x07,0x51,0x52`).  The RAM transition then found memory GPIOs `0x18` and
+    `0x2e` already at their requested levels.  Atomic RAMFUC completed, but
+    all four train nibbles stayed `0xa` through 1 s host re-poll; strict H14
+    stopped before PRAMIN/BAR1.  **Closed H39 as blocker.**
+90. **Patched + night40au (H42):** the straight NVINIT port had stubbed all
+    VGA indexed I/O.  Ported Nouveau's exact GK104 byte transactions at
+    `0x601000+port` and added index/data address-order tests.  Palit's one
+    executed read was CRTC index `0x8d`; live value was `0x00`, preserving the
+    same `INIT_GPIO_NE` path.  All train nibbles still `0xa`.  **Closed H42 as
+    blocker; fixed a real source-port defect.**  The former-memory selector
+    was `0x1373f4[3:0]=1`, so H40's simplest “no readable clock path” form is
+    also closed.
+91. **Patched + night40av (H43):** line-by-line GDDR5 audit found the next
+    omitted source lines: display-memory quiesce `0x62c000=0x0f0f0000` after
+    ENTER and restore `0x0f0f0f00` after LEAVE.  Added both and asserted their
+    position in the atomic stream.  Live transition completed; all four train
+    nibbles remained `0xa`.  **Closed H43 as blocker.**  Post-train refresh
+    low counters vary (`at=0x2d2d`, `au=0x4343`, `av=0x3737`) while bit31 and
+    the stuck nibble are stable; treat them as observations, not a cause yet.
+92. **Night40aw true cold (H41-A):** restored Nouveau's literal host
+    `gk104_ram_prog_0(1000)` before PMU `ram_exec`.  Contrary to older runs,
+    the current PMU reload path accepted the following MEMX smoke and the full
+    atomic transition completed.  All four train nibbles still remained
+    `0xa`; strict H14 stopped before PRAMIN/BAR1.  **Closed H41-A as blocker.**
+    The RAM reload explicitly used unpatched stock FB_PAUSE waits and completed,
+    so the ENTER/LEAVE part of H41-B is already closed by aw/av evidence.
+93. **Patched + night40ax (H45):** `ramfuc_mask()` caches each
+    register and queues WR32 only when the value changes or `ram_nuke` forced
+    it.  Python queued every masked write.  Split source-like change-detect
+    RAMFUC masks from always-write host `nvkm_mask`, retained the forced
+    `0x10f694` update, and made `prog0` issue all seven source host masks.
+    Corrected the test to identify the final `0x10f830[24]` pulse by value and
+    order instead of counting all writes to that register.  Full offline suite
+    green.  Live atomic payload dropped from aw's 188 WR32 words to **138**,
+    proving 50 spurious words were removed, but all four train nibbles stayed
+    `0xa`.  **Closed H45 as blocker; fixed a material source-port defect.**
+94. **Patched + night40ay (H46):** `r1373f4_init()` rebuilds REFPLL only when
+    `0x132024` or `0x132034[15:0]` differs from the calculated coefficient.
+    Python rebuilt it unconditionally immediately before training.  Added the
+    exact coefficient guard and live trace; mismatch and already-matching
+    offline tests both pass.  Cold live found current `0x32301/0x1000` versus
+    wanted `0x11701/0x1000`, so the source guard correctly chose
+    `reprogram=yes`; the old unconditional port would have taken the same
+    active path.  Atomic RAMFUC remained 138 WR32 words and all four train
+    nibbles remained `0xa` through the 1 s host re-poll.  **Closed H46 as a
+    blocker; retained the source-faithful fix.**
+95. **Patched for next cold (H47):** after the conditional
+    REFPLL block, Nouveau's mode-1 path ORs `0x00010100` into `0x1373f4`, then
+    ORs `0x10`, before `r1373f4_fini()`.  Python jumped straight to fini,
+    omitting those source-selection bits.  Added both source masks and an exact
+    flattened-stream tail assertion:
+    `0x10100, 0x10110, 0x10111, 0x00111`.  The full 24-checkpoint mmiotrace
+    suite and software demo pass.  The next cold MC dump also captures
+    `0x1373f4`, `0x132024`, and `0x132034` to prove the committed selector and
+    coefficients rather than infer them from queued commands.
+96. **Night40az true cold (H47):** the two added mode-1 masks were active:
+    atomic RAMFUC grew from 138 to 142 WR32 words, completed, and committed
+    `0x1373f4=0x00000111`.  REFPLL committed the requested
+    `0x132024=0x00011701`, `0x132034[15:0]=0x1000`, with lock/status
+    `0x137390=0x30001`.  All four train nibbles nevertheless remained `0xa`
+    through the 1 s host re-poll, and strict H14 stopped before PRAMIN/BAR1.
+    **Closed H47 as blocker; retained the source-literal fix.**
+97. **Patched for Night41a (H48, leading):** line-by-line comparison moved
+    outside `gk104_ram_calc_gddr5()` to its caller.  Night40az entered with
+    selector 1 and REFPLL `0x32301/0x1000`; Nouveau's exact
+    `gk104_clk_read_mem()` decoder yields **324000 kHz**.  The Palit ROM maps
+    324 MHz to RAMMAP 1/timing 4 and 648 MHz to RAMMAP 2/timing 0.  For this
+    upward transition, `gk104_ram_calc()` first copies target
+    `timing_20_30_07=6` over former value 5, executes that 324-MHz `xition`,
+    returns positive from `prog()`, then the clock core loops and executes the
+    648-MHz target.  Python skipped the first pass.  Ported the exact former
+    clock decoder and active two-pass contract.  Offline atomic evidence now
+    contains two complete scripts with timing[10] values `0x031455a5` then
+    `0x06086442`; full middle, 24-checkpoint mmiotrace, software demo, compile,
+    and diff checks pass.
+98. **Night41a true cold (H48):** both source caller passes executed.  The
+    324-MHz xition kept matching REFPLL `0x32301/0x1000`, used train data
+    `0x880a0000`, and completed with 34 commands / 120 WR32 words.  The
+    following 648-MHz target rebuilt REFPLL to `0x11701/0x1000`, used
+    `0x980a0000`, and completed with 37 commands / 134 words.  Final
+    `0x10f210=0x80001717` differed materially from night40az's one-pass
+    `0x80003939`, proving the intermediate transition affected silicon, but
+    all four nibbles still remained `0xa` through 1 s.  Strict H14 stopped
+    before PRAMIN/BAR1.  **Closed H48 as blocker; retained the caller fix.**
+99. **Instrumented for Night41b (H49, leading fork):** Nouveau's normal
+    `nvkm_fb_init()` calls `nvkm_ram_init()`; `gk104_ram_calc/prog()` belongs
+    to the separate, later clock pstate loop.  Python always ran both but only
+    sampled train status after reclocking.  Added a non-aborting MC/four-part
+    status dump immediately after RAMMAP/training init and before PMU reload or
+    ram_program.  If pre-reclock nibbles are zero, the extra cold reclock is
+    destructive/unnecessary; if they are already `0xa`, the first divergence
+    is POST/devinit or RAM init and further reclock edits are irrelevant.
+100. **Night41b true cold (H49 proven):** the source-ordered VBIOS/RAM init
+    completed with all four train status nibbles **zero**.  The pre-reclock
+    snapshot was `0x10f210=0x80005656`, `0x10f808=0x7aa00050`,
+    `0x10f910/914=0x08020000`, selector `0x1373f4=1`, and REFPLL
+    `0x132024=0x32301` / fraction `0x1000`.  The immediate H48 two-pass
+    324→648 MHz reclock then changed every train nibble to **`0xa`**, with
+    `0x10f210=0x80005c5c`, `0x10f808=0x72a00000`, and
+    `0x10f910/914=0x19080000`.  The nibbles remained `0xa` through the 1 s
+    host re-poll; strict H14 stopped before PRAMIN/BAR1.  **Confirmed H49:**
+    RAM init succeeds and the extra cold reclock destroys its trained state.
+101. **Patched for Night41c (lifecycle fix):** cold bring-up now defaults
+    `KEPLER_RAM_PROGRAM=0`, matching `nvkm_fb_init()` stopping after
+    `nvkm_ram_init()`.  `KEPLER_RAM_PROGRAM=1` remains an explicit reclocking
+    diagnostic.  When reclocking is skipped, the post-init four-part status
+    check is strict, so PRAMIN/BAR1 cannot run unless all train nibbles remain
+    zero.  Normalized the shared sequencer's environment fallback and updated
+    the trace tests.  Compile, middle selftest, all 24 mmiotrace checkpoints
+    (1636 exact cold writes), software demo, and diff checks pass.
+102. **Night41c true cold (H50 classified):** the default skip preserved all
+    four train nibbles at **zero** through FB page/LTC initialization.  The
+    boundary snapshot was `0x10f210=0x80001c1c`,
+    `0x10f808=0x7aa00050`, `0x10f910/914=0x08020000`, selector
+    `0x1373f4=1`, and REFPLL `0x32301/0x1000`.  LTC settled with
+    `0x100c80=0x208000`; FECS reached ready and topology 4×2, then launch
+    reached BAR1 bootstrap.  The embedded PMU pad was still Night40al's closed
+    H21 literal-only diagnostic: it wrote `0xa5a5a5a5` under ENTER, read
+    `0xbad0fb03`, and deliberately raised before any root `xdst`.  Thus H50's
+    preservation half is confirmed, but train nibble zero alone does **not**
+    make direct PRAMIN usable; the first new blocker was stale experiment code.
+103. **Patched for Night41d (H51 fixed / H52 instrumented):** replaced the
+    H21 literal probe with the complete ENTER→three direct-VRAM `xdst`→LEAVE
+    bootstrap for the Nouveau BAR1 instance root (`0x30200`), PDE (`0x10000`),
+    and PTEs (`0x20000`).  Removed the intentional H21 abort and made
+    post-LEAVE MEMIF loadback verify all 40 bytes before `0x1704` enable.
+    Assembled Falcon source is `0xde` bytes, the padded embedded image ends at
+    `0xbf4 < 0xc00`, and source/header/Python bytes match exactly.  Compile,
+    middle selftest, all 24 mmiotrace checkpoints, software demo, and diff
+    checks pass; the fake observes all three loadbacks before BAR1 enable.
+
+### Nouveau line-by-line (PFB timing block) — patched after night40ar
+
+| Source order | Nouveau | Old port | Current port |
+|--------------|---------|----------|--------------|
+| 1 | conditional `0x10f698/69c` | unconditional zero | conditional exact |
+| 2 | forced preserved `0x10f694` | late full clear + mask | one early preserved mask |
+| 3 | `0x10f670` settle 10,000 ns | 10,000,000 ns | 10,000 ns |
+| 4 | `248=t[10]`, `290..2e8=t[0..9]` | `t[0..10]` straight | rotated exact |
+| 5 | selected values gate 604/610/614 data | diff implied set | selected-value exact |
+| 6 | `0x100770` → optional wait → `0x100778` | 778 before 770 | source order exact |
+
+### Nouveau line-by-line (GPIO 0x2e) — night40ap
+
+| Step | Nouveau | Ours | Match? |
+|------|---------|------|--------|
+| `vc = !ramcfg_11_02_08` | strap6 → vc=0 | same | yes |
+| Pre-train GPIO | `func2E[0]` + trig if changed | `set_gpio_level(0x2e,0)` | yes |
+| Change detect | `temp != ram_rd32` after mask | `old&0x3000 != want` (fixed) | yes |
+| Live | — | already `0x3000`, skip trig | expected |
+
+### Nouveau literal-port boundary — after night40av
+
+| Layer/step | Nouveau | Python now | Classification |
+|------------|---------|------------|----------------|
+| NVINIT VGA byte I/O | `0x601000+port` | exact byte index/data | fixed; H42 closed |
+| GPIO reset/defaults | DCB reset + trigger/routes | exact active Palit path | fixed; H39 closed |
+| GDDR5 central body | `ramgk104.c:252-675` | register/order + RAMFUC cache tests | H45 fixed; audit continues |
+| Former memory selector | must be 1 or 2 | live is 1 | prerequisite present |
+| `prog0(1000)` | host before `ram_exec` | literal host mode validated | H41-A closed |
+| ENTER/LEAVE firmware | stock FB_PAUSE waits | stock-wait RAM reload completes | H41-B closed |
+| `0x10f808` final mask | preserve bits outside mask | deliberate absolute cold cleanup | **open H44** |
+| Invocation context | reclock only in later pstate worker | default now stops after RAM init | **H40/H49 fixed** |
+
+### Nouveau line-by-line (mode-1 REFPLL transition) — after night40ay
+
+| Source order | Nouveau | Python now | Evidence |
+|--------------|---------|------------|----------|
+| 1 | compare `0x132024`, `0x132034[15:0]` | exact conditional guard | ay mismatch, rebuild taken |
+| 2 | rebuild REFPLL only on mismatch | exact queued block | H46 closed as blocker |
+| 3 | `0x1373f4 |= 0x00010100` | exact RAMFUC mask | H47 offline exact |
+| 4 | `0x1373f4 |= 0x10` | exact RAMFUC mask | H47 offline exact |
+| 5 | fini selector mode 1, clear bit 16 | exact `0x10111 → 0x00111` | H47 offline exact |
+
+### Nouveau line-by-line (clock caller loop) — Night41a candidate
+
+| Source order | Nouveau | Python now | Evidence |
+|--------------|---------|------------|----------|
+| 1 | `read_mem()` decodes former clock | exact PLL/divider port | `0x32301/0x1000 → 324000 kHz` |
+| 2 | choose former/target RAMMAP entries | 324→entry 1, 648→entry 2 | Palit ROM decoded |
+| 3 | build `xition`; copy three transition fields | exact upward copy | `timing_20_30_07: 5→6` active |
+| 4 | `calc/prog(xition)` | complete 324-MHz atomic pass | offline script exact |
+| 5 | positive return loops to target | complete 648-MHz atomic pass | offline script exact |
+
+### Nouveau lifecycle boundary — Night41b result
+
+| Boundary | Nouveau owner | Python action | Night41b proof |
+|----------|---------------|---------------|----------------|
+| POST/devinit | device preinit | BIT-I scripts | cold path reached valid training |
+| RAMMAP/train tables | FB `nvkm_ram_init()` | source-locked 1636-write cold slice | all four nibbles became `0` |
+| Reclock transition | later clock pstate worker | explicit diagnostic only | immediate run changed all to `0xa` |
+
+### Nouveau line-by-line (BAR1 bootstrap) — Night41d result
+
+| Source order | Nouveau | Python Night41d | Guard/evidence |
+|--------------|---------|-----------------|----------------|
+| 1 | allocate 4 KiB BAR1 INST object | fixed instance bank `0x30000` | layout assertion |
+| 2 | `nvkm_vmm_join()` writes instance root | staged at DMEM `0xd80`, xdst→`0x30200` | 16-byte loadback |
+| 3 | VMM writes PDE and PTEs | staged at `0xd90/0xda0`, xdst→`0x10000/0x20000` | 8+16-byte loadback |
+| 4 | instmem mapping makes root writes durable | PMU direct-VRAM MEMIF under ENTER | **3/3, 40/40 bytes exact after LEAVE** |
+| 5 | PT flush, HUB-only PDB invalidate, flush | exact `0x70000`; `0x100cb8/0x100cbc=0x80000005`; `0x70000` | matches golden trace order |
+| 6 | `gf100_bar_bar1_init()` writes `0x1704=0x80000000|(inst>>12)` | exact `0x80000030` | only after 3/3 match |
+| 7 | `gf100_bar_bar1_wait()` flushes twice | exact double readable flush | live completed; BAR0 remained live |
+| 8 | first BAR1 root walk resolves temporary PTEs | expected `01020000…01030000…` | **failed: structured `bad0fb` walk sentinel** |
+
+### Nouveau allocation boundary — Night41e result / Night41f fix
+
+| Check | Nouveau | Night41e | Night41f |
+|-------|---------|----------|----------|
+| VRAM allocator floor | reserves `[0,0x40000)` for VGA | PGD/SPT/INST all below `0x40000` | PGD=`0x40000`, SPT=`0x50000`, INST=`0x60000` |
+| Physical durability | INST objects live in VRAM | all 40 bytes durable | same 3/3 loadback guard retained |
+| BAR activation | INST address `>>12` | `0x80000030`; walk returned `bad0fb` | `0x80000060`; cold proof pending |
+| Size probe owner | `0x11020c + fbp*0x1000` | legacy `0x10020c` snapshot was a sentinel | corrected four-FBP snapshot |
+
+### Hypothesis ledger (VRAM non-retention)
+
+| ID | Hypothesis | Status | How to prove/disprove |
+|----|------------|--------|------------------------|
+| H01–H14, H19, H21–H26 | prior closed | **closed** | — |
+| H15 | Refresh/MC image wrong despite train zero | **open↓** | PMU MEMIF retains exact bytes while only PBUS clients fail; revisit after PRAMIN ownership is solved |
+| H16 | Missing VBIOS/GPIO beyond known | **open↓** | 0x2e/0x18 OK |
+| H17 | Per-FBP size/decode wrong | **closed** | 41f: four enabled FBPs, each `0x400` MiB; total 4 GiB matches the card |
+| H25 | Link-train HW never completes | **superseded by H40/H49** | 41b proved base RAM init reaches `0`; only the misplaced optional reclock creates `0xa` |
+| H27 | Pre-train GPIO 0x2e broken | **closed** | ap: already correct |
+| H28 | `0xa` sticky success/error not busy | **closed↑** | 41b: valid RAM init is `0`; destructive reclock creates `0xa` |
+| H29 | MEMX_WAIT too short for cold | **closed** | aq: 50ms wedges PMU; stock 500µs + host repoll stuck |
+| H30 | Early refresh/MR sequence wrong | **deferred** | revisit only after base-clock PRAMIN exists; it cannot explain the pre-runtime ownership boundary |
+| H31 | MR5/LP3 restored after mode pulse | **closed, fixed** | ar still `0xa` |
+| H32 | Early MR1 queued before prog0/ENTER | **closed, fixed** | ar still `0xa` |
+| H33–H37 | Corrected PFB timing/order/topology defects | **closed, fixed** | as: exact path still `0xa` |
+| H38 | Missing BIT-I unknown post script | **closed** | ROM target is only `DONE` |
+| H39 | Executed `INIT_GPIO` was a no-op | **closed, fixed** | at: defaults applied; nibble still `0xa` |
+| H40 | Cold card violates Nouveau reclocking prerequisites | **confirmed, fixed** | 41b: reclock is outside FB init and turns `0→a`; default removed |
+| H41-A | Host `prog0(1000)` ordering | **closed** | aw: literal host path completed; nibble `0xa` |
+| H41-B | Stock ENTER/LEAVE wait semantics | **closed** | av/aw stock RAM reload completed |
+| H42 | NVINIT VGA indexed I/O was stubbed | **closed, fixed** | au: CR8d=0; nibble still `0xa` |
+| H43 | Missing display-memory quiesce bracket | **closed, fixed** | av: bracket executed; nibble still `0xa` |
+| H44 | Absolute `0x10f808` differs from source mask | **deferred** | A/B source-preserve only after base-clock PRAMIN exists and cold residual is safe |
+| H45 | RAMFUC unchanged masks incorrectly emitted | **closed, fixed** | ax: 188→138 words; nibble still `0xa` |
+| H46 | REFPLL rebuilt even when coefficients match | **closed, fixed** | ay: coefficients differed, rebuild required; nibble still `0xa` |
+| H47 | Missing mode-1 `0x1373f4 |= 0x10100; |= 0x10` | **closed, fixed** | az: selector `0x111`; nibble still `0xa` |
+| H48 | Missing active former→xition→target caller loop | **closed, fixed** | 41a: two passes changed MC state; nibble still `0xa` |
+| H49 | Train status may fail before, or be broken by, cold reclock | **confirmed, fixed; merged with H40** | 41b: ram_init `0,0,0,0`; immediate reclock `a,a,a,a` |
+| H50 | Preserved trained state yields usable PRAMIN/BAR1 | **disproven** | 41c/d/g preserved zero and PMU-visible data, while PRAMIN/physical BAR1 remained stubbed |
+| H51 | Closed H21 literal-only diagnostic still owns default launch | **confirmed, fixed** | 41c aborted before xdst; restored production transfer pad |
+| H52 | Three PMU xdst roots persist in the PMU MEMIF view with valid train state | **confirmed** | 41d: 3/3 fragments, 40/40 bytes exact after LEAVE; H57 proves this is not global PBUS visibility |
+| H53 | PFB/PBUS BAR client state is incomplete despite durable roots | **superseded by H67/H70** | later boundary probes show runtime initialization never creates live PRAMIN at all |
+| H54 | Root encoding or BAR activation order differs from Nouveau | **closed** | bytes match `vmmgf100.c`; flush/invalidate/enable order matches golden trace |
+| H55 | Missing enabled `gk104_fb_clkgate_pack` causes the walk failure | **closed as golden-path blocker** | `NvPmEnableGating` defaults false; golden writes zero, never the pack's enable values |
+| H56 | BAR roots inside Nouveau-reserved VGA VRAM are not PBUS-walkable | **closed** | 41f relocated all roots above `0x40000`; identical `bad0fb` remained |
+| H57 | PMU MEMIF-visible roots are not visible through PBUS physical BAR1 | **confirmed** | 41g: 3/3 MEMIF exact, physical BAR1 returned incrementing `bad0fb` with VM disabled |
+| H58 | PMU→PBUS handoff needs LTC flush/invalidate | **closed** | 41g: Nouveau flush `0x70010` + invalidate `0x70004` both completed; physical reread still `bad0fb` |
+| H59 | Complete `NVKM_MEM_TARGET_INST` allocation semantics are required | **deprioritized** | Nouveau instobj writes use BAR2 or PRAMIN; both depend on the PBUS visibility already disproven by H57 |
+| H60 | Python omitted a BIT-I POST script or memory opcode | **closed in that scope** | all 7 normal scripts are present and the unknown script is only `DONE`; later H76/H78 found executed non-memory opcode and invocation-state mismatches, so this is not a claim of whole-interpreter parity |
+| H61 | Nouveau inherits firmware-POSTed PBUS/PRAMIN state that this cold eGPU lacks | **confirmed as an ownership boundary; causal sufficiency unproved** | golden trace reads PRAMIN `0xbeef` at +3 us, before RAMMAP; 41m found the exact Nouveau RAMIN-source predicates present in golden state and absent after enclosure replug |
+| H62 | A full enclosure replug causes platform firmware to POST the external GTX 770 | **disproven** | 41h entry: marker `0`, topology `badf1200`, current PRAMIN word `ffffffff`; no GPU writes followed |
+| H63 | Python `INIT_ZM_REG` omitted Nouveau's `PMC_ENABLE[0]` invariant | **confirmed, fixed; not the final blocker** | 41j: first cold ROM value `0x2020` became Nouveau-correct `0x2021`; DMEM immediately changed from `badf1200` to exact read/write, but after full devinit PBUS still returned the H57 `bad0fb` walk |
+| H64 | Missing `nv50_devinit_init()` display-encoder scripts contain cold board/PBUS setup | **closed for this ROM** | four TMDS matches point to script `0x5a55` (`DONE`); the DP script `0x6247` suppresses its body because the connector is external, not eDP |
+| H65 | Python omitted Nouveau's pre-NVINIT extended VGA CRTC unlock | **confirmed, fixed; not the final blocker** | 41k emitted `CR3f=0x57`, then read `CR8d=0`; train and MEMIF roots remained exact, but physical BAR1 still returned incrementing `bad0fb` before/after LTC handoff |
+| H66 | Python establishes physical PRAMIN temporarily, then a later stage destroys it | **disproven** | 41l: cold was `ffffffff`; first full `PMC_ENABLE` exposed the `bad0fb` stub, which persisted through devinit, PGOB, zero-nibble RAM training, and FB/LTC init |
+| H67 | The cold PBUS/PRAMIN client is never instantiated by the runtime bring-up | **confirmed observationally** | 41l fixed-PA reads were stubbed at every active boundary; golden Nouveau reads `beef` before its first init write, and its BAR2 bootstrap's first store already consumes PRAMIN |
+| H68 | Platform/option-ROM POST leaves an enabled high-VRAM ROM window alongside live PRAMIN | **confirmed correlation; not causally sufficient** | golden: `0x619f04=0xfffe09` and PRAMIN `beef`; 41m cold lacks both; 41n reproduced the register state against PMU-visible bytes but PRAMIN stayed stubbed |
+| H69 | Setting `0x619f04` and BAR0 mirror `0x088050[0]` alone will instantiate PBUS/PRAMIN | **disproven for those MMIO writes** | 41n exact-address A/B stayed sequential `bad0fb`; native PCI-config offset `0x50` remains a distinct untested transaction class |
+| H70 | An additional pre-runtime producer establishes a hidden PBUS/PRAMIN prerequisite before Nouveau starts | **refined; no longer the Python blocker** | golden runtime inherits live PRAMIN, but Night41s proves corrected Nouveau-compatible VBIOS POST can create live fixed-PA PRAMIN from a virgin cold entry on this arm64 path |
+| H71 | Replaying only the traced pre-runtime option-ROM producer slice can establish PRAMIN on arm64 | **open↓; contingency** | no longer required to explain PRAMIN activation; retain only if the corrected POST transition cannot be preserved through RAM/BAR bring-up |
+| H72 | Another register in the golden runtime's pre-init readable MMIO set identifies the prerequisite | **disproven** | 41o extracted all seven unique non-aperture reads in that set; only the three Night41n values differ; this does not claim every possible MMIO register was sampled |
+| H73 | The missing producer uses PCI config, native legacy VGA I/O, reset/power sequencing, or write-only/internal state absent from mmiotrace | **open↓; golden-platform explanation only** | still explains why the golden trace enters live, but Night41s proves these domains are not required for Python to activate PRAMIN through corrected NVINIT POST |
+| H74 | Replaying the reachable ROM VGA-enable prefix through NVIDIA's BAR0 VGA alias is sufficient to instantiate PRAMIN | **disproven** | 41p exact ordered A/B (`W 3c3=1`, readback, `W 3c2=1`, readback, `CR3f=57`) left PRAMIN `ffffffff` and topology `badf1200`; native x86 I/O equivalence remains unproved |
+| H75 | The reachable option-ROM native I/O-BAR prefix instantiates the missing PBUS/PRAMIN client | **open↓; secondary** | real ROM reachability and exact transaction shape are confirmed offline, but Night41s activates PRAMIN without native I/O; retain as a firmware-equivalence fallback, not the next cold experiment |
+| H76 | Python skipped the executed Nouveau NV50+ `INIT_IO 0x3c3,0,1` activation sequence | **confirmed, fixed; closed as PBUS activator** | 41q ran the literal ten-write sequence and waits before all other GPU init; topology stayed `badf1200` and PRAMIN stayed `ffffffff` |
+| H77 | Python's cold lifecycle order changes the meaning of otherwise-correct Nouveau operations | **confirmed at POST boundary** | 41s entered virgin (`PRAMIN=ffffffff`), ran the seven scripts in Nouveau order, and immediately read four non-stub data dwords at fixed PA `0xfffe0000`; RAM was intentionally not entered |
+| H78 | Top-level NVINIT state leakage, active I2C stubs, fail-open MMIO, and clobbering `0x10f65c` made Python POST non-equivalent to Nouveau | **confirmed, fixed; cold-supported** | 41s crossed the PRAMIN boundary with the parity cluster enabled; the follow-up audit also resets the private RAMCFG cache per top-level invocation and implements literal `INIT_CR_INDEX_ADDRESS_LATCHED`; `0x10f65c` is downstream and raw transport errors did not occur, so the exact causal member remains unisolated |
+| H79 | One corrected top-level POST script/opcode is the first PRAMIN activator | **open↑; leading discriminator** | Night41t samples fixed PA after scripts `87e5,8fe8,64ff,abb5,abb6,ac95,acfb` and stops at the first positive result; `ac95` is a strong candidate because leaked `execute=3` previously suppressed its `0xd628`/`0xd604` writes, but this is not yet live proof |
+
+### Roadmap (ordered) — prove/disprove
+
+1. **Night41t / H79:** on the next fresh replug run
+   `--probe-nouveau-post-script-bisect`.  It preserves one Nouveau interpreter,
+   samples fixed PA after every top-level script, restores `0x1700`, and stops
+   at the first positive transition.  No RAM, PMU, BAR, or reset follows.
+2. If one script activates PRAMIN, isolate its first causal nested script/opcode
+   with ROM-offset checkpoints.  Prefer offline sequence alignment first; use
+   at most one additional cold prefix bisection if the script contains several
+   plausible irreversible groups.
+3. **Preservation run:** execute the exact successful POST, require the same
+   four-word PRAMIN-positive checkpoint, then run only base `gk104_ram_init`.
+   Record all train nibbles and fixed-PA PRAMIN immediately afterward.  Stop on
+   either nonzero training or loss of PRAMIN.
+4. If RAM retains train `0` and live PRAMIN, reuse the already verified
+   Nouveau root encodings and advance through LTC → MMU/BAR2 → BAR1.  Require a
+   VM-disabled physical read to match PMU-visible bytes before enabling BAR1 VM;
+   then run the existing channel/ADD path and stop at its first mismatch.
+5. If RAM destroys the new PRAMIN state, bisect only the source-literal RAM
+   boundaries; if BAR setup fails while physical PRAMIN remains live, compare
+   the relevant `gf100_bar`/instmem slice line by line rather than porting the
+   entire driver.
+6. Keep H75/H71/H73 as a secondary x86/firmware branch.  Native I/O remains
+   useful for explaining the golden inherited state, but is no longer required
+   for Python PRAMIN activation.
+7. Keep H69/H74/H76 closed for their tested MMIO/alias forms.  Continue
+   executed-opcode parity; raw MMIO/VGA failures stay fatal and I2C protocol
+   failures follow each Nouveau opcode's explicit contract.
+8. Defer reclocking-only H30/H44 until ADD works at base clock; never restore
+   the destructive optional reclock to cold FB init.
+9. Every cold run has one predeclared early prediction and stops at its first
+   discriminator—no unchanged full-path replay.
+
 ### Still missing for `hardware_demo=ok N=8`
 
-1. Prove ENTER-scoped MEMIF physical root store+load on a cold night40u run
-2. Expand BAR1 + channel (coded)
-3. Launch → `hardware_demo=ok N=8`
+1. Obtain one firmware/Nouveau-POSTed GTX 770 state without removing card power
+2. Require POST ownership bit + live PRAMIN at process entry
+3. Reuse the already exact BAR1 roots, expand BAR1 + channel
+4. Launch → `hardware_demo=ok N=8`
+
+### Night41g result and Nouveau POST boundary
+
+Night41g preserved all four train nibbles at zero and again loaded back all
+three PMU root fragments exactly.  With `0x1704=0`, however, PBUS physical BAR1
+returned sequential `bad0fb` sentinels for every one of the 40 bytes.  Nouveau's
+LTC flush and invalidate commands both completed, and the second physical read
+returned the same sentinel class.  The guard stopped before BAR1 VM enable.
+
+The follow-up source/ROM audit found no missing normal init script: Python runs
+the same seven BIT-I scripts as `nvbios_post()`, the BIT-I unknown script points
+to a single `DONE`, and this ROM executes no `INIT_COMPUTE_MEM`,
+`INIT_CONFIGURE_MEM`, or `INIT_CONFIGURE_CLK`.  More importantly, the checked-in
+Nouveau golden trace reads PRAMIN `0xbeef` only three microseconds after its
+first MMIO and before RAMMAP/training.  `gf100_bar_oneinit()` and
+`nv50_instobj` consume that existing PRAMIN/BAR2 path; they do not create it.
+The ROM does set `0x2240c[1]` at script offset `0xac25`, and Night41g's RPC
+trace confirms Python emitted that write.  Because physical PBUS remained
+`bad0fb`, the bit is a completed-devinit marker rather than the missing client
+activation.
+This moves the boundary from BAR/VMM encoding to platform/VBIOS POST ownership.
+
+### Night41h entry-only result
+
+The dedicated five-field entry probe (after one initial `PMC_BOOT_0` validation)
+classified the fresh enclosure replug without running NVINIT, RAMMAP, PMU,
+BAR1, or a GPU reset:
+
+- `PMC_BOOT_0=0x0e4040a2` — BAR0 and the GK104 identity are healthy;
+- `0x2240c=0` — no inherited completed-devinit marker;
+- `0x409604=0xbadf1200` — GPC remains power-gated;
+- `0x1700=0`, current `0x700000=0xffffffff` — no positive inherited PRAMIN
+  evidence.
+
+Thus an electrical replug is not a firmware POST event for this external GPU.
+The run stopped immediately and did not consume the cold state with another
+known-failing H57 replay.  `NvForcePost` is not a separate implementation:
+Nouveau routes it to the same `nvbios_post()` init-table interpreter already
+ported here.  A literal runtime-driver port therefore cannot manufacture the
+missing pre-driver state observed in the golden trace.
+
+### Night41j result — `INIT_ZM_REG` fidelity
+
+A line-by-line comparison of every opcode class parsed by this ROM found one
+real semantic divergence.  Nouveau `init_zm_reg()` special-cases address
+`0x000200` by ORing bit 0 before the write.  Python had written the ROM payload
+verbatim, so the first cold instruction at ROM `0x87e6` emitted `0x2020`
+instead of `0x2021`.  The handler now matches Nouveau, with focused tests for
+both the special address and an ordinary register; compile, middle selftest,
+software demo, and the 24-checkpoint/1636-write golden RAM path all pass.
+
+Night41j proved that this was a functional defect: before devinit the DMEM
+probe returned `badf1200`; immediately after the corrected master enable it
+round-tripped the exact test word and PGRAPH status changed to `badf1000`.
+The full ROM sequence subsequently programmed its intended sparse engine
+state, and the run still ended at the same later boundary: train nibbles were
+all zero, all 40 root bytes loaded back exactly through PMU MEMIF, but physical
+VM-disabled BAR1 returned sequential `bad0fb` before and after completed LTC
+flush/invalidate.  H63 is therefore fixed and experimentally confirmed, but
+it does not supersede H57/H61.
+
+The trace audit also explains why blindly translating the remaining Nouveau
+driver is unlikely to close H61.  In the checked-in reference trace all 159
+devinit operation lines carry `[ ]` (parsed with execution disabled); the only
+executed `[0]` operation lines are six RAM restriction writes and two `DONE`s.
+That Linux run inherited a card already POSTed before Nouveau's runtime path.
+A literal Python port is useful for finding semantic drift such as H63, but it
+cannot reproduce writes that the reference run itself never performed.
+
+### Night41k result — devinit lifecycle parity
+
+The next line-by-line layer found two omissions outside the opcode switch.
+First, `nv50_devinit_init()` runs each matched DCB output's encoder script after
+POST.  For this Palit ROM that path emits no relevant write: four TMDS outputs
+select `0x5a55`, whose first byte is `DONE`, and the sole DP output selects
+`0x6247`, whose body is gated to an internal eDP connector.  H64 is closed
+without adding inert machinery.
+
+Second, `nvkm_devinit_preinit()` always calls `nvkm_lockvgac(..., false)` before
+the init tables.  On GK104 that is the indexed write `CR3f=0x57`.  Python now
+performs that write once before running all BIT-I scripts in a shared
+interpreter view.  Night41k observed the exact write and the following extended
+`CR8d=0` read.  All four train nibbles stayed zero; PMU MEMIF again loaded all
+40 root bytes back exactly.  Physical VM-disabled BAR1 nevertheless returned
+the same sequential `bad0fb` signature before and after completed LTC flush and
+invalidate, so H65 is fixed but closed as the PBUS blocker.
+
+The instmem/BAR source walk sharpens the porting decision.  GK104 uses
+`nv50_instobj_wr32_slow()` for bootstrap objects until BAR2 exists; that slow
+path itself writes through `0x1700` plus the `0x700000` PRAMIN window.
+`gf100_bar_oneinit()` then creates BAR2 first and BAR1 second.  Therefore a
+literal BAR/instmem translation cannot bypass H57: its first page-table write
+already depends on the physical PRAMIN visibility that cold Python lacks.
+Lifecycle parity is still worth auditing, but each added slice must have a
+hardware-visible prediction; translating allocator and object scaffolding
+without restoring PRAMIN is circular.
+
+### Night41l result — PRAMIN lifecycle timeline
+
+The golden mmiotrace was searched backward from its first `0x700000` access.
+It maps BAR0, reads boot/strap/board state, reads `0x1700=0xffb0`, writes only
+the selector `0x1700=0xfffe`, and immediately reads live PRAMIN
+`0x700000=0xbeef`.  There is no preceding Nouveau GPU-initialization write
+that can be copied as a PBUS enable.
+
+Night41l sampled four dwords at fixed physical address zero while restoring
+`0x1700` after every probe:
+
+| Boundary | Physical PRAMIN result |
+|---|---|
+| inherited cold ownership | `ffffffff` ×4 |
+| full `PMC_ENABLE` | `bad0fb00,09,0a,0b` |
+| VBIOS devinit | `bad0fb0c..0f` |
+| PMU/PGOB | `bad0fb10..13` |
+| RAM init, train `0,0,0,0` | `bad0fb14..17` |
+| FB page + LTC/ZBC init | `bad0fb18..1b` |
+
+The monotonically advancing low byte demonstrates one persistent PBUS stub
+response, not framebuffer contents that become valid and are later lost.
+`PMC_ENABLE` makes the client respond instead of returning all-ones, but none
+of the runtime owners instantiate a physical mapping.  Late PMU MEMIF again
+proved that trained VRAM and all 40 root bytes are durable behind the private
+Falcon path.  H66 is disproven and H67 is confirmed observationally.
+
+This is also the answer to a wholesale Python Nouveau port: it would improve
+fidelity but would not, by itself, cross this boundary.  The golden runtime
+has live PRAMIN before its first initialization write, and Nouveau's own
+`nv50_instobj_wr32_slow()` requires that aperture to build BAR2.  The missing
+owner is earlier than the runtime driver trace—platform/option-ROM POST or an
+equivalent undocumented sequence.  Porting that proven pre-runtime slice may
+work; mechanically translating the remaining allocator, BAR, FIFO, and GR
+objects first will consume the same stub and reproduce Night41l.
+
+### Night41m entry — inherited ROM-window ownership
+
+Nouveau's BIOS source order exposes the missing owner more precisely than the
+runtime FB/BAR paths.  `shadowramin.c:pramin_init()` first requires display to
+be enabled (`0x22500[0]=0`), then requires `PDISPLAY.VGA.ROM_WINDOW`
+(`0x619f04`) to have enable bit 3 set and target bits `1` (VRAM).  It derives
+the high-VRAM shadow address from that register, changes only `0x1700`, and
+reads the ROM through `0x700000`.  It does not initialise display, VRAM, PBUS,
+or the ROM window.  Separately, `shadowrom.c` calls `nvkm_pci_rom_shadow()` to
+toggle PCI config offset `0x50`; the golden BAR0 mirror is `0x088050`.
+
+The new `--probe-rom-shadow-ownership` path mirrors those predicates with five
+BAR0 reads and no GPU write.  On the fresh Night41m enclosure replug it found:
+
+```
+0x22500=0x00000100 display_enabled=True
+0x619f04=0x00000001 window_enabled=False target=1 base=0
+0x88050=0x00000000 shadow_enabled=False
+0x1700=0x00000000 PRAMIN[0]=0xffffffff
+ramin_eligible=False firmware_shadow_ready=False
+```
+
+The golden Nouveau entry instead has `0x619f04=0x00fffe09`: enabled, VRAM
+target, base `0xfffe0000`.  It temporarily selects that base through `0x1700`
+and immediately reads live data (`0xbeef`) before any init-table write.  That
+word is not a valid `0xaa55` ROM signature; Nouveau subsequently tries PROM, so
+the trace proves an inherited live aperture and ROM-window configuration, not
+that this VRAM page contains a valid VBIOS copy.  Thus H68 is a correlation at
+the ownership boundary rather than a proven activator.
+
+The card ROM explains the host mismatch.  It contains a legacy x86 image at
+raw offset `0x600` (size `0xf600`) and a compressed EFI image at `0xfc00`
+(machine `0x8664`, x86-64; compression type `1`).  The current host is arm64,
+so neither image is natively executable by its firmware.  A literal runtime
+Nouveau port therefore remains downstream of the blocker.  The technically
+relevant port is the pre-runtime option-ROM slice, preferably obtained first
+as an x86 hardware MMIO trace rather than guessed register writes.
+
+### Night41n result — exact ROM-window/PRAMIN A/B
+
+Night41n converted H69 from a tempting register replay into a direct causal
+test.  The run preserved valid RAM training (`0,0,0,0`), completed the
+autonomous ENTER/XFER/LEAVE root transfer, and loaded all 40 root bytes back
+exactly through PMU MEMIF.  Before any physical BAR1 or VM enable, PMU then
+read 16 bytes at the exact golden physical address `0xfffe0000`:
+
+```
+PMU physical: f3ccff5bff64ffc7ffefbf23f7beff4f
+PRAMIN before:            04fbd0ba06fbd0ba07fbd0ba08fbd0ba
+PRAMIN after 0x619f04=0x00fffe09:
+                          09fbd0ba0afbd0ba0bfbd0ba0cfbd0ba
+PRAMIN after 0x088050[0]=1:
+                          0dfbd0ba0efbd0ba0ffbd0ba10fbd0ba
+```
+
+All three PRAMIN samples are the same monotonically advancing `bad0fb` PBUS
+stub class and none matches the PMU physical bytes.  The helper restored
+`0x619f04=1`, `0x088050=2`, and `0x1700=0x10`; an independent read-only probe
+observed those exact values afterward.  The intentional H69 stop occurred
+before physical BAR1/VM activation.
+
+H69 is therefore disproven, H68 is demoted from cause to correlation, and H70
+is the leading boundary: firmware establishes additional state not represented
+by the two visible final registers.  A whole runtime Nouveau port still starts
+too late.  The next useful artifact is an x86 option-ROM/platform trace that
+includes PCI configuration and VGA I/O as well as MMIO, ending at the first
+live PRAMIN read.
+
+### Night41o result — complete readable golden-entry diff
+
+The golden mmiotrace was cut mechanically at line 42907, its first real device
+initialisation write (`0x140=0`, interrupt unarm).  Excluding the sequential
+PRAMIN/PROM aperture reads and their temporary selector/shadow writes leaves
+exactly seven unique read-only MMIO registers.  The new
+`--probe-golden-preinit` path read those seven in trace order on a fresh card:
+
+| Register | Golden | Night41o cold | Result |
+|---|---:|---:|---|
+| `PMC_BOOT_1 0x000004` | `0` | `0` | exact |
+| `PMC_BOOT_0 0x000000` | `0x0e4040a2` | `0x0e4040a2` | exact |
+| `PSTRAPS 0x101000` | `0x8040509a` | `0x8040509a` | exact |
+| `PDISPLAY 0x022500` | `0x100` | `0x100` | exact |
+| `ROM_WINDOW 0x619f04` | `0x00fffe09` | `1` | known difference |
+| `PRAMIN selector 0x001700` | `0xffb0` | `0` | known difference |
+| `PCI shadow mirror 0x088050` | `1` | `0` | known difference |
+
+Thus H72 is disproven: the runtime trace exposes no fourth inherited readable
+register to test.  The only mismatches are the exact three states Night41n
+already reproduced and disproved as sufficient.  The replug remained otherwise
+untouched; this probe performed no GPU write.
+
+Static inspection also explains the blind spot.  The legacy ROM's 16-bit entry
+at image offset `0x50` jumps to `0x2caa` and enters an environment-dependent
+routine with native VGA and device-I/O-BAR transactions.  The separate
+`0x2f0a` graphics/sequencer routine belongs to INT 10h font service
+`AH=0x11, AL=0x04`; it is not on the proven pre-NVINIT path.  The ROM's
+`0x619f04` occurrence is embedded NVINIT bytecode, which Python already
+interprets, not a standalone x86 MMIO activation write.  H73 therefore points
+to the proven native-I/O prefix and other pre-runtime domains, not to the font
+service.
+
+A whole runtime Nouveau port cannot recover operations that precede the
+runtime trace.  A literal option-ROM translation might, but it would also have
+to reproduce its 16-bit firmware environment and port-I/O semantics.  The
+smaller reliable route remains a three-space trace on x86 followed by replay of
+only the producer prefix ending at first live PRAMIN.
+
+### Night41p result — reachable option-ROM VGA prefix
+
+Static reachability is now established for one concrete pre-NVINIT side
+effect.  The legacy image follows
+`0x0050 -> 0x2caa -> far 0x657e -> call 0x67ae`.  That function performs this
+ordered native-I/O prefix before the NVINIT calls:
+
+```
+OUT 0x3c3, 0x01; IN 0x3c3
+OUT 0x3c2, 0x01; IN 0x3c3
+extended CRTC unlock (CR3f=0x57)
+```
+
+Python now has an explicit, offline-asserted diagnostic for those six accesses
+through NVIDIA's BAR0 VGA alias.  The Night41p cold A/B recorded exactly four
+byte accesses at `0x6013c3/0x6013c2` followed by the two CRTC bytes at
+`0x6013d4/0x6013d5`.  Immediate entry probes were unchanged:
+
+```
+before: topology=0xbadf1200 PRAMIN[0]=0xffffffff
+after:  topology=0xbadf1200 PRAMIN[0]=0xffffffff
+```
+
+H74 is therefore disproven for the BAR0 alias, and the normal devinit path
+still performs only Nouveau's source-backed CRTC unlock.  This does not close
+native PCI I/O: the ROM's x86 `OUT/IN` transactions and BAR0's VGA alias are
+not proven to have identical bridge/device side effects.  The next causal test
+must capture or execute native PCI I/O, native PCI config, and BAR0 MMIO in one
+ordered timeline.
+
+The same proven entry path continues through image `0x484d` and `0x3406`.  It
+uses `0xcf8/0xcfc` to discover PCI config dword `0x24`, writes
+`0x2469fdb9` and `1` to the resulting I/O BAR at `+0/+4`, then uses `+8/+12`
+to read-modify-write indexed register `0x200` with bit `0x10000`.  TinyGPU has
+no native PCI-I/O RPC, so Night41p did not test these operations; they are H75,
+the leading bounded replay candidate.  Porting all runtime Nouveau remains downstream of this
+boundary; porting additional ROM routines without reachability and an
+immediate PRAMIN prediction would be another unfalsifiable bulk translation.
+
+### Night41q result — literal Nouveau INIT_IO special case
+
+The line-by-line interpreter audit found two real bugs.  `_reg_mask()` clipped
+the value to the clear-mask, unlike Nouveau's `(old & ~mask) | val`; that made
+`INIT_OR_REG` a no-op.  The Palit script also executes `INIT_IO` at `0x85bb`
+with `port=0x3c3, mask=0, data=1`, while Python skipped it.  Nouveau gives this
+exact NV50+ case a special ten-write sequence over `0x614100`, `0xe18c`,
+`0x614900`, and `PMC_ENABLE[30]`, separated by two 10 ms waits.  Python now
+ports that sequence literally, plus the executed `INIT_CR`, `INIT_ZM_CR`, and
+`INIT_ZM_CR_GROUP` semantics; offline tests assert every write and port access.
+
+Night41q ran only that one `INIT_IO` opcode on a fresh card, before RAM, PMU,
+PGOB, GR reset, or global engine enable:
+
+```
+before: topology=0xbadf1200 PRAMIN[0]=0xffffffff
+after:  topology=0xbadf1200 PRAMIN[0]=0xffffffff
+```
+
+Thus H76 is confirmed as a code defect and fixed, but closed as the missing
+PBUS activator.  H77 remains important because the normal Python path still
+orders engine reset/enable and PMU/PGOB differently from Nouveau.  H75 remains
+the strongest concrete pre-runtime candidate that has not been executed: the
+legacy ROM's native device-I/O-BAR writes cannot be issued by the current
+TinyGPU protocol.
+
+### Night41r result — active I2C exposed the last NVINIT error-contract gap
+
+Night41r entered with live BAR0, marker clear, topology `0xbadf1200`, selector
+zero, and `PRAMIN[0]=ffffffff`.  The guarded lifecycle probe forbade PCI reset
+and strap override, unlocked VGA state once, and began the literal seven-script
+POST.  It reached two real `I2C_IF` conditions on DCB primary bus `0x80` mapped
+through CCB2 to GF119 register `0xd054`.  The first read completed; the second
+NACKed, and Python aborted before the POST boundary.
+
+Nouveau does not abort that opcode on a protocol failure: `nvkm_i2c_rd()`
+returns `-EIO`, the result is assigned to an unsigned byte (`0xfb`), and the
+condition simply becomes false.  Python now follows that per-opcode contract.
+Raw TinyGPU/MMIO failures remain fatal; only device-level I2C absence/NACK uses
+Nouveau's branch semantics.  Night41r therefore classified no PRAMIN boundary
+and consumed no RAM experiment, but it removed the last observed divergence.
+
+### Night41s result — corrected POST activates physical PRAMIN
+
+Night41s repeated the same guarded cold entry and completed all seven top-level
+scripts.  The two I2C conditions followed the live board outcomes (`0xff`, then
+NACK→false), and `INIT_GPIO_NE` completed.  Before any RAM, LTC, PMU, BAR, GR,
+or FIFO operation, the fixed physical snapshot changed from a virgin aperture
+to four non-stub data dwords:
+
+```
+entry current PRAMIN[0] = ffffffff
+fixed PA 0xfffe0000 after POST =
+  fffd7e7f 0800e100 efff55ff 01001000
+```
+
+The probe intentionally stopped there.  This is the first cold causal win over
+the old `ffffffff`/`bad0fb` boundary.  It confirms H77 at the POST boundary and
+cold-supports the H78 parity cluster.  It also refines H70: external x86 option
+ROM/native-I/O state is sufficient to explain the golden inherited state, but
+it is not necessary for this Python path because corrected Nouveau-compatible
+NVINIT POST itself can instantiate readable PRAMIN.
+
+The successful trace contains 803 MMIO writes and ends with the POST marker,
+then `0xd628`/`0xd604`, followed only by the selector snapshot.  Offline replay
+shows why top-level script `0xac95` is a strong candidate: script `0xabb6`
+leaves `execute=3`; the former Python state leak suppressed `0xac95`, while a
+fresh Nouveau invocation state lets it emit `0xd628` and the GPIO trigger.
+That correlation is H79, not yet proof; an earlier large script may already
+have activated the aperture.
+
+### Night41t instrumentation — top-level POST boundary bisector
+
+`--probe-nouveau-post-script-bisect` is now armed offline.  It enforces the
+same live/unposted/PRAMIN-negative entry, forbids reset and strap override,
+keeps one interpreter alive for nested-call fidelity, and executes these
+top-level scripts in order:
+
+```
+87e5 8fe8 64ff abb5 abb6 ac95 acfb
+```
+
+After each script it samples four dwords at fixed PA `0xfffe0000`, restores
+`0x1700`, and stops immediately at the first positive boundary.  It never
+enters RAM.  Both middle selftests, the 24-checkpoint mmiotrace suite, Python
+compilation, 78 Falcon-oracle tests, 33 x86-ROM tests, and `git diff --check`
+pass.  The source-parity audit additionally fixed the per-top-level RAMCFG
+cache lifetime and literal `INIT_CR_INDEX_ADDRESS_LATCHED`; neither opcode
+explains Night41s, but both are now covered offline.  The next live run requires a fresh
+enclosure replug and should be logged as
+`logs/night41t-nouveau-post-script-bisect.rpc`.
