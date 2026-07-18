@@ -5338,6 +5338,12 @@ def run_software_demo(dev):
 
   a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
   b_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
+  if os.environ.get("KEPLER_PRINT_IO", "0") != "0":
+    _show = min(N, 16)
+    print(f"[kepler] inputs a[0:{_show}]={[round(a_host[i], 4) for i in range(_show)]}",
+          flush=True)
+    print(f"[kepler] inputs b[0:{_show}]={[round(b_host[i], 4) for i in range(_show)]}",
+          flush=True)
 
   a_dev = allocator.alloc(N * 4)
   b_dev = allocator.alloc(N * 4)
@@ -11921,6 +11927,10 @@ def run_hardware_demo(dev, cubin=None):
   N = int(os.environ.get("KEPLER_N", "256"))
   if N <= 0 or N > 1024:
     raise ValueError(f"invalid KEPLER_N={N}; expected 1..1024")
+  _seed = os.environ.get("KEPLER_SEED")
+  if _seed is not None and _seed != "":
+    random.seed(int(_seed, 0))
+    print(f"[kepler] RNG seed={int(_seed, 0)}", flush=True)
   test_stage = os.environ.get("KEPLER_TEST_STAGE", "full-add")
   if test_stage not in ("sem", "set-object", "full-add"):
     raise ValueError(
@@ -11934,6 +11944,12 @@ def run_hardware_demo(dev, cubin=None):
 
   a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
   b_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
+  if os.environ.get("KEPLER_PRINT_IO", "0") != "0":
+    _show = min(N, 16)
+    print(f"[kepler] inputs a[0:{_show}]={[round(a_host[i], 4) for i in range(_show)]}",
+          flush=True)
+    print(f"[kepler] inputs b[0:{_show}]={[round(b_host[i], 4) for i in range(_show)]}",
+          flush=True)
 
   a_dev = allocator.alloc(N * 4)
   b_dev = allocator.alloc(N * 4)
@@ -12170,9 +12186,15 @@ def run_hardware_demo(dev, cubin=None):
   _mismatches = sum(1 for i in range(N)
                     if not math.isfinite(out_arr[i]) or
                     abs(out_arr[i] - expected[i]) >= 1e-5)
-  print(f"[kepler] output: first 8 actual={[round(out_arr[i],4) for i in range(8)]} "
-        f"expected={[round(expected[i],4) for i in range(8)]} "
+  print(f"[kepler] output: first 8 actual={[round(out_arr[i],4) for i in range(min(8, N))]} "
+        f"expected={[round(expected[i],4) for i in range(min(8, N))]} "
         f"mismatches={_mismatches}/{N}", flush=True)
+  if os.environ.get("KEPLER_PRINT_IO", "0") != "0":
+    _show = min(N, 16)
+    print(f"[kepler] out[0:{_show}]={[round(out_arr[i], 4) for i in range(_show)]}",
+          flush=True)
+    print(f"[kepler] exp[0:{_show}]={[round(expected[i], 4) for i in range(_show)]}",
+          flush=True)
   if _mismatches > 0:
     print(f"[kepler] raw output hex: {out_host[:32].hex()}", flush=True)
     print(f"[kepler] raw a_host hex: {a_host.tobytes()[:32].hex()}", flush=True)
