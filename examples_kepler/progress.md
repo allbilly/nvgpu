@@ -3452,21 +3452,30 @@ BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.
 | H87 | `run_vbios_ram_init` (RAMMAP+train) clobbers fixed-PA PRAMIN | **disproven; preserved** | Night41ah |
 | H88 | Post-RAM FB page + LTC/ZBC clobbers fixed-PA PRAMIN | **disproven; preserved** | Night41ai |
 | H89 | Minimal BAR1 identity clobbers fixed-PA PRAMIN | **disproven; MMIO preserved** | Night41aj: identical words after BAR1; `0x1704=0x80000060` |
-| H90 | Physical BAR1 is usable after PRAMIN-backed identity enable | **open↑; leading** | Night41aj: TinyGPU `mmio_read(1,0,4)` failed (`unknown error`); not yet `bad0fb` data |
+| H90 | Physical BAR1 usable after PRAMIN-backed identity enable | **confirmed** | Night41ak: `bar_info(1)` MAP_BAR then `BAR1[0]==PRAMIN[PA0]=0xfff3f49f`; Night41aj RPC fail was missing MAP_BAR |
+| H91 | One-page BAR1 identity is enough for ADD | **disproven as "one page"; 16 MiB multi-page confirmed** | Night41al: `map_size=0x1000000`; pages 0/511/512/2048/4094/4095 match after offset-correct PRAMIN; fixed-PA preserved. Full PCI 128 MiB still open (SPT bank) |
+| H91c | Full 128 MiB BAR1 identity needed before ADD | **open; secondary** | Nouveau BAR1 VMM is 128 MiB; Python SPT@`0x50000` max 16 MiB before `inst@0x60000`; heap notes say ≤`0x900000` may suffice |
+| H92 | Nouveau BAR2 (`0x1714`) required before FECS/instmem | **open; secondary** | H90/H91 worked without BAR2; may still matter for FECS DMA |
+| H93 | GPC/FECS domain still gated after POST+RAM+LTC+BAR1 | **partial; H93a confirmed** | Night41am: PMC full enable → topo `0x00040004`; PGRAPH still `0xbadf1000` |
+| H93b | GR bit12 toggle clears PGRAPH `badf1000` | **disproven (warm)** | Night41am warm: restores topo only |
+| H93c | PGOB / GPC PLL / PGRAPH pack needed for FECS ready | **partial; FECS-load tried** | Night41an: FECS runs (CPUCTL=0, PC≈`0x100f7`) but `0x409800 bit31` never sets; PGRAPH stays `badf1000`; fuse PGOB skipped (`0x02141c=0`) |
+| H93d | Nouveau `gf100_gr_fecs_reset` RED_SWITCH `0x770` makes FECS ready | **disproven (warm)** | Night41an: RED=`0x770`, still no bit31 |
+| H93e | `gf100_gr_init` PGRAPH pack MMIO required before FECS `main_done` | **open↑; leading** | FECS stuck with GPCCS/GPC0 still STOPPED (`0x10`); PGRAPH `badf1000` |
 
 ### Roadmap (ordered) — prove/disprove
 
-1. ~~**H79–H85 nested bisect / H87–H89 preservation:**~~ **done** through BAR1 MMIO enable.
-2. **Night41ak / H90:** diagnose physical BAR1 — TinyGPU BAR1 map, missing BAR2 (`0x1714`), or VMM walk; sample BAR1 vs PRAMIN of same low VRAM page.
-3. Live ADD (`hardware_demo=ok`); defer reclock.
-4. H75/H71/H73 secondary; no mid-POST `0x1700` samples.
+1. ~~**H79–H91 / H93a (PMC ungate):**~~ **done** — PRAMIN through BAR1; topo `0x40004` via MC full enable.
+2. ~~**H93c FECS-load-only / H93d RED_SWITCH:**~~ **done** — firmware loads+runs; ready fails; RED fix insufficient.
+3. **H93e:** Nouveau `gf100_gr_init` pack / MMIO line-by-line until PGRAPH leaves `badf1000` or FECS posts ready (hang risk — keep BAR0 live checks).
+4. **H92** only if FECS/instmem stalls without `0x1714`.
+5. **H91c** only if ADD heap needs >16 MiB.
+6. Channel/FIFO → `hardware_demo=ok`; defer reclock.
 
 ### Still missing for `hardware_demo=ok N=8`
 
-1. Obtain one firmware/Nouveau-POSTed GTX 770 state without removing card power
-2. Require POST ownership bit + live PRAMIN at process entry
-3. Reuse the already exact BAR1 roots, expand BAR1 + channel
-4. Launch → `hardware_demo=ok N=8`
+1. FECS ready (`0x409800 bit31`) + PGRAPH leave `0xbadf1000`
+2. Channel/FIFO/USERD + launch → `hardware_demo=ok N=8`
+3. (Optional) 128 MiB BAR1 if working set exceeds 16 MiB
 
 ### Night41g result and Nouveau POST boundary
 
@@ -4166,3 +4175,80 @@ activated=after-bar-preserved
 **H89 MMIO half confirmed** (PRAMIN not clobbered by BAR1 bootstrap).
 **H90 opened:** physical BAR1 client path still broken after enable — next
 discriminator vs Nouveau BAR2/`0x1714` and TinyGPU BAR1 mapping.
+
+### Night41ak result — physical BAR1 works; Night41aj was missing MAP_BAR
+
+Night41ak repeated POST → RAM → LTC → one-page BAR1 identity, then called
+TinyGPU `bar_info(1)` (MAP_BAR) before `mmio_read(1,0,4)`:
+
+```
+MAP_BAR1 addr=0x10e800000 size=0x8000000
+0x1704=0x80000060
+PRAMIN[PA0]=0xfff3f49f  BAR1[0]=0xfff3f49f  match=True
+fixed-PA @ 0xfffe0000 identical through POST/RAM/LTC/BAR
+activated=after-bar-preserved
+```
+
+Nouveau `gf100_bar_oneinit` still does BAR2 then BAR1, but identity VRAM
+walk through physical BAR1 did **not** need `0x1714` for this cut.
+**H90 confirmed.** Warm post-run ownership: `0x2240c=2` + live PRAMIN, but
+`0x409604` still `0xbadf1200` (GPC gated). Next: H91 full-aperture BAR1, then
+FECS/GPC.
+
+### Night41al abort — TinyGPU restart hung BAR0
+
+After H90, a warm H91a expand (16-page BAR1) was attempted following a
+TinyGPU server restart. Entry already showed virgin/stub PRAMIN again and
+`0x1704=0`; PRAMIN store then hit `PMC_BOOT_0=0xffffffff` (hung MMIO/link;
+config space still `10de:1184`). Ownership probe with PCI reset did not
+recover. **Do not warm-retry** — enclosure power cycle required for H91.
+
+### Night41al result — 16 MiB BAR1 multi-page confirmed; H93 leads
+
+Cold virgin → POST → RAM → LTC → `KEPLER_LIFECYCLE_BAR_MAP_SIZE=0x1000000`:
+
+```
+fixed-PA preserved through BAR
+0x1704=0x80000060
+pages 0,2048 matched in-run; page4095 false-negative from stage_snapshot
+  (reads window base only — fixed probe to use _gk104_pramin_read32)
+warm recompare: pages 0/511/512/2048/4094/4095 all PTE+BAR1==PRAMIN
+inst.limit=0xffffff
+GPC/FECS still 0xbadf1200; PMC_ENABLE=0xe011212d; 0x1714=0x40000000
+```
+
+Nouveau GK104 one FULL PDE covers 128 MiB (SPT bits=15); 16 MiB partial SPT
+under one PDE is valid. **H91 (16 MiB) confirmed.** Next: **H93** GPC/FECS
+ungating vs Nouveau GR/PGOB/clock — ADD still blocked there, not on BAR1 walk.
+
+### Night41am result — PMC full enable ungates GPC topology (H93a)
+
+Cold virgin → POST → RAM → LTC → BAR1 → `KEPLER_LIFECYCLE_THROUGH_PMC=1`
+(`wr32(0x000200, 0xffffffff)` only; no PGOB):
+
+```
+before: PMC=0xe011212d topo=0xbadf1200 PGRAPH=0xbadf1200
+after:  PMC=0xfc37b1ff topo=0x00040004 PGRAPH=0xbadf1000 0x409800=0
+fixed-PA preserved; BAR1 page0 match; activated=after-pmc-ungated
+```
+
+Matches Nouveau `nv50_mc_init` / `gk104_mc.init` as the first leave-`badf`
+step for topology. PMC does not stick as all-ones (`0xfc37b1ff`). Warm GR
+bit12 toggle (H93b) re-gates then restores topo but does **not** clear
+PGRAPH `0xbadf1000`. **Next: H93c** PGOB / PLL / PGRAPH pack → FECS ready.
+
+### Night41an result — FECS loads and runs; ready fails (H93c/d)
+
+Warm post-PMC card (`topo=0x40004`, fuse `0x02141c=0` → Nouveau skips PGOB).
+FECS-load-only (no full PGRAPH pack):
+
+```
+DMEM probe OK; IMEM[0]=0x039b0ef5 exact
+after start: CPUCTL=0 (running) PC≈0x100f7  0x409800=0 (no bit31)
+GPCCS/GPC0 CPUCTL=0x10 STOPPED; PGRAPH=0xbadf1000
+H93d RED_SWITCH Nouveau 0x70|0x700 → 0x770: still no ready
+fixed-PA preserved; BAR0 stayed live
+```
+
+**H93c:** load alone insufficient. **H93d:** RED_SWITCH alone insufficient.
+**Next H93e:** `gf100_gr_init` PGRAPH pack vs Nouveau before FECS `main_done`.

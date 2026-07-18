@@ -1,0 +1,21 @@
+{
+  "name": "night41an_fecs_load_no_ready",
+  "description": "Warm Night41an: FECS IMEM/DMEM load+start after H93a; runs at PC~0x100f7; no 0x409800 bit31; RED 0x770 insufficient",
+  "source": "examples_kepler/progress.md Night41an",
+  "entry_warm": {
+    "topo": "0x00040004",
+    "pgraph": "0xbadf1000",
+    "pmc": "0xfc37b1ff",
+    "fuse_02141c": "0x00000000"
+  },
+  "imem0_ok": true,
+  "fecs_running": true,
+  "fecs_ready": false,
+  "pc_stuck": "0x000100f7",
+  "gpccs_cpuctl": "0x00000010",
+  "gpc0_cpuctl": "0x00000010",
+  "red_switch_h93d": "0x00000770",
+  "classification": "fecs_runs_no_ready_pgraph_gated",
+  "hypothesis": "H93c",
+  "next_phase": "H93e_pgraph_pack"
+}

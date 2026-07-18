@@ -1140,7 +1140,11 @@ class NVDevice:
     # returns the 0xbad0fb stub on a cold eGPU that never ran EFI GDDR training.
     # Treat that as un-POSTed for RAM/devinit so we do not skip VRAM bring-up.
     _gpc_awake = _gk104_topo_is_posted(_gpc_topo)
-    _pramin_live = _gk104_pramin_looks_live(self, soft=False)
+    # Night41ax/H100: hard PRAMIN probe (0x1700 retarget) *before* BIT-I POST
+    # prevents Night41u fixed-PA activation (same class as H80 mid-POST).
+    # Soft-live on true-cold (GPC not awake) skips the poke; dirty half-POST
+    # (GPC awake) still hard-probes so REFUSE_DIRTY stays honest.
+    _pramin_live = _gk104_pramin_looks_live(self, soft=not _gpc_awake)
     _post_owner = _gk104_post_ownership_snapshot(self, _pramin_live)
     _posted = _gpc_awake and _pramin_live
     if _gpc_awake and not _pramin_live:
@@ -1192,6 +1196,97 @@ class NVDevice:
     _fecs_already_ready = _posted and bool(self.read32(0x409800) & 0x80000000)
     if _fecs_already_ready:
       print(f"[kepler] FECS already ready (0x409800={self.read32(0x409800):#x}) — skipping firmware reload", flush=True)
+
+    # Resolve VBIOS / cold-POST intent before PMC enable.  Night41u/H99:
+    # fixed-PA PRAMIN activates only when BIT-I POST runs on a virgin card
+    # *before* PMC_ENABLE/GR reset (lifecycle order).  Full add used to enable
+    # engines first; after-POST fixed-PA then stayed bad0fb and BAR1-after-POST
+    # never armed.
+    _ram_init_mode = os.environ.get("KEPLER_RAM_INIT", "1")
+    if _ram_init_mode not in ("0", "1", "force"):
+      raise ValueError("invalid KEPLER_RAM_INIT; expected 0, 1, or force")
+    _run_devinit = (not _posted and
+                    os.environ.get("KEPLER_VBIOS_DEVINIT", "1") != "0")
+    _ram_program_mode = os.environ.get("KEPLER_RAM_PROGRAM", "0")
+    _bit0_only = _ram_program_mode == "bit0-only"
+    _need_vbios_image = (
+        _run_devinit or _ram_init_mode == "force" or _bit0_only or
+        (_ram_program_mode != "0" and not _posted))
+    image = None
+    scripts = None
+    if _need_vbios_image:
+      vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
+      image, _, scripts = vbios_init_info(vbios_path)
+
+    def _gk104_bar1_after_post_if_live():
+      if os.environ.get("KEPLER_BAR1_AFTER_POST", "1") == "0":
+        return
+      try:
+        _pa_word = _gk104_pramin_read32(self, 0xfffe0000) & 0xffffffff
+      except Exception as e:
+        _pa_word = 0xbad0fb00
+        print(f"[kepler] post-POST fixed-PA probe skipped: {e}", flush=True)
+      if (not _gk104_pramin_word_is_stub(_pa_word) and
+          _pa_word not in (0, 0xffffffff)):
+        _map = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x1000000"), 0)
+        print(f"[kepler] Nouveau-order BAR1 after POST "
+              f"(fixed-PA={_pa_word:#x}, map={_map:#x})", flush=True)
+        _saved = {k: os.environ.get(k) for k in (
+            "KEPLER_TINYGPU_ATOMIC_BAR1", "KEPLER_PRAMIN_MEMX",
+            "KEPLER_PRAMIN_LITERAL", "KEPLER_PRAMIN_LITERAL_FIRST")}
+        os.environ["KEPLER_TINYGPU_ATOMIC_BAR1"] = "0"
+        os.environ["KEPLER_PRAMIN_MEMX"] = "0"
+        # Night41ay: after H79 fixed-PA activation the host aperture is
+        # literal; XOR-first on unread 0xffffffff with macOS
+        # KEPLER_PRAMIN_LITERAL=0 leaves 0xffffdffe (wanted^ffffffff).
+        os.environ["KEPLER_PRAMIN_LITERAL"] = "1"
+        os.environ["KEPLER_PRAMIN_LITERAL_FIRST"] = "1"
+        try:
+          _gk104_init_bar1_identity(
+              self, mapped_size=_map, map_vram=True, userd_alias_pa=None)
+          print(f"[kepler] BAR1 after POST: 0x1704="
+                f"{self.read32(0x001704):#x}", flush=True)
+          # Keep classic host-PRAMIN stores (do NOT set _bar1_identity_ready —
+          # that diverts through BAR1 and Night41ap wedged USB4).  Still mark
+          # so channel-build skips the atomic MEMX pad re-init.
+          try:
+            setattr(self, "_bar1_classic_posted", True)
+            setattr(self, "_bar1_identity_size", _map)
+            setattr(self, "_bar1_identity_userd", None)
+          except Exception:
+            pass
+        except Exception as e:
+          print(f"[kepler] BAR1 after POST failed (continuing): {e}",
+                flush=True)
+        finally:
+          for k, v in _saved.items():
+            if v is None:
+              os.environ.pop(k, None)
+            else:
+              os.environ[k] = v
+      else:
+        print(f"[kepler] BAR1 after POST skipped "
+              f"(fixed-PA={_pa_word:#x})", flush=True)
+
+    _early_post_done = False
+    if (_run_devinit and scripts is not None and
+        os.environ.get("KEPLER_POST_BEFORE_PMC", "1") != "0"):
+      print(f"[kepler] VBIOS POST before PMC (script0={scripts[0]:#x})",
+            flush=True)
+      nvbios_init.run_vbios_init(
+          self, image, scripts,
+          debug=bool(DEBUG and getenv("KEPLER_VBIOS_TRACE", 0)))
+      print(f"[kepler] after VBIOS POST: PLL(0x137000)={self.read32(0x137000):#x} "
+            f"GPC(0x409604)={self.read32(0x409604):#x} "
+            f"0x2240c={self.read32(0x2240c):#x} "
+            f"0x11e338={self.read32(0x11e338):#x}", flush=True)
+      _dmem_probe("after VBIOS POST (pre-PMC)")
+      _stage_pramin("after VBIOS POST (pre-PMC)")
+      _gk104_bar1_after_post_if_live()
+      program_gk104_gpc_pll(self)
+      _dmem_probe("after GPC PLL (pre-PMC)")
+      _early_post_done = True
+
     # Enable the engines compute needs (nouveau gk104_mc reset/enable bits):
     # PGRAPH=0x1000 (bit12), PFIFO=0x100, PFB=0x08002000, LTC=0x02000000.
     # Avoid 0xffffffff (would arm engines whose firmware isn't loaded yet).
@@ -1260,33 +1355,10 @@ class NVDevice:
         "to a dir containing gk104_fecs_code.bin).")
     # A card that was not POSTed by EFI (e.g. unbound from the driver at boot)
     # has not run the board's NVINIT scripts; the GPC/PCLOCK domain remains
-    # gated and FECS waits forever for topology.  Run devinit on a cold card;
-    # skip it on a POSTed card (nouveau/EFI already ran it, and re-running
-    # can re-gate power domains).
-    _ram_init_mode = os.environ.get("KEPLER_RAM_INIT", "1")
-    if _ram_init_mode not in ("0", "1", "force"):
-      raise ValueError("invalid KEPLER_RAM_INIT; expected 0, 1, or force")
-    _run_devinit = (not _posted and
-                    os.environ.get("KEPLER_VBIOS_DEVINIT", "1") != "0")
-    # `force` is an explicit recovery path for a card left in a partially
-    # POSTed state by an earlier userspace attempt.  It loads the ROM only for
-    # RAMMAP/training; it does not rerun the power-domain devinit or GPC PLL.
-    # Nouveau's FB init stops after gk104_ram_init(); reclocking belongs to a
-    # later clock-pstate request.  Night41b proved an immediate cold reclock
-    # changes all four valid train nibbles 0→0xa, so keep it diagnostic-only.
-    _ram_program_mode = os.environ.get("KEPLER_RAM_PROGRAM", "0")
-    _bit0_only = _ram_program_mode == "bit0-only"
-    _need_vbios_image = (
-        _run_devinit or _ram_init_mode == "force" or _bit0_only or
-        (_ram_program_mode != "0" and not _posted))
-    image = None
-    if _need_vbios_image:
-      vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
-      image, _, scripts = vbios_init_info(vbios_path)
-    if _run_devinit:
+    # gated and FECS waits forever for topology.  Cold path already ran BIT-I
+    # POST before PMC when KEPLER_POST_BEFORE_PMC=1 (_early_post_done).
+    if _run_devinit and not _early_post_done:
       print(f"[kepler] VBIOS direct devinit script0={scripts[0]:#x}")
-      # Nouveau's devinit lifecycle unlocks extended VGA CRTC state once,
-      # then executes the complete BIT-I table in that same interpreter view.
       nvbios_init.run_vbios_init(
           self, image, scripts,
           debug=bool(DEBUG and getenv("KEPLER_VBIOS_TRACE", 0)))
@@ -1297,8 +1369,12 @@ class NVDevice:
             f"PGRAPH_INTR={self.read32(0x400100):#x}", flush=True)
       _dmem_probe("after VBIOS devinit")
       _stage_pramin("after VBIOS devinit")
+      _gk104_bar1_after_post_if_live()
       program_gk104_gpc_pll(self)
       _dmem_probe("after GPC PLL")
+    elif _early_post_done:
+      print("[kepler] skipping post-PMC VBIOS POST (already ran pre-PMC)",
+            flush=True)
     dev.hw.set_phase("firmware-load")
     def _rd(name):
       p = os.path.join(fdir, name)
@@ -1306,9 +1382,10 @@ class NVDevice:
         raise NotImplementedError(f"NVDevice._init_hardware: missing firmware {p}")
       return open(p, "rb").read()
     # GPC/ROP power-gate release needs the PMU alive; best-effort PMU bring-up.
-    # On a POSTed card, PGOB already ran and the PMU is already alive —
-    # re-running PGOB destroys the loaded FECS firmware, so skip it.
-    if not _posted:
+    # Skip PMU/PGOB only when FECS already posted ready (true firmware POST).
+    # Night41ao: PMC-only ungate can make topo+PRAMIN look "POSTed" without
+    # PMU/PGOB; skipping then leaves FECS in wait_donez and GPCs STOPPED.
+    if not _fecs_already_ready:
       _dmem_probe("before PMU")
       _pmu_started = False
       try:
@@ -1362,8 +1439,16 @@ class NVDevice:
               print("[kepler] PMU MEMX still unavailable after retry", flush=True)
           except Exception as e2:
             print(f"[kepler] PMU MEMX unavailable after load: {e2}", flush=True)
+      # Half-POST (topo awake, FECS not ready): still need GPC PLL if VBIOS
+      # clock programming was skipped with _run_devinit.
+      if _posted and not _run_devinit:
+        try:
+          program_gk104_gpc_pll(self)
+          _dmem_probe("after GPC PLL (half-POST)")
+        except Exception as e:
+          print(f"[kepler] GPC PLL on half-POST skipped: {e}", flush=True)
     else:
-      print("[kepler] skipping PMU/PGOB (card already POSTed)", flush=True)
+      print("[kepler] skipping PMU/PGOB (FECS already ready)", flush=True)
     # Nouveau's gk104_ram_init() and first memory-clock transition run only
     # after PMU/PGOB has made the framebuffer domains usable.  On a cold eGPU
     # this ordering is essential: programming 0x10f*/0x132* while the PMU is
@@ -6165,6 +6250,11 @@ def _gk104_pramin_write(dev, pa, data):
     raise ValueError("PRAMIN write must be 4-byte aligned")
   window = None
   allow_literal = os.environ.get("KEPLER_PRAMIN_LITERAL", "1") != "0"
+  # Night41ap: warm POSTed FB is a literal aperture. XOR-first then corrupts
+  # (e.g. 0x4001→0x4000) and, with macOS KEPLER_PRAMIN_LITERAL=0, never
+  # recovers. Virgin GDDR still reads 0xffffffff and needs XOR compensation.
+  force_literal_first = os.environ.get("KEPLER_PRAMIN_LITERAL_FIRST", "") == "1"
+  force_xor_first = os.environ.get("KEPLER_PRAMIN_LITERAL_FIRST", "") == "0"
   for off in range(0, len(data), 4):
     addr = pa + off
     base = addr & 0xffffff00000
@@ -6178,15 +6268,32 @@ def _gk104_pramin_write(dev, pa, data):
     _gk104_require_bar0_live(dev, f"after PRAMIN read @{addr:#x}")
     if current == wanted:
       continue
-    # XOR aperture: virgin 0xffffffff + wanted 0 needs write of 0xffffffff,
-    # not a literal 0 (literal 0 on XOR leaves all-ones and has killed TinyGPU).
-    dev.write32(reg, (current ^ wanted) & 0xffffffff)
-    actual = dev.read32(reg) & 0xffffffff
-    _gk104_require_bar0_live(dev, f"after PRAMIN XOR @{addr:#x}")
-    if actual != wanted and allow_literal:
+    virgin = (current == 0xffffffff)
+    # Warm/dirty dwords always prefer literal (Nouveau instmem).  KEPLER_PRAMIN_LITERAL
+    # only gates the virgin-XOR → literal fallback (night13: literal 0 on XOR hung).
+    literal_first = (
+        force_literal_first or
+        (not force_xor_first and not virgin))
+    if literal_first:
+      # Warm/dirty dword: Nouveau-shaped literal store (instmem wr32_slow).
       dev.write32(reg, wanted)
       actual = dev.read32(reg) & 0xffffffff
       _gk104_require_bar0_live(dev, f"after PRAMIN literal @{addr:#x}")
+      if actual != wanted:
+        # Fallback: treat as XOR aperture if literal did not stick.
+        dev.write32(reg, (actual ^ wanted) & 0xffffffff)
+        actual = dev.read32(reg) & 0xffffffff
+        _gk104_require_bar0_live(dev, f"after PRAMIN XOR @{addr:#x}")
+    else:
+      # XOR aperture: virgin 0xffffffff + wanted 0 needs write of 0xffffffff,
+      # not a literal 0 (literal 0 on XOR leaves all-ones and has killed TinyGPU).
+      dev.write32(reg, (current ^ wanted) & 0xffffffff)
+      actual = dev.read32(reg) & 0xffffffff
+      _gk104_require_bar0_live(dev, f"after PRAMIN XOR @{addr:#x}")
+      if actual != wanted and allow_literal:
+        dev.write32(reg, wanted)
+        actual = dev.read32(reg) & 0xffffffff
+        _gk104_require_bar0_live(dev, f"after PRAMIN literal @{addr:#x}")
     if actual != wanted:
       stub = (" (FB aperture stub/untrained — cold RAM/MEMX did not enable "
               "PRAMIN)" if _gk104_pramin_word_is_stub(actual) else "")
@@ -7807,7 +7914,18 @@ def _gk104_atomic_bar1_bootstrap(
       raise RuntimeError(
           f"H69 Night41n classified: {ab['classification']}; "
           "intentional stop before physical BAR1/VM")
-    _gk104_verify_physical_bar1_roots(dev, segments)
+    # Night41ar H57: host BAR1/PBUS still returns bad0fb while post-LEAVE MEMIF
+    # loadback proves the roots.  Nouveau enables 0x1704 from INST/VRAM without
+    # a host physical BAR1 prove.  Default: trust MEMIF and arm VM; set
+    # KEPLER_BAR1_REQUIRE_PHYSICAL=1 to keep the old hard gate.
+    if os.environ.get("KEPLER_BAR1_REQUIRE_PHYSICAL", "0") == "1":
+      _gk104_verify_physical_bar1_roots(dev, segments)
+    else:
+      try:
+        _gk104_verify_physical_bar1_roots(dev, segments)
+      except RuntimeError as err:
+        print(f"[kepler] H57: skipping host physical BAR1 proof ({err}); "
+              f"arming 0x1704 from MEMIF-proven roots", flush=True)
     # Nouveau stores PTs then flush → HUB_ONLY PDB invalidate → flush before
     # BAR1 enable.  Night40aa still saw bad0fb without this; try it now that
     # loadback proved the roots are in the MEMIF VRAM view.
@@ -7976,8 +8094,16 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
   matching gf100_vmm_pgd_pde() for NVKM_MEM_TARGET_VRAM.
   """
   # MEMX PRAMIN is slow; 16 MiB covers bit19-safe GR/attrib (≤0x900000).
-  if os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1":
+  # SPT@0x50000 can only hold 16 MiB (0x8000 bytes) before inst@0x60000.
+  if os.environ.get("KEPLER_BAR1_MAP_SIZE"):
+    mapped_size = int(os.environ["KEPLER_BAR1_MAP_SIZE"], 0)
+  elif os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1":
     mapped_size = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x1000000"), 0)
+  if mapped_size > 0x1000000:
+    # Hard bank limit with current root layout (spt@0x50000, inst@0x60000).
+    mapped_size = 0x1000000
+    print(f"[kepler] BAR1 identity clamped to {mapped_size:#x} (SPT bank)",
+          flush=True)
   if getattr(dev, "_bar1_identity_ready", False):
     prior_size = getattr(dev, "_bar1_identity_size", mapped_size)
     prior_alias = getattr(dev, "_bar1_identity_userd", userd_alias_pa)
@@ -7987,6 +8113,19 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
           f"alias={prior_alias}, requested size={mapped_size:#x} "
           f"alias={userd_alias_pa}")
     return
+  # Night41aw: classic BAR1 installed during pre-PMC POST — do not re-enter
+  # the atomic MEMX pad (H57) or rewrite roots through a stubbing host BAR1.
+  if getattr(dev, "_bar1_classic_posted", False):
+    prior_size = getattr(dev, "_bar1_identity_size", mapped_size)
+    prior_alias = getattr(dev, "_bar1_identity_userd", None)
+    if prior_size == mapped_size and prior_alias == userd_alias_pa:
+      print(f"[kepler] BAR1 already classic-posted "
+            f"(0x1704={dev.read32(0x001704):#x}); skipping re-init",
+            flush=True)
+      return
+    raise RuntimeError(
+        f"BAR1 classic-posted size={prior_size:#x} alias={prior_alias}, "
+        f"requested size={mapped_size:#x} alias={userd_alias_pa}")
   dev.write32(0x001704, dev.read32(0x001704) & ~0x80000000)
   # Nouveau's GF100-family VRAM allocator reserves the first 256 KiB for VGA
   # memory (ramgf100.c:rsvd_head).  Keep all BAR roots above that boundary,
@@ -8200,6 +8339,11 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
           f"{_gk104_pramin_read32(dev, spt_pa + 0x100 * 8 + 4):#x}", flush=True)
   dev.write32(0x001704, 0x80000000 | (inst_pa >> 12))
   _gk104_bar_flush(dev)
+  # Do NOT set _bar1_identity_ready here.  That flag diverts PRAMIN stores
+  # through BAR1 self-walks; Night41ap showed BAR1@0x400000 → 0xbad0ac7f and
+  # the subsequent BAR1 hammering wedged TinyGPU/USB4 (macOS hard hang).
+  # Nouveau keeps instmem on BAR2/PRAMIN, not BAR1-into-BAR1.  Atomic/HOST
+  # bootstrap paths may set the flag only after their control-walk proof.
   if DEBUG:
     print(f"[kepler] BAR1 identity enabled inst={inst_pa:#x} pgd={pgd_pa:#x} "
           f"spt={spt_pa:#x} size={mapped_size:#x} "
@@ -8632,8 +8776,13 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # old ordering populated every object while 0x1704 was still disabled and
     # only created the identity mapping much later during FIFO setup.
     if os.environ.get("KEPLER_INIT_BAR1", "1") != "0":
+      # USERD VA0 alias (PTE=pa>>8|1) can fail to stick PRESENT on cold PRAMIN
+      # XOR aperture (Night41ao: wanted 0x4001 actual 0x4000). Default: pure
+      # identity; USERD is reached as VA==PA within the mapped window.
+      _alias = (None if os.environ.get("KEPLER_USERD_ALIAS", "0") == "0"
+                else userd_vram_pa)
       _gk104_init_bar1_identity(dev, bus_base=base, map_vram=True,
-                                userd_alias_pa=userd_vram_pa)
+                                userd_alias_pa=_alias)
       bar1_identity_ready = True
     # Stop FECS before bulk-zeroing GR/instance VRAM.  A live FECS (left ready
     # by a prior userspace attempt) can rewrite context pages underneath us and
@@ -8892,21 +9041,38 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
         (fault_guard_pte_addr, fault_guard_pte_wanted))
     _alias_cursor += 0x1000
     for mirror in getattr(dev, "_kepler_vram_mirrors", ()):
-      mirror_pa = bar1_alloc(round_up(mirror.size, 0x1000))
+      mirror_size = round_up(mirror.size, 0x1000)
+      # Bit19-safe banks are 512 KiB; mirrors (e.g. 1 MiB mmio list) must be
+      # striped across banks.  Map still uses contiguous VA; PA need not be.
+      chunks = []
+      rem = mirror_size
+      while rem:
+        chunk = min(rem, 0x80000 if bit19_safe else rem)
+        chunks.append((bar1_alloc(chunk), chunk))
+        rem -= chunk
       src_pa = mirror.meta["pa"]
       image = bytes(vram[src_pa:src_pa + mirror.size])
-      bar1_write(mirror_pa, image + bytes(round_up(mirror.size, 0x1000) - mirror.size))
-      for page in range(round_up(mirror.size, 0x1000) // 0x1000):
-        va = mirror.va_addr + page * 0x1000
-        pgdi, spti = (va >> 27) & 0x1fff, (va >> 12) & 0x7fff
-        pte = ((mirror_pa + page * 0x1000) >> 8) | 1
-        if mirror.meta.get("priv"):
-          pte |= 2
-        _gk104_pramin_write(dev, cloned_by_pgd[pgdi] + spti * 8,
-                            struct.pack("<Q", pte))
+      image = image + bytes(mirror_size - len(image))
+      off = 0
+      for chunk_pa, chunk_sz in chunks:
+        bar1_write(chunk_pa, image[off:off + chunk_sz])
+        off += chunk_sz
+      page = 0
+      for chunk_pa, chunk_sz in chunks:
+        for local in range(0, chunk_sz, 0x1000):
+          va = mirror.va_addr + page * 0x1000
+          pgdi, spti = (va >> 27) & 0x1fff, (va >> 12) & 0x7fff
+          pte = ((chunk_pa + local) >> 8) | 1
+          if mirror.meta.get("priv"):
+            pte |= 2
+          _gk104_pramin_write(dev, cloned_by_pgd[pgdi] + spti * 8,
+                              struct.pack("<Q", pte))
+          page += 1
+      mirror_pa = chunks[0][0]
       mirror.meta["vram_pa"] = mirror_pa
+      mirror.meta["vram_chunks"] = chunks
       print(f"[kepler] VRAM mirror: va={mirror.va_addr:#x} pa={mirror_pa:#x} "
-            f"size={mirror.size:#x}", flush=True)
+            f"size={mirror.size:#x} chunks={len(chunks)}", flush=True)
     if getattr(dev, "_kepler_vram_mirrors", ()):
       _gk104_bar_flush(dev)
     # The GR scratch objects are INST/VRAM memory in Nouveau but all register
@@ -9158,15 +9324,21 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # never completes — the pending bit stays set forever.
     if (use_vram_inst and not bar1_identity_ready and
         os.environ.get("KEPLER_INIT_BAR1", "1") != "0"):
-      # Nouveau maps the global USERD object into BAR1 at VA zero during FIFO
-      # oneinit, then programs 0x2254 with that BAR1 VA.  Establish the same
-      # alias before channel bind instead of relying on a merely equivalent
-      # identity VA equal to the physical USERD allocation.
+      # Nouveau maps USERD into a BAR1 VMA (allocator-chosen VA), then programs
+      # 0x2254 with that VA.  Optional KEPLER_USERD_ALIAS=1 keeps the old VA0
+      # shortcut; default uses identity VA==PA (Nouveau-shaped 0x2254).
+      _alias = (userd_vram_pa
+                if os.environ.get("KEPLER_USERD_ALIAS", "0") == "1"
+                else None)
       _gk104_init_bar1_identity(dev, bus_base=base, map_vram=True,
-                                userd_alias_pa=userd_vram_pa)
-      userd_bar1_base = 0
+                                userd_alias_pa=_alias)
+      userd_bar1_base = 0 if _alias is not None else userd_vram_pa
+      bar1_identity_ready = True
     elif os.environ.get("KEPLER_USERD_BAR1_ZERO") == "1":
       userd_bar1_base = 0
+    elif bar1_identity_ready and os.environ.get("KEPLER_USERD_ALIAS", "0") != "1":
+      # Identity BAR1: PFIFO polls USERD at VA==PA.
+      userd_bar1_base = userd_vram_pa if use_vram_inst else 0
     else:
       userd_bar1_base = (dev.dev_impl.bar1_addr
                          if os.environ.get("KEPLER_USERD_BAR1_RESOURCE") == "1"
@@ -9292,9 +9464,13 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
     # Clear USERD GP_GET/GP_PUT and other pointers
     _userd_phys_base = ((userd_vram_pa + userd_base_off) if use_vram_inst else
                         userd_base_off)
-    _userd_mmio_base = ((userd_base_off if use_vram_inst and
-                         os.environ.get("KEPLER_INIT_BAR1", "1") != "0" else
-                         _userd_phys_base))
+    # VA0 USERD alias → BAR1 offset is just the CHID USERD slice.  Identity
+    # BAR1 (default) maps USERD at VA==PA, matching Nouveau's 0x2254 VMA base.
+    if (use_vram_inst and os.environ.get("KEPLER_INIT_BAR1", "1") != "0" and
+        os.environ.get("KEPLER_USERD_ALIAS", "0") == "1"):
+      _userd_mmio_base = userd_base_off
+    else:
+      _userd_mmio_base = _userd_phys_base
     for _uo in (0x40, 0x44, 0x48, 0x4c, 0x50, 0x58, 0x5c, 0x60,
                 USERD_GP_GET, USERD_GP_PUT):
       dev.dev_impl.hw.mmio_write(1, _userd_mmio_base + _uo, struct.pack("<I", 0))
@@ -10481,11 +10657,15 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value):
   # direct BAR writes alias VRAM while the VMM is enabled, whereas PFIFO
   # requires the VMM for USERD polling.  Subsequent stores use PRAMIN.
   if use_vram_inst and os.environ.get("KEPLER_INIT_BAR1", "1") != "0":
+    _alias = (userd_vram_pa
+              if os.environ.get("KEPLER_USERD_ALIAS", "0") == "1"
+              else None)
     _gk104_init_bar1_identity(dev, bus_base=base, map_vram=True,
-                              userd_alias_pa=userd_vram_pa)
+                              userd_alias_pa=_alias)
     # gk104_fifo_init() runs after BAR1 init in Nouveau.  Re-latch the USERD
     # polling VMA now that 0x1704 points at the live BAR1 page directory.
-    dev.write32(0x2254, 0x10000000)
+    _userd_bar1 = 0 if _alias is not None else userd_vram_pa
+    dev.write32(0x2254, 0x10000000 | (_userd_bar1 >> 12))
     _expected_put = 1 if put_before_runlist else 0
     for _attempt in range(4):
       _gk104_pramin_write(
