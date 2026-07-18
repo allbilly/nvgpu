@@ -1,0 +1,25 @@
+{
+  "name": "night41af_8fe8_stop_a418",
+  "description": "Live cold Night41af: 87e5 + 8fe8 stop_before 0xa418 virgin; H84 out; activator H85 in (0xa418,0xa43c]",
+  "source": "examples_kepler/progress.md Night41af",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "prefix": 2,
+  "scripts_run": ["0x87e5", "0x8fe8"],
+  "stop_before": "0xa418",
+  "ended_at": "0xa418",
+  "fixed_pa": "0xfffe0000",
+  "after_prefix_words": ["0xffffffff", "0xffffffff", "0xffffffff", "0xffffffff"],
+  "classification": "pramin_virgin_8fe8_a418_cut",
+  "causal_stop": "before_ram",
+  "window": "(0xa418, 0xa43c]",
+  "next_cut": "KEPLER_NVINIT_STOP_OFFSET=0xa421",
+  "hypothesis": "H85",
+  "closed": ["H84"],
+  "nouveau_pc_skew": "-0x62"
+}

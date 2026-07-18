@@ -1,0 +1,20 @@
+{
+  "name": "night41v_prefix_4",
+  "description": "Live cold Night41v: POST prefix k=4 through 0xabb5 activates fixed-PA PRAMIN; abb6/ac95/acfb unnecessary",
+  "source": "examples_kepler/progress.md Night41v",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "prefix": 4,
+  "scripts_run": ["0x87e5", "0x8fe8", "0x64ff", "0xabb5"],
+  "fixed_pa": "0xfffe0000",
+  "after_prefix_words": ["0xffff7eff", "0x0800e100", "0xefff57ff", "0x00001000"],
+  "classification": "pramin_positive_prefix_4",
+  "causal_stop": "before_ram",
+  "next_cut": "KEPLER_POST_SCRIPT_PREFIX=2",
+  "hypothesis": "H79"
+}

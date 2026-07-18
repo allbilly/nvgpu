@@ -1,0 +1,30 @@
+{
+  "architecture": "falcon",
+  "base_address": "0x00000b14",
+  "dmem_size": 4096,
+  "done_magic_dmem": "0x00000d70",
+  "done_magic_value": "0x40c0b005",
+  "done_pc": "0x00000bef",
+  "engine": "pmu",
+  "entry_address": "0x00000b14",
+  "evidence_level": "LIVE_BYTE_VERIFIED",
+  "expected_stop": "done",
+  "falcon_version": "fuc4",
+  "helpers": {
+    "0x34": "nv_wr32"
+  },
+  "image_size": 222,
+  "imem_base": "0x00000b14",
+  "imem_size": 222,
+  "name": "pmu_bar1_bootstrap",
+  "register_count": 16,
+  "required_features": [
+    "dmem",
+    "mmio",
+    "xfer_direct_vram",
+    "xdwait"
+  ],
+  "schema": 1,
+  "sha256": "4f13f22d96c71504da6a7cd53bcef2700d0c3ef27bf15c7b652628db2d3743ca",
+  "source": "examples_kepler/pmu_bar1_bootstrap.fuc"
+}

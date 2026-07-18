@@ -1,0 +1,24 @@
+{
+  "name": "night41ai_lifecycle_through_ltc",
+  "description": "Live cold Night41ai: POST+RAMMAP+LTC; fixed-PA PRAMIN identical after LTC (H88 preserved)",
+  "source": "examples_kepler/progress.md Night41ai",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "through_ltc": true,
+  "after_post_words": ["0xffd97e3f", "0x08c1a564", "0xef2f57c7", "0x00211078"],
+  "after_ram_words": ["0xffd97e3f", "0x08c1a564", "0xef2f57c7", "0x00211078"],
+  "after_ltc_words": ["0xffd97e3f", "0x08c1a564", "0xef2f57c7", "0x00211078"],
+  "strap_reg": "0x80405096",
+  "ramcfg_group": 5,
+  "ltc_nr": 4,
+  "fixed_pa": "0xfffe0000",
+  "classification": "pramin_preserved_through_ltc",
+  "activated": "after-ltc-preserved",
+  "hypothesis": "H88",
+  "next_phase": "H89_bar2_bar1"
+}

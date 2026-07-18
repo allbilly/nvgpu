@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "source": "examples_kepler/progress.md Night41+",
+  "leading": ["H90", "H89"],
+  "hypotheses": [
+    {
+      "id": "H52",
+      "status": "confirmed",
+      "oracle": "offline_ok",
+      "summary": "PMU MEMIF three xdst roots 40/40 exact after ENTER/LEAVE"
+    },
+    {
+      "id": "H57",
+      "status": "confirmed",
+      "oracle": "out_of_scope",
+      "summary": "MEMIF-visible roots are not PBUS physical BAR1"
+    },
+    {
+      "id": "H61",
+      "status": "confirmed_boundary",
+      "oracle": "needs_live",
+      "summary": "Nouveau inherits firmware-POSTed PBUS/PRAMIN this cold eGPU lacks"
+    },
+    {
+      "id": "H69",
+      "status": "disproven",
+      "oracle": "refuse",
+      "summary": "Writing 0x619f04 / 0x088050 alone does not instantiate PRAMIN"
+    },
+    {
+      "id": "H70",
+      "status": "refined_not_blocking",
+      "oracle": "secondary_live",
+      "summary": "Golden inherits a pre-runtime producer; corrected NVINIT POST activates PRAMIN from cold"
+    },
+    {
+      "id": "H72",
+      "status": "disproven",
+      "oracle": "refuse",
+      "summary": "Golden pre-init readable MMIO set alone does not identify activator"
+    },
+    {
+      "id": "H73",
+      "status": "open_secondary",
+      "oracle": "secondary_live",
+      "summary": "PCI config / legacy VGA I/O / reset may explain golden inheritance"
+    },
+    {
+      "id": "H74",
+      "status": "disproven",
+      "oracle": "refuse",
+      "summary": "BAR0 VGA-alias preamble alone did not instantiate PRAMIN"
+    },
+    {
+      "id": "H75",
+      "status": "open_secondary",
+      "oracle": "secondary_live",
+      "summary": "Option-ROM native I/O-BAR prefix remains a firmware-equivalence contingency"
+    },
+    {
+      "id": "H76",
+      "status": "confirmed_fixed_closed",
+      "oracle": "regression_only",
+      "summary": "INIT_IO 0x3c3 special case ported; did not instantiate PBUS/PRAMIN"
+    },
+    {
+      "id": "H77",
+      "status": "confirmed_post_boundary",
+      "oracle": "regression_and_plan",
+      "summary": "Corrected NVINIT POST activates fixed-PA PRAMIN before RAM"
+    },
+    {
+      "id": "H78",
+      "status": "confirmed_cold_supported",
+      "oracle": "regression_and_plan",
+      "summary": "NVINIT parity fixes enabled the successful cold POST path"
+    },
+    {
+      "id": "H79",
+      "status": "confirmed_first_activator_opcode",
+      "oracle": "regression_and_plan",
+      "summary": "First activator: R[0x11e338]=0x00300120 at py 0xa421"
+    },
+    {
+      "id": "H80",
+      "status": "confirmed",
+      "oracle": "regression_and_plan",
+      "summary": "Mid-POST 0x1700 sampling was the virgin artifact"
+    },
+    {
+      "id": "H81",
+      "status": "disproven_as_first_activator",
+      "oracle": "refuse",
+      "summary": "CFG0/early enables insufficient"
+    },
+    {
+      "id": "H82",
+      "status": "disproven_as_first_activator",
+      "oracle": "refuse",
+      "summary": "0x11x218 wave insufficient"
+    },
+    {
+      "id": "H83",
+      "status": "disproven_as_first_activator",
+      "oracle": "refuse",
+      "summary": "0x11e218+strap insufficient"
+    },
+    {
+      "id": "H84",
+      "status": "disproven_as_first_activator",
+      "oracle": "refuse",
+      "summary": "MACRO strobes insufficient"
+    },
+    {
+      "id": "H85",
+      "status": "confirmed_0x11e338",
+      "oracle": "regression_and_plan",
+      "summary": "First flip requires R[0x11e338]=0x00300120"
+    },
+    {
+      "id": "H86",
+      "status": "open_note",
+      "oracle": "offline_map",
+      "summary": "Nouveau GK104 dmesg ROM PCs are Palit-image PC minus 0x62"
+    },
+    {
+      "id": "H87",
+      "status": "confirmed_preserved",
+      "oracle": "regression_and_plan",
+      "summary": "Night41ah: fixed-PA PRAMIN identical after RAMMAP+train"
+    },
+    {
+      "id": "H88",
+      "status": "confirmed_ltc_preserved",
+      "oracle": "regression_and_plan",
+      "summary": "Night41ai: fixed-PA PRAMIN identical after FB page + LTC/ZBC"
+    },
+    {
+      "id": "H89",
+      "status": "confirmed_bar1_mmio_preserved",
+      "oracle": "regression_and_plan",
+      "summary": "Night41aj: fixed-PA PRAMIN identical after BAR1 identity (0x1704=0x80000060); physical BAR1[0] RPC failed"
+    },
+    {
+      "id": "H90",
+      "status": "open_leading",
+      "oracle": "needs_live",
+      "summary": "Physical BAR1 client path: TinyGPU BAR1 mmio_read failed after 0x1704 enable; need BAR2/instmem/host map fix toward ADD"
+    }
+  ]
+}

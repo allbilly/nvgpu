@@ -3444,40 +3444,22 @@ BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.
 | H76 | Python skipped the executed Nouveau NV50+ `INIT_IO 0x3c3,0,1` activation sequence | **confirmed, fixed; closed as PBUS activator** | 41q ran the literal ten-write sequence and waits before all other GPU init; topology stayed `badf1200` and PRAMIN stayed `ffffffff` |
 | H77 | Python's cold lifecycle order changes the meaning of otherwise-correct Nouveau operations | **confirmed at POST boundary** | 41s entered virgin (`PRAMIN=ffffffff`), ran the seven scripts in Nouveau order, and immediately read four non-stub data dwords at fixed PA `0xfffe0000`; RAM was intentionally not entered |
 | H78 | Top-level NVINIT state leakage, active I2C stubs, fail-open MMIO, and clobbering `0x10f65c` made Python POST non-equivalent to Nouveau | **confirmed, fixed; cold-supported** | 41s crossed the PRAMIN boundary with the parity cluster enabled; the follow-up audit also resets the private RAMCFG cache per top-level invocation and implements literal `INIT_CR_INDEX_ADDRESS_LATCHED`; `0x10f65c` is downstream and raw transport errors did not occur, so the exact causal member remains unisolated |
-| H79 | One corrected top-level POST script/opcode is the first PRAMIN activator | **open↑; leading discriminator** | Night41t samples fixed PA after scripts `87e5,8fe8,64ff,abb5,abb6,ac95,acfb` and stops at the first positive result; `ac95` is a strong candidate because leaked `execute=3` previously suppressed its `0xd628`/`0xd604` writes, but this is not yet live proof |
+| H79 | One corrected top-level POST script/opcode is the first PRAMIN activator | **confirmed; first activator opcode** | Night41ag virgin @`0xa421`; Night41z + @`0xa43c`. First flip = `RAM_RESTRICT` → `R[0x11e338]=0x00300120` |
+| H80 | Mid-POST host `0x1700` PRAMIN retargeting prevents the Night41s fixed-PA activation | **confirmed** | Night41u vs Night41t |
+| H81–H84 | Earlier opcode groups are the first activator | **disproven** | Night41ac–af |
+| H85 | Trailing `0x11e34c`/`0x11e338` is the first activator | **confirmed as `0x11e338`** | Night41ag |
+| H86 | Nouveau GK104 dmesg ROM PCs = Palit-image PC − `0x62` | **open note; offline** | |
+| H87 | `run_vbios_ram_init` (RAMMAP+train) clobbers fixed-PA PRAMIN | **disproven; preserved** | Night41ah |
+| H88 | Post-RAM FB page + LTC/ZBC clobbers fixed-PA PRAMIN | **disproven; preserved** | Night41ai |
+| H89 | Minimal BAR1 identity clobbers fixed-PA PRAMIN | **disproven; MMIO preserved** | Night41aj: identical words after BAR1; `0x1704=0x80000060` |
+| H90 | Physical BAR1 is usable after PRAMIN-backed identity enable | **open↑; leading** | Night41aj: TinyGPU `mmio_read(1,0,4)` failed (`unknown error`); not yet `bad0fb` data |
 
 ### Roadmap (ordered) — prove/disprove
 
-1. **Night41t / H79:** on the next fresh replug run
-   `--probe-nouveau-post-script-bisect`.  It preserves one Nouveau interpreter,
-   samples fixed PA after every top-level script, restores `0x1700`, and stops
-   at the first positive transition.  No RAM, PMU, BAR, or reset follows.
-2. If one script activates PRAMIN, isolate its first causal nested script/opcode
-   with ROM-offset checkpoints.  Prefer offline sequence alignment first; use
-   at most one additional cold prefix bisection if the script contains several
-   plausible irreversible groups.
-3. **Preservation run:** execute the exact successful POST, require the same
-   four-word PRAMIN-positive checkpoint, then run only base `gk104_ram_init`.
-   Record all train nibbles and fixed-PA PRAMIN immediately afterward.  Stop on
-   either nonzero training or loss of PRAMIN.
-4. If RAM retains train `0` and live PRAMIN, reuse the already verified
-   Nouveau root encodings and advance through LTC → MMU/BAR2 → BAR1.  Require a
-   VM-disabled physical read to match PMU-visible bytes before enabling BAR1 VM;
-   then run the existing channel/ADD path and stop at its first mismatch.
-5. If RAM destroys the new PRAMIN state, bisect only the source-literal RAM
-   boundaries; if BAR setup fails while physical PRAMIN remains live, compare
-   the relevant `gf100_bar`/instmem slice line by line rather than porting the
-   entire driver.
-6. Keep H75/H71/H73 as a secondary x86/firmware branch.  Native I/O remains
-   useful for explaining the golden inherited state, but is no longer required
-   for Python PRAMIN activation.
-7. Keep H69/H74/H76 closed for their tested MMIO/alias forms.  Continue
-   executed-opcode parity; raw MMIO/VGA failures stay fatal and I2C protocol
-   failures follow each Nouveau opcode's explicit contract.
-8. Defer reclocking-only H30/H44 until ADD works at base clock; never restore
-   the destructive optional reclock to cold FB init.
-9. Every cold run has one predeclared early prediction and stops at its first
-   discriminator—no unchanged full-path replay.
+1. ~~**H79–H85 nested bisect / H87–H89 preservation:**~~ **done** through BAR1 MMIO enable.
+2. **Night41ak / H90:** diagnose physical BAR1 — TinyGPU BAR1 map, missing BAR2 (`0x1714`), or VMM walk; sample BAR1 vs PRAMIN of same low VRAM page.
+3. Live ADD (`hardware_demo=ok`); defer reclock.
+4. H75/H71/H73 secondary; no mid-POST `0x1700` samples.
 
 ### Still missing for `hardware_demo=ok N=8`
 
@@ -3828,30 +3810,359 @@ it is not necessary for this Python path because corrected Nouveau-compatible
 NVINIT POST itself can instantiate readable PRAMIN.
 
 The successful trace contains 803 MMIO writes and ends with the POST marker,
-then `0xd628`/`0xd604`, followed only by the selector snapshot.  Offline replay
-shows why top-level script `0xac95` is a strong candidate: script `0xabb6`
-leaves `execute=3`; the former Python state leak suppressed `0xac95`, while a
-fresh Nouveau invocation state lets it emit `0xd628` and the GPIO trigger.
-That correlation is H79, not yet proof; an earlier large script may already
-have activated the aperture.
+then `0xd628`/`0xd604`, followed only by the selector snapshot.  Night41s
+still cannot attribute activation to one script: the entry probe read
+`PRAMIN[0]` through inherited `0x1700=0` (PA window ~0), while the after-POST
+snapshot retargeted `0x1700` to fixed PA `0xfffe0000` (live write `0xfff0`).
+Those are different physical locations, so virgin→data is not a same-PA
+before/after pair.
 
-### Night41t instrumentation — top-level POST boundary bisector
+Offline script ranking before Night41t favored top-level `0x8fe8` over
+`0xac95` on write volume, but that ranking assumed mid-POST sampling was a
+valid observer.  Night41t falsified that observer.
 
-`--probe-nouveau-post-script-bisect` is now armed offline.  It enforces the
-same live/unposted/PRAMIN-negative entry, forbids reset and strap override,
-keeps one interpreter alive for nested-call fidelity, and executes these
-top-level scripts in order:
+### Night41t result — mid-POST `0x1700` sampling loses Night41s activation
+
+Night41t entered virgin (`marker=0`, `0x1700=0`, `PRAMIN[0]=ffffffff`) and
+ran all seven top-level scripts with a fixed-PA sample after each script.
+Every sample stayed virgin:
 
 ```
-87e5 8fe8 64ff abb5 abb6 ac95 acfb
+POST script[0]=0x87e5 … [6]=0xacfb @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=none
 ```
 
-After each script it samples four dwords at fixed PA `0xfffe0000`, restores
-`0x1700`, and stops immediately at the first positive boundary.  It never
-enters RAM.  Both middle selftests, the 24-checkpoint mmiotrace suite, Python
-compilation, 78 Falcon-oracle tests, 33 x86-ROM tests, and `git diff --check`
-pass.  The source-parity audit additionally fixed the per-top-level RAMCFG
-cache lifetime and literal `INIT_CR_INDEX_ADDRESS_LATCHED`; neither opcode
-explains Night41s, but both are now covered offline.  The next live run requires a fresh
-enclosure replug and should be logged as
-`logs/night41t-nouveau-post-script-bisect.rpc`.
+RPC comparison against Night41s: after stripping host `0x1700` and
+`0x700000..0x70000c` traffic, the core NVINIT write stream is byte-for-byte
+identical (801 writes).  The only added operations were the mid-POST
+selector retargets.  Nouveau's `nvbios_post()` (`init.c:2322`) never writes
+`0x1700`; that register belongs to later instmem (`nv50.c:400`).
+
+Warm ownership after Night41t showed `0x2240c` marker set and
+`PRAMIN[0]=0xfff3f7df` at inherited `0x1700=0`, while GPC stayed
+`badf1200`.  BAR0 then became intermittently RPC-hostile until replug.
+
+This does **not** close H79.  It opens H80 and retires mid-POST sampling.
+`--probe-nouveau-post-script-bisect` now requires
+`KEPLER_POST_SCRIPT_PREFIX=k` and takes one end-of-prefix sample only.
+
+### Night41u result — H80 confirmed by reproduction
+
+Night41u repeated the Night41s observer on a fresh virgin entry: all seven
+scripts via `run_vbios_init`, then exactly one fixed-PA sample.  No mid-POST
+`0x1700` traffic.  Result:
+
+```
+entry PRAMIN[0]=ffffffff (0x1700=0)
+fixed PA 0xfffe0000 after POST =
+  ffff7eff 0800e100 efff57ff 00001000
+activated=after-post
+```
+
+Core NVINIT MMIO again matched Night41s (801 writes).  Night41s had
+`fffd7e7f 0800e100 efff55ff 01001000` — same non-virgin data class, not
+byte-identical.  Warm ownership afterward: marker `0x2240c=2`, inherited
+`PRAMIN[0]=0xfff3f7df` at `0x1700=0`, GPC still `badf1200`.
+
+H80 is confirmed: the Night41t virgin outcome was an observer artifact from
+mid-POST selector retargeting, not a loss of the POST activation itself.
+H79 is now the leading live discriminator.
+
+### Night41v result — prefix k=4 activates (H79 narrowed)
+
+Night41v ran scripts `87e5,8fe8,64ff,abb5` only, then one fixed-PA sample:
+
+```
+POST prefix=4 last=0xabb5 @ 0xfffe0000 =
+  ffff7eff 0800e100 efff57ff 00001000
+activated=True
+```
+
+Same four words as Night41u.  Therefore `abb6`, `ac95`, and `acfb` are not
+required for fixed-PA activation (closing the old `ac95`-as-activator guess).
+Offline, `0x64ff` and `0xabb5` are single `DONE` (`0x71`) with zero MMIO, so
+the causal work is inside `0x87e5` and/or `0x8fe8`.  Nouveau still never
+writes `0x1700` during `nvbios_post` (instmem `nv50.c:400` only).
+
+Next cold run (Night41w): `KEPLER_POST_SCRIPT_PREFIX=2`
+`--probe-nouveau-post-script-bisect`.  Prediction: activated=True.  Log as
+`logs/night41w-post-prefix-2.rpc`.
+
+### Night41w result — prefix k=2 activates
+
+Night41w ran only `87e5` then `8fe8`, one end sample:
+
+```
+POST prefix=2 last=0x8fe8 @ 0xfffe0000 =
+  ffff7eff 0800e100 efff57ff 00001000
+activated=True
+```
+
+Same words as Night41u/v.  H79 is now inside `{0x87e5, 0x8fe8}` only.
+
+Next cold run (Night41x): `KEPLER_POST_SCRIPT_PREFIX=1` (`0x87e5` alone).
+Prediction: virgin — then `0x8fe8` is necessary.  Log as
+`logs/night41x-post-prefix-1.rpc`.
+
+### Night41x result — `0x8fe8` is necessary
+
+Night41x ran only `0x87e5`, one end sample:
+
+```
+POST prefix=1 last=0x87e5 @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+Combined with Night41w (`87e5+8fe8` → data), H79's first activating
+top-level script is **`0x8fe8`**, with **`0x87e5` as required precondition**.
+`run_script(..., stop_before=)` and `KEPLER_NVINIT_STOP_OFFSET` are armed for
+nested ROM-offset cuts inside `0x8fe8` (proposed mid cut `0x9e34`).
+
+Next cold run (Night41y):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0x9e34`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41y-8fe8-stop-9e34.rpc`.
+
+### Night41y result — activator after mid-`0x8fe8`
+
+Night41y ran `0x87e5` fully, then `0x8fe8` with `stop_before=0x9e34`
+(ended at `0x9e60` after nested work), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0x9e34 @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+So the first half of `0x8fe8` (through ~`0x9e34`) is insufficient; the
+activating work is later in the script (toward `0xa43c` / end).
+
+Next cold run (Night41z):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa43c`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41z-8fe8-stop-a43c.rpc`.
+
+### Night41z result — activator by `0xa43c`
+
+Night41z ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa43c`
+(ended at `0xa448`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa43c @ 0xfffe0000 =
+  ffff7eff f7ff1eff ffffffff ffffffff
+activated=True
+```
+
+With Night41y virgin at `0x9e34`, the first activating work is in the ROM
+window (`0x9e34`,`0xa43c`].  Note only the first two dwords are non-virgin
+here (full POST had four data words) — still a positive H79 boundary.
+
+Next cold run (Night41aa):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa138`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41aa-8fe8-stop-a138.rpc`.
+
+### Night41aa result — activator after `0xa138`
+
+Night41aa ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa138`
+(ended at `0xa191`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa138 @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+With Night41z positive at `0xa43c`, the window is now (`0xa138`,`0xa43c`].
+
+Next cold run (Night41ab):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa2ba`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41ab-8fe8-stop-a2ba.rpc`.
+
+### Night41ab result — activator after `0xa2ba`
+
+Night41ab ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa2ba`
+(ended at `0xa2bf`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa2ba @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+Window narrowed to (`0xa2ba`,`0xa43c`].  Offline (Palit image PCs; Nouveau
+dmesg PCs are −`0x62`): first not-yet-run op is `RAM_RESTRICT` → `0x110d38`
+at `0xa2bf`; mid-cut `0xa37b` includes pads + `0x110200` bit12 + `0x11e808`/`0x11e4c0`
+and stops before the `0x11x218` wave.
+
+Next cold run (Night41ac):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa37b`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41ac-8fe8-stop-a37b.rpc`.
+
+Prediction: if **positive** → activator in (`0xa2ba`,`0xa37b]` (H81 / early pads+CFG);
+if **virgin** → activator in (`0xa37b`,`0xa43c]` (H82–H85).
+
+### Night41ac result — H81 out; activator after `0xa37b`
+
+Night41ac ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa37b`
+(ended at `0xa37e`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa37b @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+Pads + `0x110200` bit12 + `0x11e808`/`0x11e4c0` are **not** sufficient.
+Window is now (`0xa37b`,`0xa43c`].  H81 closed as first activator.
+
+Next cold run (Night41ad):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa3dd`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41ad-8fe8-stop-a3dd.rpc`.
+
+Prediction: if **positive** → H82 (`*0218`/`0x11e21c` wave);
+if **virgin** → H83–H85 (`0x11e218` / MACRO / trailing).
+
+### Night41ad result — H82 out; activator after `0xa3dd`
+
+Night41ad ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa3dd`
+(ended at `0xa3dd`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa3dd @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+The full `0x11x218` / `0x11e21c` wave is **not** sufficient.
+Window is now (`0xa3dd`,`0xa43c`].  H82 closed as first activator.
+
+Next cold run (Night41ae):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa40d`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41ae-8fe8-stop-a40d.rpc`.
+
+Prediction: if **positive** → H83 (`0x11e218` + strap `0x11e808`);
+if **virgin** → H84–H85 (MACRO strobes / trailing `0x11e34c`/`338`).
+
+### Night41ae result — H83 out; activator after `0xa40d`
+
+Night41ae ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa40d`
+(ended at `0xa40d`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa40d @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+`0x11e218=0x01001101` + strap `0x11e808` are **not** sufficient.
+Window is now (`0xa40d`,`0xa43c`].  H83 closed as first activator.
+
+Next cold run (Night41af):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa418`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41af-8fe8-stop-a418.rpc`.
+
+Prediction: if **positive** → H84 (MACRO `0x11e314`/`318` strobes);
+if **virgin** → H85 (trailing `0x11e34c` / `0x11e338`).
+
+### Night41af result — H84 out; activator is H85 trailing
+
+Night41af ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa418`
+(ended at `0xa418`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa418 @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+MACRO `0x11e314`/`0x11e318` strobes alone are **not** sufficient.
+Window is now (`0xa418`,`0xa43c`].  H84 closed; H85 is the first-activator region
+(`ZM_REG 0x11e34c` and/or `RAM_RESTRICT 0x11e338`).
+
+Next cold run (Night41ag):
+`KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0xa421`
+`--probe-nouveau-post-script-bisect`.  Log as
+`logs/night41ag-8fe8-stop-a421.rpc`.
+
+Prediction: if **positive** → `0x11e34c` alone flips (H85a);
+if **virgin** → need `0x11e338` (H85b) or both.
+
+### Night41ag result — H85a out; first activator is `0x11e338`
+
+Night41ag ran `0x87e5` fully, then `0x8fe8` with `stop_before=0xa421`
+(ended at `0xa421`), one end sample:
+
+```
+POST prefix=2 last=0x8fe8 stop_before=0xa421 @ 0xfffe0000 =
+  ffffffff ffffffff ffffffff ffffffff
+activated=False
+```
+
+`ZM_REG R[0x11e34c]=0x00f00000` alone is **not** sufficient. Combined with
+Night41z positive at `0xa43c` (which completes `RAM_RESTRICT` @ `0xa421` →
+`R[0x11e338]=0x00300120`), **H79 is closed**: the first PRAMIN-readable flip is
+that strap write to **`0x11e338`**, after the full prior `87e5`+`8fe8` preamble
+through MACRO/`0x11e34c`. Nouveau does the same write (dmesg PC `0xa3bf`).
+
+**H85 confirmed as H85b (`0x11e338`).** Nested POST bisect complete.
+
+Next phase (after replug): preservation — keep fixed-PA readable through
+RAMMAP / `--probe-nouveau-base-lifecycle`, then BAR → ADD. Optional sanity
+only: `KEPLER_NVINIT_STOP_OFFSET=0xa448` should stay positive like Night41z.
+
+### Night41ah result — fixed-PA PRAMIN survives RAMMAP (H87)
+
+Night41ah ran full seven-script POST then `run_vbios_ram_init` with
+`KEPLER_LIFECYCLE_THROUGH_RAM=1` (probe previously early-returned after POST):
+
+```
+after POST  @ 0xfffe0000 = fff97e3f 08c1a564 ef2f57c7 00211468  (4× data)
+0x101000 = 0x80405096 → RAMCFG group=5 (live, no strap pin)
+after RAM   @ 0xfffe0000 = fff97e3f 08c1a564 ef2f57c7 00211468  (identical)
+activated=after-ram-preserved
+```
+
+Nouveau `gk104_ram_init` runs RAMMAP scripts + train and does **not** program
+`0x1700`; Python matched that and did not clobber the H79 window.  Surprise:
+live strap is group **5** (`0x80405096`), not the Palit golden group 6
+(`0x8040509a`) — still trained (`mask=0x3d3` ok).
+
+**H87 confirmed (preserved).** Next: H88 — LTC/BAR2/BAR1 toward ADD.
+
+### Night41ai result — fixed-PA PRAMIN survives LTC (H88)
+
+Night41ai ran POST → RAMMAP → `_gk104_post_ram_fb_ltc` with
+`KEPLER_LIFECYCLE_THROUGH_LTC=1`:
+
+```
+after POST/RAM/LTC @ 0xfffe0000 = ffd97e3f 08c1a564 ef2f57c7 00211078  (identical)
+LTC init: ltc_nr=4 lts_nr=4 parts=4 mask=0x0 lpg128=True tag_base=0x0
+activated=after-ltc-preserved
+```
+
+Nouveau order after FB is LTC (no `0x1700` in `gk104_ltc_init`); Python matched.
+**H88 LTC slice confirmed preserved.** Next: H89 — BAR2/BAR1/instmem.
+
+### Night41aj result — fixed-PA survives BAR1 enable; physical BAR1 not yet
+
+Night41aj ran POST → RAM → LTC → one-page `_gk104_init_bar1_identity`
+(`KEPLER_LIFECYCLE_THROUGH_BAR=1`):
+
+```
+POST/RAM/LTC/BAR @ 0xfffe0000 = ffd97e3f 08c1a564 ef2f57c7 00211078  (identical)
+0x1704 = 0x80000060   (inst=0x60000 → Nouveau-shaped enable)
+BAR1[0] physical read: TinyGPU RPC failed (unknown error)
+activated=after-bar-preserved
+```
+
+**H89 MMIO half confirmed** (PRAMIN not clobbered by BAR1 bootstrap).
+**H90 opened:** physical BAR1 client path still broken after enable — next
+discriminator vs Nouveau BAR2/`0x1714` and TinyGPU BAR1 mapping.

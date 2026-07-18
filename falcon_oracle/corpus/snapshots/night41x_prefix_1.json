@@ -1,0 +1,21 @@
+{
+  "name": "night41x_prefix_1",
+  "description": "Live cold Night41x: prefix k=1 (0x87e5 alone) stays virgin; 0x8fe8 is necessary after 0x87e5",
+  "source": "examples_kepler/progress.md Night41x",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "prefix": 1,
+  "scripts_run": ["0x87e5"],
+  "fixed_pa": "0xfffe0000",
+  "after_prefix_words": ["0xffffffff", "0xffffffff", "0xffffffff", "0xffffffff"],
+  "classification": "pramin_virgin_prefix_1",
+  "causal_stop": "before_ram",
+  "conclusion": "0x8fe8 necessary after 0x87e5 precondition",
+  "next_cut": "KEPLER_POST_SCRIPT_PREFIX=2 KEPLER_NVINIT_STOP_OFFSET=0x9e34",
+  "hypothesis": "H79"
+}

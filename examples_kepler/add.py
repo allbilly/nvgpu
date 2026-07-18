@@ -491,11 +491,26 @@ def _probe_nouveau_init_io():
 def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
   """Bisect Nouveau's POST and base FB/RAM boundaries on one cold entry.
 
-  ``bisect_post_scripts`` keeps one Nouveau interpreter alive, executes the
-  BIT-I top-level scripts in order, and samples the same fixed PRAMIN PA after
-  each script.  The selector is restored after every sample.  Stop at the
-  first positive boundary so a cold cycle identifies one causal script
-  without entering RAM initialization.
+  ``bisect_post_scripts`` runs a *prefix* of BIT-I top-level scripts, then
+  takes exactly one fixed-PA PRAMIN sample.  Night41t proved that retargeting
+  ``0x1700`` between scripts leaves the same core NVINIT MMIO stream as
+  Night41s but keeps fixed-PA ``0xfffe0000`` virgin; Night41s only sampled
+  once at end-of-POST and saw data.  Mid-POST selector traffic is therefore
+  forbidden.  Set ``KEPLER_POST_SCRIPT_PREFIX`` to the 1-based prefix length
+  (1..N).  Optionally set ``KEPLER_NVINIT_STOP_OFFSET`` so the *last* script
+  of the prefix stops before that top-level ROM offset (Night41x nested
+  bisect of ``0x8fe8``).  One cold cycle tests one cut.
+
+  Full lifecycle (no bisect): runs all BIT-I scripts, samples fixed-PA, then
+  by default stops if POST already activated (H79 causal stop).  Set
+  ``KEPLER_LIFECYCLE_THROUGH_RAM=1`` to continue into ``run_vbios_ram_init``
+  and sample again (Night41ah preservation discriminator).  Set
+  ``KEPLER_LIFECYCLE_THROUGH_LTC=1`` to also run ``_gk104_post_ram_fb_ltc``
+  and sample again (Night41ai; implies through-ram).  Set
+  ``KEPLER_LIFECYCLE_THROUGH_BAR=1`` to also run a one-page
+  ``_gk104_init_bar1_identity`` and sample again (Night41aj; implies
+  through-ltc). Optional ``KEPLER_LIFECYCLE_BAR_MAP_SIZE`` (default
+  ``0x1000``).
   """
   dev = APLRemotePCIDevice.probe()
   if dev is None:
@@ -520,45 +535,194 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
           f"entry (boot0={before['boot0']:#010x} "
           f"posted={before['posted_marker']} "
           f"pramin={before['pramin_word']:#010x}); replug without retry")
-    if os.environ.get("KEPLER_RAMCFG_STRAP") not in (None, ""):
+    # Night41ah+: KEPLER_LIFECYCLE_THROUGH_RAM=1 continues into RAMMAP even
+    # when after-POST fixed-PA PRAMIN is already positive (H79 closed).  Strap
+    # override stays forbidden on the bisect/causal-stop path; through-ram may
+    # pin Palit strap 6 only after POST if 0x101000 is still unread.
+    # Night41ai+: KEPLER_LIFECYCLE_THROUGH_LTC=1 continues past RAM into
+    # Nouveau's post-RAM FB page + LTC init (implies through-ram).
+    # Night41aj+: KEPLER_LIFECYCLE_THROUGH_BAR=1 continues past LTC into a
+    # minimal BAR1 identity bootstrap (implies through-ltc).
+    through_bar = os.environ.get("KEPLER_LIFECYCLE_THROUGH_BAR", "0") == "1"
+    through_ltc = (os.environ.get("KEPLER_LIFECYCLE_THROUGH_LTC", "0") == "1" or
+                   through_bar)
+    through_ram = (os.environ.get("KEPLER_LIFECYCLE_THROUGH_RAM", "0") == "1" or
+                   through_ltc)
+    if (os.environ.get("KEPLER_RAMCFG_STRAP") not in (None, "") and
+        not through_ram):
       raise RuntimeError(
           "lifecycle probe forbids KEPLER_RAMCFG_STRAP override; "
-          "the post-POST live strap must select RAMCFG")
+          "the post-POST live strap must select RAMCFG "
+          "(set KEPLER_LIFECYCLE_THROUGH_RAM=1 to allow a post-POST pin)")
     def pramin_positive(words):
       return any(not shared._gk104_pramin_word_is_stub(word) and
                  word not in (0x00000000, 0xffffffff) for word in words)
     image, _bit_i, scripts = shared.vbios_init_info(shared.DEFAULT_VBIOS)
     os.environ.setdefault("KEPLER_VBIOS_I2C_TRACE", "1")
     if bisect_post_scripts:
+      raw_prefix = os.environ.get("KEPLER_POST_SCRIPT_PREFIX", "").strip()
+      if not raw_prefix:
+        raise RuntimeError(
+            "Night41t retired mid-POST 0x1700 sampling; set "
+            "KEPLER_POST_SCRIPT_PREFIX to a 1-based script count "
+            f"(1..{len(scripts)}) for one end-only fixed-PA sample")
+      prefix = int(raw_prefix, 0)
+      if prefix < 1 or prefix > len(scripts):
+        raise RuntimeError(
+            f"KEPLER_POST_SCRIPT_PREFIX={prefix} out of range 1..{len(scripts)}")
+      raw_stop = os.environ.get("KEPLER_NVINIT_STOP_OFFSET", "").strip()
+      stop_before = int(raw_stop, 0) if raw_stop else None
+      chosen = scripts[:prefix]
       init = shared.nvbios_init.NvbiosInit(bar0, image, debug=False)
       init.unlock_vga_crtc()
-      for index, script in enumerate(scripts):
-        init.run_script(script)
-        words = shared._gk104_pramin_stage_snapshot(
-            bar0, f"POST script[{index}]={script:#06x}", pa=0xfffe0000)
-        if pramin_positive(words):
-          print("probe-nouveau-post-script-bisect: "
-                f"activated=script[{index}]={script:#06x}; "
-                "intentional causal stop before the next script and RAM")
-          return
-      print("probe-nouveau-post-script-bisect: activated=none; "
-            "intentional causal stop before RAM")
+      for index, script in enumerate(chosen):
+        is_last = index + 1 == len(chosen)
+        if is_last and stop_before is not None:
+          init.run_script(script, stop_before=stop_before)
+          print(f"probe-nouveau-post-script-bisect: "
+                f"ran script[{index}]={script:#06x} "
+                f"stop_before={stop_before:#x} "
+                f"(ended@{init.offset:#x}; no mid-POST PRAMIN sample)",
+                flush=True)
+        else:
+          init.run_script(script)
+          print(f"probe-nouveau-post-script-bisect: "
+                f"ran script[{index}]={script:#06x} "
+                f"(no mid-POST PRAMIN sample)", flush=True)
+      label = (f"POST prefix={prefix} last={chosen[-1]:#06x}"
+               + (f" stop_before={stop_before:#x}" if stop_before is not None
+                  else ""))
+      words = shared._gk104_pramin_stage_snapshot(
+          bar0, label, pa=0xfffe0000)
+      activated = pramin_positive(words)
+      stop_s = (f"{stop_before:#x}" if stop_before is not None else "none")
+      print("probe-nouveau-post-script-bisect: "
+            f"prefix={prefix} last={chosen[-1]:#06x} "
+            f"stop_before={stop_s} "
+            f"activated={activated}; "
+            "intentional causal stop before RAM "
+            "(single end-of-prefix 0x1700 sample only)")
       return
     shared.nvbios_init.run_vbios_init(bar0, image, scripts, debug=False)
     after_post = shared._gk104_pramin_stage_snapshot(
         bar0, "nouveau-measure after POST", pa=0xfffe0000)
-    if pramin_positive(after_post):
+    post_ok = pramin_positive(after_post)
+    if post_ok and not through_ram:
       print("probe-nouveau-base-lifecycle: activated=after-post; "
-            "intentional causal stop before RAM")
+            "intentional causal stop before RAM "
+            "(set KEPLER_LIFECYCLE_THROUGH_RAM=1 to continue into RAMMAP)")
       return
+    if through_ram:
+      strap_reg = bar0.read32(0x101000)
+      print(f"probe-nouveau-base-lifecycle: after-post "
+            f"activated={post_ok}; through-ram; "
+            f"0x101000={strap_reg:#010x}", flush=True)
+      if ((strap_reg & 0x0000003c) == 0 and
+          os.environ.get("KEPLER_RAMCFG_STRAP") in (None, "")):
+        # Cold unread strap would select the wrong M0205/M0209 tables;
+        # pin Palit golden strap 6 only for the RAMMAP phase.
+        os.environ["KEPLER_RAMCFG_STRAP"] = "6"
+        print("probe-nouveau-base-lifecycle: pinned "
+              "KEPLER_RAMCFG_STRAP=6 for RAMMAP (0x101000 unread)",
+              flush=True)
     shared.nvbios_init.run_vbios_ram_init(bar0, image, debug=False)
     after_ram = shared._gk104_pramin_stage_snapshot(
         bar0, "nouveau-measure after RAM", pa=0xfffe0000)
-    stage = "after-ram" if pramin_positive(after_ram) else "none"
-    print("probe-nouveau-base-lifecycle: "
-          f"entry={before['pramin_word']:#010x} "
-          f"post={[hex(word) for word in after_post]} "
-          f"ram={[hex(word) for word in after_ram]} activated={stage}")
+    ram_ok = pramin_positive(after_ram)
+    after_ltc = None
+    ltc_ok = False
+    after_bar = None
+    bar_ok = False
+    bar1_dword = None
+    bar1_ctl = None
+    if through_ltc:
+      if not ram_ok:
+        print("probe-nouveau-base-lifecycle: through-ltc skipped; "
+              "after-RAM fixed-PA not positive", flush=True)
+      else:
+        print("probe-nouveau-base-lifecycle: through-ltc; "
+              "running post-RAM FB page + LTC", flush=True)
+        shared._gk104_post_ram_fb_ltc(bar0)
+        after_ltc = shared._gk104_pramin_stage_snapshot(
+            bar0, "nouveau-measure after LTC", pa=0xfffe0000)
+        ltc_ok = pramin_positive(after_ltc)
+    if through_bar:
+      if not ltc_ok:
+        print("probe-nouveau-base-lifecycle: through-bar skipped; "
+              "after-LTC fixed-PA not positive", flush=True)
+      else:
+        # Minimal Nouveau-shaped BAR1 identity: PRAMIN roots + 0x1704 enable.
+        # One page only — H89 discriminator, not full aperture / ADD.
+        map_size = int(os.environ.get("KEPLER_LIFECYCLE_BAR_MAP_SIZE",
+                                      "0x1000"), 0)
+        print(f"probe-nouveau-base-lifecycle: through-bar; "
+              f"BAR1 identity map_size={map_size:#x}", flush=True)
+        shared._gk104_init_bar1_identity(
+            bar0, mapped_size=map_size, map_vram=True)
+        after_bar = shared._gk104_pramin_stage_snapshot(
+            bar0, "nouveau-measure after BAR1", pa=0xfffe0000)
+        bar_ok = pramin_positive(after_bar)
+        bar1_ctl = bar0.read32(0x001704) & 0xffffffff
+        try:
+          raw = bytes(dev.mmio_read(1, 0, 4))
+          bar1_dword = struct.unpack("<I", raw)[0] if len(raw) == 4 else None
+        except Exception as e:
+          print(f"probe-nouveau-base-lifecycle: physical BAR1[0] "
+                f"read failed: {e}", flush=True)
+        print(f"probe-nouveau-base-lifecycle: 0x1704={bar1_ctl:#010x} "
+              f"BAR1[0]={bar1_dword:#010x}" if bar1_dword is not None else
+              f"probe-nouveau-base-lifecycle: 0x1704={bar1_ctl:#010x} "
+              f"BAR1[0]=unreadable",
+              flush=True)
+    # Summarize furthest stage reached.
+    if through_bar and after_bar is not None:
+      if post_ok and ram_ok and ltc_ok and bar_ok:
+        stage = "after-bar-preserved"
+      elif post_ok and ram_ok and ltc_ok and not bar_ok:
+        stage = "after-bar-clobbered"
+      elif bar_ok:
+        stage = "after-bar"
+      else:
+        stage = "none"
+      print("probe-nouveau-base-lifecycle: "
+            f"entry={before['pramin_word']:#010x} "
+            f"post={[hex(word) for word in after_post]} "
+            f"ram={[hex(word) for word in after_ram]} "
+            f"ltc={[hex(word) for word in after_ltc]} "
+            f"bar={[hex(word) for word in after_bar]} activated={stage}")
+    elif through_ltc and after_ltc is not None:
+      if post_ok and ram_ok and ltc_ok:
+        stage = "after-ltc-preserved"
+      elif post_ok and ram_ok and not ltc_ok:
+        stage = "after-ltc-clobbered"
+      elif ltc_ok:
+        stage = "after-ltc"
+      elif post_ok and ram_ok:
+        stage = "after-ram-preserved"
+      elif ram_ok:
+        stage = "after-ram"
+      elif post_ok:
+        stage = "after-post-clobbered"
+      else:
+        stage = "none"
+      print("probe-nouveau-base-lifecycle: "
+            f"entry={before['pramin_word']:#010x} "
+            f"post={[hex(word) for word in after_post]} "
+            f"ram={[hex(word) for word in after_ram]} "
+            f"ltc={[hex(word) for word in after_ltc]} activated={stage}")
+    else:
+      if post_ok and ram_ok:
+        stage = "after-ram-preserved"
+      elif ram_ok:
+        stage = "after-ram"
+      elif post_ok:
+        stage = "after-post-clobbered"
+      else:
+        stage = "none"
+      print("probe-nouveau-base-lifecycle: "
+            f"entry={before['pramin_word']:#010x} "
+            f"post={[hex(word) for word in after_post]} "
+            f"ram={[hex(word) for word in after_ram]} activated={stage}")
   finally:
     dev.fini()
 

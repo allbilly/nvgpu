@@ -1,0 +1,8 @@
+{
+  "name": "mutation_wr32_outside_enter",
+  "description": "Mutation: target WR32 outside ownership region (should fault)",
+  "expect_error": "outside ENTER",
+  "commands": [
+    ["WR32", "0x10f808", "0x72a00000"]
+  ]
+}

@@ -1163,7 +1163,7 @@ class NvbiosInit:
   # --------------------------------------------------------------------------
   # Core execution loop
   # --------------------------------------------------------------------------
-  def run_script(self, start: int) -> None:
+  def run_script(self, start: int, stop_before: int | None = None) -> None:
     if self.nested == 0:
       # nvbios_init() constructs a fresh execution state for every top-level
       # script.  Only nested SUB/CALL execution inherits conditions/selectors.
@@ -1182,6 +1182,12 @@ class NvbiosInit:
     self.offset = start
     self.nested += 1
     while self.offset:
+      # Night41x proved activator is inside 0x8fe8 after 0x87e5.  Nested
+      # bisection stops before a top-level ROM offset without mid-POST
+      # 0x1700 samples.  Nested SUB/CALL may still run past stop_before.
+      if (stop_before is not None and self.nested == 1 and
+          self.offset >= int(stop_before)):
+        break
       op = self.rd08(self.offset)
       handler = self._handlers.get(op)
       if handler is None:

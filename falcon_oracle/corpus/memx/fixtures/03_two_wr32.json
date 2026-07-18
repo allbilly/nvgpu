@@ -1,0 +1,10 @@
+{
+  "name": "two_wr32",
+  "description": "Fixture ladder #3: two WR32 commands",
+  "commands": [
+    ["ENTER"],
+    ["WR32", "0x10f808", "0x72a00000"],
+    ["WR32", "0x10f80c", "0x00000001"],
+    ["LEAVE"]
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "night41z_8fe8_stop_a43c",
+  "description": "Live cold Night41z: 87e5 + 8fe8 stop_before 0xa43c activates (partial four-word); activator in (0x9e34,0xa43c]",
+  "source": "examples_kepler/progress.md Night41z",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "prefix": 2,
+  "scripts_run": ["0x87e5", "0x8fe8"],
+  "stop_before": "0xa43c",
+  "ended_at": "0xa448",
+  "fixed_pa": "0xfffe0000",
+  "after_prefix_words": ["0xffff7eff", "0xf7ff1eff", "0xffffffff", "0xffffffff"],
+  "classification": "pramin_positive_8fe8_a43c_cut",
+  "causal_stop": "before_ram",
+  "window": "(0x9e34, 0xa43c]",
+  "next_cut": "KEPLER_NVINIT_STOP_OFFSET=0xa138",
+  "hypothesis": "H79"
+}

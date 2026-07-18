@@ -1,0 +1,18 @@
+{
+  "name": "night41s_after_post",
+  "description": "Live cold Night41s: corrected seven-script NVINIT POST activates fixed-PA PRAMIN before RAM",
+  "source": "examples_kepler/progress.md Night41s",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "scripts": ["0x87e5", "0x8fe8", "0x64ff", "0xabb5", "0xabb6", "0xac95", "0xacfb"],
+  "fixed_pa": "0xfffe0000",
+  "after_post_words": ["0xfffd7e7f", "0x0800e100", "0xefff55ff", "0x01001000"],
+  "classification": "pramin_positive_after_post",
+  "causal_stop": "before_ram",
+  "caveat": "entry PRAMIN word used inherited 0x1700=0; after-POST sample retargeted fixed PA — not a same-PA before/after pair; H79 script identity requires Night41t"
+}

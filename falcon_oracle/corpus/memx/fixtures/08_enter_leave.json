@@ -1,0 +1,8 @@
+{
+  "name": "enter_leave",
+  "description": "Fixture ladder #8: ENTER; LEAVE only (Night40r preflight shape)",
+  "commands": [
+    ["ENTER"],
+    ["LEAVE"]
+  ]
+}

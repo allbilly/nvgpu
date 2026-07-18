@@ -1,0 +1,22 @@
+{
+  "name": "h76_init_io_sequence",
+  "description": "Nouveau NV50+ INIT_IO port=0x3c3 mask=0 data=1 special case (nvbios_init._op_io). Offline sequence only — do not imply live execution.",
+  "hypothesis": "H76",
+  "prediction": "PRAMIN non-stub may appear before any RAM/PMU/GR; A/B alone on next cold replug",
+  "forbid_before_prediction": ["ram_init", "pmu_memx", "gr_enable", "bar1_enable"],
+  "steps": [
+    {"op": "mask", "addr": "0x614100", "clear": "0xf0800000", "set": "0x00800000"},
+    {"op": "mask", "addr": "0x00e18c", "clear": "0x00020000", "set": "0x00020000"},
+    {"op": "mask", "addr": "0x614900", "clear": "0xf0800000", "set": "0x00800000"},
+    {"op": "mask", "addr": "0x000200", "clear": "0x40000000", "set": "0x00000000", "note": "PMC_ENABLE bit30 clear"},
+    {"op": "sleep_ms", "ms": 10},
+    {"op": "mask", "addr": "0x00e18c", "clear": "0x00020000", "set": "0x00000000"},
+    {"op": "mask", "addr": "0x000200", "clear": "0x40000000", "set": "0x40000000", "note": "PMC_ENABLE bit30 set"},
+    {"op": "wr32", "addr": "0x614100", "data": "0x00800018"},
+    {"op": "wr32", "addr": "0x614900", "data": "0x00800018"},
+    {"op": "sleep_ms", "ms": 10},
+    {"op": "wr32", "addr": "0x614100", "data": "0x10000018"},
+    {"op": "wr32", "addr": "0x614900", "data": "0x10000018"},
+    {"op": "port_rmw", "port": "0x03c3", "mask": "0x00", "data": "0x01"}
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "one_wr32",
+  "description": "Fixture ladder #2: one WR32 under ENTER/LEAVE",
+  "commands": [
+    ["ENTER"],
+    ["WR32", "0x10f808", "0x72a00000"],
+    ["LEAVE"]
+  ]
+}

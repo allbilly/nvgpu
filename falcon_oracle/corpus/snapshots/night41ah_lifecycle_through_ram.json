@@ -1,0 +1,22 @@
+{
+  "name": "night41ah_lifecycle_through_ram",
+  "description": "Live cold Night41ah: full POST then RAMMAP; fixed-PA PRAMIN identical after RAM (H87 preserved)",
+  "source": "examples_kepler/progress.md Night41ah",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "through_ram": true,
+  "after_post_words": ["0xfff97e3f", "0x08c1a564", "0xef2f57c7", "0x00211468"],
+  "after_ram_words": ["0xfff97e3f", "0x08c1a564", "0xef2f57c7", "0x00211468"],
+  "strap_reg": "0x80405096",
+  "ramcfg_group": 5,
+  "fixed_pa": "0xfffe0000",
+  "classification": "pramin_preserved_through_rammap",
+  "activated": "after-ram-preserved",
+  "hypothesis": "H87",
+  "next_phase": "H88_bar1_ltc_add"
+}

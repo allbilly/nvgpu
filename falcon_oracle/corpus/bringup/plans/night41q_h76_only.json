@@ -1,0 +1,9 @@
+{
+  "name": "night41q_h76_only",
+  "intent": "h76_init_io_only",
+  "hypothesis": "H76",
+  "entry_assumption": "COLD_REPLUG",
+  "actions": ["probe_nouveau_init_io"],
+  "forbid": ["ram_init", "pmu_memx", "gr_enable", "full_cold_pramin_replay", "write_619f04_activator"],
+  "prediction": "compare PRAMIN word before/after INIT_IO only"
+}

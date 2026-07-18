@@ -1,0 +1,9 @@
+{
+  "name": "bad_full_cold_on_replug",
+  "intent": "full_cold_pramin_replay",
+  "hypothesis": "H57",
+  "entry_assumption": "COLD_REPLUG",
+  "actions": ["nvinit", "ram_init", "pmu_memx", "memif_roots", "bar1_enable", "physical_bar1_read"],
+  "forbid": [],
+  "prediction": "expect bad0fb again — refused by oracle"
+}

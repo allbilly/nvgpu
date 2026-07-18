@@ -1,0 +1,34 @@
+{
+  "0x00000b14": {
+    "source": "pmu_bar1_bootstrap.fuc:10",
+    "symbol": "bootstrap_entry"
+  },
+  "0x00000b35": {
+    "source": "pmu_bar1_bootstrap.fuc:21",
+    "symbol": "wait_go"
+  },
+  "0x00000b72": {
+    "source": "pmu_bar1_bootstrap.fuc:41",
+    "symbol": "pause_poll"
+  },
+  "0x00000b85": {
+    "source": "pmu_bar1_bootstrap.fuc:48",
+    "symbol": "pause_done"
+  },
+  "0x00000b95": {
+    "source": "pmu_bar1_bootstrap.fuc:56",
+    "symbol": "xfer_instance"
+  },
+  "0x00000ba8": {
+    "source": "pmu_bar1_bootstrap.fuc:64",
+    "symbol": "xfer_pde"
+  },
+  "0x00000bbb": {
+    "source": "pmu_bar1_bootstrap.fuc:72",
+    "symbol": "xfer_pte"
+  },
+  "0x00000bef": {
+    "source": "pmu_bar1_bootstrap.fuc:90",
+    "symbol": "done"
+  }
+}
