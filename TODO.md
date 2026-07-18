@@ -90,3 +90,21 @@ The original `examples/add.py` and `examples/add.py.legacy` were a
 non-green, 926 kB hand-mirror implementation. They have been deleted
 along with the migration scratch (capture scripts, debug logs,
 golden-image dump output, `add.cu`/`add.cubin` stubs).
+
+---
+
+# TODO — GK104 eGPU (`examples_kepler/`, GTX 770)
+
+Warm `add.py` / `mul.py` reach `hardware_demo=ok` (~8 s). Classic BAR1 is
+16 MiB identity only; GPC PLL is a fixed post-POST program, not Nouveau
+pstates.
+
+## Open
+
+- [ ] **Full BAR1** — map the full 128 MiB aperture (today clamped to 16 MiB by
+      SPT bank `spt@0x50000` / `inst@0x60000`); needs a new root layout, not a
+      `KEPLER_BAR1_MAP_SIZE` bump alone.
+- [ ] **Reclocking** — Nouveau-shaped `gk104` clk pstate / memclk / gpcclk
+      calc–prog (not just `program_gk104_gpc_pll` ~300 MHz). Cold
+      `KEPLER_RAM_PROGRAM` reclock stays off by default (train `0→0xa`); only
+      after cold POST/RAM is reliable.

@@ -791,7 +791,15 @@ def test_12_macos_replug_preflight() -> None:
       "macOS live path must auto warm-continue after cold NaN demo"
   assert 'setdefault("KEPLER_RPC_LIGHT", "1")' in src, \
       "macOS live path must default light RPC (skip per-MMIO flight log)"
+  assert 'setdefault("KEPLER_FAST_ZERO", "1")' in src, \
+      "macOS live path must default BAR1 fast GR-ctx zero"
+  assert 'setdefault("KEPLER_LIVE_ACK", "completion-abort-risk")' in src, \
+      "macOS live path must default LIVE_ACK so bare add.py launches"
+  assert 'setdefault("KEPLER_RPC_TRACE"' in src, \
+      "macOS live path must default KEPLER_RPC_TRACE under logs/"
   assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in src
+  assert "_ensure_tinygpu_server" in src, \
+      "macOS live path must auto-start TinyGPU when the socket is missing"
   assert "--mmiotrace-selftest" in src, \
       "macOS wrapper must treat --mmiotrace-selftest as an offline flag"
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
@@ -1170,8 +1178,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
   # Prefer importing the Linux-owned bring-up module.
   here = pathlib.Path(__file__).resolve().parent
   pcie = here.parent / "examples_kepler_pcie"
-  sys.path.insert(0, str(pcie))
+  # Insert PCIe module last so it wins over examples_kepler/add.py (TinyGPU
+  # wrapper) which shares the module name "add".
   sys.path.insert(0, str(here))
+  sys.path.insert(0, str(pcie))
   import add as add_mod  # type: ignore
   hooks = build_hooks_from_add_module(add_mod)
   return run_mmiotrace_selftest(hooks)
