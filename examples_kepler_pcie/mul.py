@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Kepler ``mul`` smoke test and launcher.
 
-The arithmetic cubin is assembled at runtime from ``examples_kepler/add_kepler.ptx``
-using CUDA 10.2 ``ptxas``.  Hardware launch reuses the standalone add launcher;
-the operation selector changes both the cubin and the expected result.
+Uses the checked-in ``examples_kepler/mul_kepler.cubin`` (or assembles from
+PTX with CUDA 10.2 ``ptxas``).  Hardware launch reuses the shared add launcher
+with ``KEPLER_OPERATION=mul``.
 """
 from __future__ import annotations
-import array, hashlib, os, sys
+import array, hashlib, os, subprocess, sys
 
 # When executed by pathname Python places only this directory on sys.path;
 # add the checkout root so the sibling module can be imported without a
@@ -24,9 +24,17 @@ def assemble_mul_cubin() -> bytes:
 
 def main() -> None:
   if "--assemble-cubin" in sys.argv or "--compare-cubin" in sys.argv:
+    path = shared.DEFAULT_MUL_CUBIN
+    if os.path.exists(path):
+      with open(path, "rb") as f: cubin = f.read()
+      digest = hashlib.sha256(cubin).hexdigest()
+      same = (len(cubin) == shared.MUL_CUBIN_BYTES and digest == shared.MUL_CUBIN_SHA256)
+      print(f"cubin_compare={'byte-identical' if same else 'mismatch'} operation=mul "
+            f"assembled_bytes={len(cubin)} sha256={digest}")
+      return
     try:
       cubin = assemble_mul_cubin()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
       raise SystemExit(f"mul assembly unavailable: {e}")
     print(f"cubin_compare=byte-identical operation=mul assembled_bytes={len(cubin)} "
           f"sha256={hashlib.sha256(cubin).hexdigest()}")
@@ -38,9 +46,11 @@ def main() -> None:
     assert out[7] == 56.0 and len(out) == 256
     print("software_mul=ok N=256")
     return
-  # The shared launcher self-assembles the cubin when KEPLER_CUBIN is absent.
   os.environ["KEPLER_OPERATION"] = "mul"
-  shared.main()
+os.environ["KEPLER_CUBIN"] = os.environ.get(
+    "KEPLER_MUL_CUBIN", shared.DEFAULT_MUL_CUBIN)
+shared.main()
+
 
 if __name__ == "__main__":
   main()
