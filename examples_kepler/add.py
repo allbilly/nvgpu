@@ -543,7 +543,12 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
     # Nouveau's post-RAM FB page + LTC init (implies through-ram).
     # Night41aj+: KEPLER_LIFECYCLE_THROUGH_BAR=1 continues past LTC into a
     # minimal BAR1 identity bootstrap (implies through-ltc).
-    through_bar = os.environ.get("KEPLER_LIFECYCLE_THROUGH_BAR", "0") == "1"
+    # Night41am+: KEPLER_LIFECYCLE_THROUGH_PMC=1 continues past BAR into
+    # Nouveau nv50_mc_init-only PMC_ENABLE=0xffffffff (implies through-bar;
+    # no PGOB — H93a discriminator).
+    through_pmc = os.environ.get("KEPLER_LIFECYCLE_THROUGH_PMC", "0") == "1"
+    through_bar = (os.environ.get("KEPLER_LIFECYCLE_THROUGH_BAR", "0") == "1" or
+                   through_pmc)
     through_ltc = (os.environ.get("KEPLER_LIFECYCLE_THROUGH_LTC", "0") == "1" or
                    through_bar)
     through_ram = (os.environ.get("KEPLER_LIFECYCLE_THROUGH_RAM", "0") == "1" or
@@ -651,8 +656,9 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
         print("probe-nouveau-base-lifecycle: through-bar skipped; "
               "after-LTC fixed-PA not positive", flush=True)
       else:
-        # Minimal Nouveau-shaped BAR1 identity: PRAMIN roots + 0x1704 enable.
-        # One page only — H89 discriminator, not full aperture / ADD.
+        # Nouveau-shaped BAR1 identity: PRAMIN roots + 0x1704 enable.
+        # Default one page (H89/H90); H91 uses KEPLER_LIFECYCLE_BAR_MAP_SIZE
+        # up to 0x1000000 (16 MiB) — SPT bank max before inst@0x60000.
         map_size = int(os.environ.get("KEPLER_LIFECYCLE_BAR_MAP_SIZE",
                                       "0x1000"), 0)
         print(f"probe-nouveau-base-lifecycle: through-bar; "
@@ -663,19 +669,101 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
             bar0, "nouveau-measure after BAR1", pa=0xfffe0000)
         bar_ok = pramin_positive(after_bar)
         bar1_ctl = bar0.read32(0x001704) & 0xffffffff
+        # Identity VA→PA; sample page 0, mid, and last mapped page (H91).
+        n_pages = max(map_size // 0x1000, 1)
+        sample_pages = [0]
+        if n_pages > 1:
+          sample_pages.append(n_pages // 2)
+        if n_pages > 2:
+          sample_pages.append(n_pages - 1)
+        sample_pages = sorted(set(sample_pages))
+        # TinyGPU MMIO_READ needs prior MAP_BAR (bar_info); BAR0 already mapped
+        # in _gk104_ensure_bar0_mmio — Night41aj skipped this for BAR1 (H90a).
+        bar1_dword = None
+        page0_dword = None
+        multi_ok = True
         try:
-          raw = bytes(dev.mmio_read(1, 0, 4))
-          bar1_dword = struct.unpack("<I", raw)[0] if len(raw) == 4 else None
+          bar1_addr, bar1_size = dev.bar_info(1)
+          print(f"probe-nouveau-base-lifecycle: MAP_BAR1 "
+                f"addr={bar1_addr:#x} size={bar1_size:#x}", flush=True)
+          for page in sample_pages:
+            pa = page * 0x1000
+            # Use offset-correct PRAMIN read (stage_snapshot only hits window base).
+            pr = shared._gk104_pramin_read32(bar0, pa) & 0xffffffff
+            raw = bytes(dev.mmio_read(1, pa, 4))
+            b1 = struct.unpack("<I", raw)[0] if len(raw) == 4 else None
+            hit = b1 is not None and b1 == pr
+            multi_ok = multi_ok and hit
+            if page == 0:
+              page0_dword, bar1_dword = pr, b1
+            print(f"probe-nouveau-base-lifecycle: page{page} "
+                  f"PRAMIN={pr:#010x} BAR1={b1:#010x} match={hit}"
+                  if b1 is not None else
+                  f"probe-nouveau-base-lifecycle: page{page} "
+                  f"PRAMIN={pr:#010x} BAR1=unreadable match=False",
+                  flush=True)
         except Exception as e:
-          print(f"probe-nouveau-base-lifecycle: physical BAR1[0] "
+          multi_ok = False
+          print(f"probe-nouveau-base-lifecycle: physical BAR1 "
                 f"read failed: {e}", flush=True)
+        page0_s = (f"{page0_dword:#010x}" if page0_dword is not None
+                   else "None")
+        bar1_s = (f"{bar1_dword:#010x}" if bar1_dword is not None
+                  else "unreadable")
         print(f"probe-nouveau-base-lifecycle: 0x1704={bar1_ctl:#010x} "
-              f"BAR1[0]={bar1_dword:#010x}" if bar1_dword is not None else
-              f"probe-nouveau-base-lifecycle: 0x1704={bar1_ctl:#010x} "
-              f"BAR1[0]=unreadable",
+              f"PRAMIN[PA0]={page0_s} BAR1[0]={bar1_s} "
+              f"match={multi_ok} pages={sample_pages}",
+              flush=True)
+    topo_before_pmc = None
+    topo_after_pmc = None
+    pmc_before = None
+    pmc_after = None
+    if through_pmc:
+      if not bar_ok:
+        print("probe-nouveau-base-lifecycle: through-pmc skipped; "
+              "after-BAR fixed-PA not positive", flush=True)
+      else:
+        # Nouveau nv50_mc_init / gk104_mc.init: wr32(0x000200, 0xffffffff).
+        # H93a: isolate MC full enable from PGOB (gf100_gr_oneinit).
+        pmc_before = bar0.read32(0x000200) & 0xffffffff
+        topo_before_pmc = bar0.read32(0x409604) & 0xffffffff
+        pgraph_before = bar0.read32(0x400000) & 0xffffffff
+        print(f"probe-nouveau-base-lifecycle: through-pmc; "
+              f"before PMC_ENABLE={pmc_before:#010x} "
+              f"topo={topo_before_pmc:#010x} "
+              f"PGRAPH={pgraph_before:#010x}", flush=True)
+        bar0.write32(0x000200, 0xffffffff)
+        _ = bar0.read32(0x000200)  # posting read
+        pmc_after = bar0.read32(0x000200) & 0xffffffff
+        topo_after_pmc = bar0.read32(0x409604) & 0xffffffff
+        pgraph_after = bar0.read32(0x400000) & 0xffffffff
+        fecs_scratch = bar0.read32(0x409800) & 0xffffffff
+        ungated = (topo_after_pmc != 0xbadf1200 and
+                   (topo_after_pmc & 0xffff0000) != 0xbadf0000)
+        print(f"probe-nouveau-base-lifecycle: after PMC_ENABLE="
+              f"{pmc_after:#010x} topo={topo_after_pmc:#010x} "
+              f"PGRAPH={pgraph_after:#010x} "
+              f"0x409800={fecs_scratch:#010x} ungated={ungated}",
+              flush=True)
+        after_pmc_fixed = shared._gk104_pramin_stage_snapshot(
+            bar0, "nouveau-measure after PMC", pa=0xfffe0000)
+        print(f"probe-nouveau-base-lifecycle: after-pmc fixed-PA "
+              f"preserved={pramin_positive(after_pmc_fixed)}",
               flush=True)
     # Summarize furthest stage reached.
-    if through_bar and after_bar is not None:
+    if through_pmc and topo_after_pmc is not None:
+      ungated = (topo_after_pmc != 0xbadf1200 and
+                 (topo_after_pmc & 0xffff0000) != 0xbadf0000)
+      stage = ("after-pmc-ungated" if ungated else "after-pmc-still-gated")
+      print("probe-nouveau-base-lifecycle: "
+            f"entry={before['pramin_word']:#010x} "
+            f"post={[hex(word) for word in after_post]} "
+            f"ram={[hex(word) for word in after_ram]} "
+            f"ltc={[hex(word) for word in after_ltc]} "
+            f"bar={[hex(word) for word in after_bar]} "
+            f"pmc={pmc_after:#010x} topo={topo_after_pmc:#010x} "
+            f"activated={stage}")
+    elif through_bar and after_bar is not None:
       if post_ok and ram_ok and ltc_ok and bar_ok:
         stage = "after-bar-preserved"
       elif post_ok and ram_ok and ltc_ok and not bar_ok:

@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "source": "examples_kepler/progress.md Night41+",
-  "leading": ["H90", "H89"],
+  "leading": ["H93e", "H92", "H91c"],
   "hypotheses": [
     {
       "id": "H52",
@@ -139,13 +139,61 @@
       "id": "H89",
       "status": "confirmed_bar1_mmio_preserved",
       "oracle": "regression_and_plan",
-      "summary": "Night41aj: fixed-PA PRAMIN identical after BAR1 identity (0x1704=0x80000060); physical BAR1[0] RPC failed"
+      "summary": "Night41aj: fixed-PA PRAMIN identical after BAR1 identity (0x1704=0x80000060)"
     },
     {
       "id": "H90",
+      "status": "confirmed",
+      "oracle": "regression_and_plan",
+      "summary": "Night41ak: MAP_BAR then BAR1[0]==PRAMIN[PA0]; Night41aj RPC fail was missing TinyGPU MAP_BAR"
+    },
+    {
+      "id": "H91",
+      "status": "confirmed_16mib",
+      "oracle": "regression_and_plan",
+      "summary": "Night41al: 16MiB identity multi-page match (probe bug fixed); one-page insufficient claim closed"
+    },
+    {
+      "id": "H91c",
+      "status": "open_secondary",
+      "oracle": "needs_live",
+      "summary": "Full 128MiB BAR1 may need SPT root move; only if ADD heap exceeds 16MiB"
+    },
+    {
+      "id": "H92",
+      "status": "open_secondary",
+      "oracle": "needs_live",
+      "summary": "Nouveau BAR2 (0x1714) before BAR1 may still be required for FECS/instmem path"
+    },
+    {
+      "id": "H93",
+      "status": "partial_h93a_confirmed",
+      "oracle": "regression_and_plan",
+      "summary": "Night41am: PMC_ENABLE full write ungates topo to 0x40004; PGRAPH still badf1000"
+    },
+    {
+      "id": "H93b",
+      "status": "disproven",
+      "oracle": "regression_and_plan",
+      "summary": "Warm GR bit12 toggle does not clear PGRAPH badf1000"
+    },
+    {
+      "id": "H93c",
+      "status": "partial_fecs_runs_no_ready",
+      "oracle": "regression_and_plan",
+      "summary": "Night41an: FECS load+start runs PC~0x100f7; bit31 never sets; PGOB fuse-skipped"
+    },
+    {
+      "id": "H93d",
+      "status": "disproven",
+      "oracle": "regression_and_plan",
+      "summary": "Nouveau RED_SWITCH 0x770 alone does not make FECS ready"
+    },
+    {
+      "id": "H93e",
       "status": "open_leading",
       "oracle": "needs_live",
-      "summary": "Physical BAR1 client path: TinyGPU BAR1 mmio_read failed after 0x1704 enable; need BAR2/instmem/host map fix toward ADD"
+      "summary": "Need gf100_gr_init PGRAPH pack/MMIO so FECS can finish main_done / clear badf1000"
     }
   ]
 }

@@ -1,0 +1,25 @@
+{
+  "name": "night41al_bar1_16mib",
+  "description": "Live cold Night41al: POST+RAM+LTC+16MiB BAR1 identity; multi-page BAR1==PRAMIN after offset-correct compare",
+  "source": "examples_kepler/progress.md Night41al",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "through_bar": true,
+  "bar_map_size": "0x1000000",
+  "map_bar1": {"addr": "0x110800000", "size": "0x8000000"},
+  "after_bar_words": ["0xffd97e3f", "0x08c1a564", "0xef2f57c7", "0x00211078"],
+  "bar1_ctl": "0x80000060",
+  "warm_pages_matched": [0, 511, 512, 2048, 4094, 4095],
+  "inst_limit": "0xffffff",
+  "gpc_topology_after": "0xbadf1200",
+  "fecs_after": "0xbadf1200",
+  "classification": "bar1_16mib_ok_gpc_still_gated",
+  "activated": "after-bar-preserved",
+  "hypothesis": "H91",
+  "next_phase": "H93_gpc_fecs_ungate"
+}

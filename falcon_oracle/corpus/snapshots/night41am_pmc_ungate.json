@@ -1,0 +1,24 @@
+{
+  "name": "night41am_pmc_ungate",
+  "description": "Live cold Night41am: POST+RAM+LTC+BAR1+PMC_ENABLE=0xffffffff; topo 0x40004 ungated",
+  "source": "examples_kepler/progress.md Night41am",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_word": "0xffffffff"
+  },
+  "through_pmc": true,
+  "pmc_before": "0xe011212d",
+  "pmc_after": "0xfc37b1ff",
+  "topo_before": "0xbadf1200",
+  "topo_after": "0x00040004",
+  "pgraph_after": "0xbadf1000",
+  "fecs_409800": "0x00000000",
+  "bar1_match": true,
+  "fixed_pa_preserved": true,
+  "classification": "pmc_ungates_topo_pgraph_still_badf1000",
+  "activated": "after-pmc-ungated",
+  "hypothesis": "H93a",
+  "next_phase": "H93c_pgob_or_pgraph_pack"
+}
