@@ -1,0 +1,9 @@
+{
+  "name": "wr32_group",
+  "description": "Fixture ladder #4: one WR32 group (serial pairs in one command)",
+  "commands": [
+    ["ENTER"],
+    ["WR32", "0x10f808", "0x72a00000", "0x10f80c", "0x00000001", "0x10f810", "0x00000002"],
+    ["LEAVE"]
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "posted_baseline_candidate",
+  "description": "Synthetic H70 field-predicate pass (offline template — not live silicon)",
+  "source": "progress.md roadmap H61/H70 posted baseline requirements",
+  "registers": {
+    "0x0": "0x0e4040a2",
+    "0x2240c": "0x2",
+    "0x409604": "0x0",
+    "0x1700": "0x0",
+    "0x700000": "0x0000beef",
+    "0x619f04": "0x000fffe09",
+    "0x88050": "0x1"
+  }
+}

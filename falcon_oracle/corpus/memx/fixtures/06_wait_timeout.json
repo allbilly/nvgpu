@@ -1,0 +1,10 @@
+{
+  "name": "wait_timeout",
+  "description": "Fixture ladder #6: WAIT that times out (stock memx continues)",
+  "seed_host": {"0x10f900": "0x00000000"},
+  "commands": [
+    ["ENTER"],
+    ["WAIT", "0x10f900", "0x0000000f", "0x0000000a", "3000"],
+    ["LEAVE"]
+  ]
+}

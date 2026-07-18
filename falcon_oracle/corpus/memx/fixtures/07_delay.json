@@ -1,0 +1,9 @@
+{
+  "name": "delay",
+  "description": "Fixture ladder #7: DELAY (logical-step timer, not wall clock)",
+  "commands": [
+    ["ENTER"],
+    ["DELAY", "5000"],
+    ["LEAVE"]
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "night41u_after_post",
+  "description": "Live cold Night41u: end-only fixed-PA sample reproduces Night41s-class PRAMIN activation; confirms H80",
+  "source": "examples_kepler/progress.md Night41u",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "scripts": ["0x87e5", "0x8fe8", "0x64ff", "0xabb5", "0xabb6", "0xac95", "0xacfb"],
+  "fixed_pa": "0xfffe0000",
+  "after_post_words": ["0xffff7eff", "0x0800e100", "0xefff57ff", "0x00001000"],
+  "classification": "pramin_positive_after_post",
+  "causal_stop": "before_ram",
+  "core_mmio_vs_night41s": "identical_801_writes",
+  "hypothesis": "H80_confirmed"
+}

@@ -1,0 +1,27 @@
+{
+  "name": "night41ag_8fe8_stop_a421",
+  "description": "Live cold Night41ag: 87e5 + 8fe8 stop_before 0xa421 virgin; H85a out; first activator is R[0x11e338] (H79 closed)",
+  "source": "examples_kepler/progress.md Night41ag",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "prefix": 2,
+  "scripts_run": ["0x87e5", "0x8fe8"],
+  "stop_before": "0xa421",
+  "ended_at": "0xa421",
+  "fixed_pa": "0xfffe0000",
+  "after_prefix_words": ["0xffffffff", "0xffffffff", "0xffffffff", "0xffffffff"],
+  "classification": "pramin_virgin_8fe8_a421_cut",
+  "causal_stop": "before_ram",
+  "window": "closed: first activator R[0x11e338]=0x00300120 @ py 0xa421",
+  "next_phase": "preservation_through_ram",
+  "hypothesis": "H79",
+  "closed": ["H85a"],
+  "confirmed": ["H85b", "H79"],
+  "nouveau_pc_skew": "-0x62",
+  "activator_mmio": "R[0x11e338]=0x00300120"
+}

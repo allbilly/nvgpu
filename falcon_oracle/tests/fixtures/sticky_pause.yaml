@@ -1,0 +1,7 @@
+schema: 1
+name: sticky-pause
+initial_mmio:
+  "0x000007c0": "0x00000004"
+vram_default: 0
+xfer_complete_after_polls: 1
+events: []

@@ -1,0 +1,18 @@
+{
+  "name": "night41t_mid_post_virgin",
+  "description": "Live cold Night41t: identical core NVINIT MMIO to Night41s, but fixed-PA PRAMIN stayed virgin after every mid-POST 0x1700 sample",
+  "source": "examples_kepler/progress.md Night41t",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "scripts": ["0x87e5", "0x8fe8", "0x64ff", "0xabb5", "0xabb6", "0xac95", "0xacfb"],
+  "fixed_pa": "0xfffe0000",
+  "after_each_script_words": ["0xffffffff", "0xffffffff", "0xffffffff", "0xffffffff"],
+  "classification": "pramin_virgin_under_mid_post_1700_sampling",
+  "core_mmio_vs_night41s": "identical_801_writes_when_stripping_1700_and_pramin_aperture",
+  "hypothesis": "H80"
+}

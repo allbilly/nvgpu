@@ -1,0 +1,23 @@
+{
+  "name": "night41f_order",
+  "description": "Night41f MEMX ordering: ENTER → root dword WR32 group → LEAVE. 0x1704 enable is host-after (see host_after); real Night41f roots use PMU MEMIF xdst.",
+  "host_after": [
+    ["WR32", "0x1704", "0x80000001"]
+  ],
+  "commands": [
+    ["ENTER"],
+    ["WR32",
+      "0x10f000", "0x44332211",
+      "0x10f004", "0x88776655",
+      "0x10f008", "0xccbbaa99",
+      "0x10f00c", "0x01ffeedd",
+      "0x10f010", "0xa3a2a1a0",
+      "0x10f014", "0xa7a6a5a4",
+      "0x10f018", "0xb3b2b1b0",
+      "0x10f01c", "0xb7b6b5b4",
+      "0x10f020", "0xbbbab9b8",
+      "0x10f024", "0xbfbebdbc"
+    ],
+    ["LEAVE"]
+  ]
+}

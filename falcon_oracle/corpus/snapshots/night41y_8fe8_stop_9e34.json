@@ -1,0 +1,22 @@
+{
+  "name": "night41y_8fe8_stop_9e34",
+  "description": "Live cold Night41y: 87e5 + 8fe8 stop_before 0x9e34 stays virgin; activator in latter half of 0x8fe8",
+  "source": "examples_kepler/progress.md Night41y",
+  "entry": {
+    "boot0": "0x0e4040a2",
+    "devinit_posted": "0x00000000",
+    "gpc_topology": "0xbadf1200",
+    "pramin_selector": "0x00000000",
+    "pramin_word": "0xffffffff"
+  },
+  "prefix": 2,
+  "scripts_run": ["0x87e5", "0x8fe8"],
+  "stop_before": "0x9e34",
+  "ended_at": "0x9e60",
+  "fixed_pa": "0xfffe0000",
+  "after_prefix_words": ["0xffffffff", "0xffffffff", "0xffffffff", "0xffffffff"],
+  "classification": "pramin_virgin_8fe8_mid_cut",
+  "causal_stop": "before_ram",
+  "next_cut": "KEPLER_NVINIT_STOP_OFFSET=0xa43c",
+  "hypothesis": "H79"
+}

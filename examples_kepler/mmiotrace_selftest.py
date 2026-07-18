@@ -1025,11 +1025,17 @@ def test_21_replug_runbook_in_wrappers() -> None:
   assert "def _probe" in mac or '"--probe"' in mac
   assert "--probe-post-ownership" in mac
   assert "_gk104_post_entry_probe" in mac
+  assert "--probe-nouveau-post-script-bisect" in mac
+  assert "KEPLER_POST_SCRIPT_PREFIX" in mac
+  assert "KEPLER_NVINIT_STOP_OFFSET" in mac
+  assert "Night41t retired mid-POST 0x1700 sampling" in mac
+  assert "stop_before" in pathlib.Path(__file__).resolve().parent.joinpath("nvbios_init.py").read_text(encoding="utf-8")
   pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
   pcie_src = pcie.read_text(encoding="utf-8")
   assert "--mmiotrace-selftest" in pcie_src
   assert "--probe-post-ownership" in pcie_src
   assert "no hardware / pagemap" in pcie_src or "mmiotrace-selftest" in pcie_src
+  assert "stop_before=0x9e34" in pcie_src
 
 
 # ---------------------------------------------------------------------------

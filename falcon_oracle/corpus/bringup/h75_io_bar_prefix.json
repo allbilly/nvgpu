@@ -1,0 +1,14 @@
+{
+  "name": "h75_io_bar_prefix",
+  "description": "Capture checklist for H75 option-ROM I/O-BAR prefix (progress.md). Oracle does not replay this — score plans that claim to capture/replay it.",
+  "hypothesis": "H75",
+  "spaces_required": ["pci_config", "x86_io", "bar0_mmio"],
+  "mmiotrace_alone": false,
+  "steps": [
+    {"space": "pci_config", "op": "rd32", "via": "0xcf8/0xcfc", "offset": "0x24", "note": "I/O BAR base"},
+    {"space": "x86_io", "op": "wr32", "bar_plus": 0, "data": "0x2469fdb9"},
+    {"space": "x86_io", "op": "wr32", "bar_plus": 4, "data": "0x1"},
+    {"space": "x86_io", "op": "rmw_indexed", "index_plus": 8, "data_plus": 12, "reg": "0x200", "set": "0x10000"},
+    {"space": "bar0_mmio", "op": "probe", "addr": "0x700000", "note": "PRAMIN word immediately after prefix"}
+  ]
+}

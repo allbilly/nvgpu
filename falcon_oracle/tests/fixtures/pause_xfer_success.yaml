@@ -1,0 +1,25 @@
+schema: 1
+name: pause-xfer-success
+initial_mmio:
+  "0x000007c0": "0x00000000"
+  "0x000007e0": "0x00000000"
+  "0x000007e4": "0x00000000"
+vram_default: 0
+xfer_complete_after_polls: 1
+events:
+  - trigger:
+      kind: mmio_write
+      address: "0x000007e0"
+      value: "0x00000004"
+    effect:
+      after_steps: 1
+      set_mmio:
+        "0x000007c0": "0x00000004"
+  - trigger:
+      kind: mmio_write
+      address: "0x000007e4"
+      value: "0x00000004"
+    effect:
+      after_steps: 1
+      set_mmio:
+        "0x000007c0": "0x00000000"

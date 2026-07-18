@@ -1,0 +1,9 @@
+{
+  "name": "bad_promote_619f04",
+  "intent": "write_619f04_activator",
+  "hypothesis": "H69",
+  "entry_assumption": "STUB_PRAMIN",
+  "actions": ["write_619f04", "write_088050", "physical_bar1_read"],
+  "forbid": [],
+  "prediction": "H69 disproven — refused"
+}

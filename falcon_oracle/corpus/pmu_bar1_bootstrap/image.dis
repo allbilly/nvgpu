@@ -1,0 +1,66 @@
+00000b14: f1 37 02 b0           mov $r3 -0x4ffe
+00000b18: f1 33 c0 40           sethi $r3 0x40c00000
+00000b1c: f1 47 7c 0d           mov $r4 0xd7c
+00000b20: f0 43 00              sethi $r4 0x0
+00000b23: 80 43 00              st b32 D[$r4] $r3
+00000b26: f1 27 03 b0           mov $r2 -0x4ffd
+00000b2a: f1 23 c0 40           sethi $r2 0x40c00000
+00000b2e: f1 47 78 0d           mov $r4 0xd78
+00000b32: f0 43 00              sethi $r4 0x0
+00000b35: 98 43 00            B ld b32 $r3 D[$r4]
+00000b38: bb 32 02              sub b32 $r3 $r2
+00000b3b: f4 1b fa              bra ne 0xb35
+00000b3e: f1 e7 20 16           mov $r14 0x1620
+00000b42: f0 e3 00              sethi $r14 0x0
+00000b45: f1 d7 08 00           mov $r13 0x8
+00000b49: f0 d3 00              sethi $r13 0x0
+00000b4c: f4 21 34              call 0x34
+00000b4f: f1 e7 f0 26           mov $r14 0x26f0
+00000b53: f1 d7 00 00           mov $r13 0x0
+00000b57: f4 21 34              call 0x34
+00000b5a: f1 07 e4 07           mov $r0 0x7e4
+00000b5e: f0 37 04              mov $r3 0x4
+00000b61: d0 03 00              iowr I[$r0] $r3
+00000b64: f1 07 e0 07           mov $r0 0x7e0
+00000b68: f0 37 04              mov $r3 0x4
+00000b6b: d0 03 00              iowr I[$r0] $r3
+00000b6e: f1 57 ff 00           mov $r5 0xff
+00000b72: f1 07 c0 07         B mov $r0 0x7c0
+00000b76: cf 06 00              iord $r6 I[$r0]
+00000b79: f0 64 04              and $r6 0x4
+00000b7c: f4 1b 09              bra ne 0xb85
+00000b7f: b6 52 01              sub b32 $r5 0x1
+00000b82: f4 1b f0              bra ne 0xb72
+00000b85: bd 24               B clear b32 $r2
+00000b87: f1 37 02 06           mov $r3 0x602
+00000b8b: fe 37 00              mov $xdbase $r3
+00000b8e: f1 17 80 0d           mov $r1 0xd80
+00000b92: f0 13 02              sethi $r1 0x20000
+00000b95: fa 21 06              xdst $r2 $r1
+00000b98: f8 03                 xdwait
+00000b9a: f1 37 00 04           mov $r3 0x400
+00000b9e: fe 37 00              mov $xdbase $r3
+00000ba1: f1 17 90 0d           mov $r1 0xd90
+00000ba5: f0 13 01              sethi $r1 0x10000
+00000ba8: fa 21 06              xdst $r2 $r1
+00000bab: f8 03                 xdwait
+00000bad: f1 37 00 05           mov $r3 0x500
+00000bb1: fe 37 00              mov $xdbase $r3
+00000bb4: f1 17 a0 0d           mov $r1 0xda0
+00000bb8: f0 13 02              sethi $r1 0x20000
+00000bbb: fa 21 06              xdst $r2 $r1
+00000bbe: f8 03                 xdwait
+00000bc0: f1 07 e4 07           mov $r0 0x7e4
+00000bc4: f0 37 04              mov $r3 0x4
+00000bc7: d0 03 00              iowr I[$r0] $r3
+00000bca: f1 e7 f0 26           mov $r14 0x26f0
+00000bce: f1 d7 01 00           mov $r13 0x1
+00000bd2: f4 21 34              call 0x34
+00000bd5: f1 e7 20 16           mov $r14 0x1620
+00000bd9: f1 d7 ab 0a           mov $r13 0xaab
+00000bdd: f4 21 34              call 0x34
+00000be0: f1 37 05 b0           mov $r3 -0x4ffb
+00000be4: f1 33 c0 40           sethi $r3 0x40c00000
+00000be8: f1 47 70 0d           mov $r4 0xd70
+00000bec: 80 43 00              st b32 D[$r4] $r3
+00000bef: f4 0e 00            B bra 0xbef

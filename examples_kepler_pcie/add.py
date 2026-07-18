@@ -3937,6 +3937,16 @@ def kepler_selftest():
   assert _state_regs.regs[0x00123400] == 0x89abcdef
   assert _state_init.execute == 1
   assert _state_init._ramcfg_value is None
+  # Night41x nested bisect: stop_before halts top-level progress inside 0x8fe8.
+  _stop_image = nvbios_init.find_vbios_image(
+      pathlib.Path(DEFAULT_VBIOS).read_bytes())
+  _stop_regs = _FakeRamRegs()
+  _stop_init = nvbios_init.NvbiosInit(_stop_regs, _stop_image)
+  _stop_init.run_script(0x87e5)
+  _n_after_87e5 = len(_stop_regs.writes)
+  _stop_init.run_script(0x8fe8, stop_before=0x9e34)
+  assert _stop_init.offset >= 0x9e34, _stop_init.offset
+  assert len(_stop_regs.writes) > _n_after_87e5
   class _FailingNvinitRegs:
     def read32(self, reg): raise OSError("transport read failed")
     def write32(self, reg, value): raise OSError("transport write failed")

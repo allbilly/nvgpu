@@ -1,0 +1,533 @@
+{
+  "schema": 1,
+  "instructions": [
+    {
+      "pc": "0x00000b14",
+      "size": 4,
+      "raw": "f13702b0",
+      "mnemonic": "mov",
+      "operands": "$r3 -0x4ffe",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b18",
+      "size": 4,
+      "raw": "f133c040",
+      "mnemonic": "sethi",
+      "operands": "$r3 0x40c00000",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b1c",
+      "size": 4,
+      "raw": "f1477c0d",
+      "mnemonic": "mov",
+      "operands": "$r4 0xd7c",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b20",
+      "size": 3,
+      "raw": "f04300",
+      "mnemonic": "sethi",
+      "operands": "$r4 0x0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b23",
+      "size": 3,
+      "raw": "804300",
+      "mnemonic": "st",
+      "operands": "b32 D[$r4] $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b26",
+      "size": 4,
+      "raw": "f12703b0",
+      "mnemonic": "mov",
+      "operands": "$r2 -0x4ffd",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b2a",
+      "size": 4,
+      "raw": "f123c040",
+      "mnemonic": "sethi",
+      "operands": "$r2 0x40c00000",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b2e",
+      "size": 4,
+      "raw": "f147780d",
+      "mnemonic": "mov",
+      "operands": "$r4 0xd78",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b32",
+      "size": 3,
+      "raw": "f04300",
+      "mnemonic": "sethi",
+      "operands": "$r4 0x0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b35",
+      "size": 3,
+      "raw": "984300",
+      "mnemonic": "ld",
+      "operands": "b32 $r3 D[$r4]",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b38",
+      "size": 3,
+      "raw": "bb3202",
+      "mnemonic": "sub",
+      "operands": "b32 $r3 $r2",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b3b",
+      "size": 3,
+      "raw": "f41bfa",
+      "mnemonic": "bra",
+      "operands": "ne 0xb35",
+      "branch_target": "0xb35"
+    },
+    {
+      "pc": "0x00000b3e",
+      "size": 4,
+      "raw": "f1e72016",
+      "mnemonic": "mov",
+      "operands": "$r14 0x1620",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b42",
+      "size": 3,
+      "raw": "f0e300",
+      "mnemonic": "sethi",
+      "operands": "$r14 0x0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b45",
+      "size": 4,
+      "raw": "f1d70800",
+      "mnemonic": "mov",
+      "operands": "$r13 0x8",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b49",
+      "size": 3,
+      "raw": "f0d300",
+      "mnemonic": "sethi",
+      "operands": "$r13 0x0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b4c",
+      "size": 3,
+      "raw": "f42134",
+      "mnemonic": "call",
+      "operands": "0x34",
+      "branch_target": "0x34"
+    },
+    {
+      "pc": "0x00000b4f",
+      "size": 4,
+      "raw": "f1e7f026",
+      "mnemonic": "mov",
+      "operands": "$r14 0x26f0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b53",
+      "size": 4,
+      "raw": "f1d70000",
+      "mnemonic": "mov",
+      "operands": "$r13 0x0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b57",
+      "size": 3,
+      "raw": "f42134",
+      "mnemonic": "call",
+      "operands": "0x34",
+      "branch_target": "0x34"
+    },
+    {
+      "pc": "0x00000b5a",
+      "size": 4,
+      "raw": "f107e407",
+      "mnemonic": "mov",
+      "operands": "$r0 0x7e4",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b5e",
+      "size": 3,
+      "raw": "f03704",
+      "mnemonic": "mov",
+      "operands": "$r3 0x4",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b61",
+      "size": 3,
+      "raw": "d00300",
+      "mnemonic": "iowr",
+      "operands": "I[$r0] $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b64",
+      "size": 4,
+      "raw": "f107e007",
+      "mnemonic": "mov",
+      "operands": "$r0 0x7e0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b68",
+      "size": 3,
+      "raw": "f03704",
+      "mnemonic": "mov",
+      "operands": "$r3 0x4",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b6b",
+      "size": 3,
+      "raw": "d00300",
+      "mnemonic": "iowr",
+      "operands": "I[$r0] $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b6e",
+      "size": 4,
+      "raw": "f157ff00",
+      "mnemonic": "mov",
+      "operands": "$r5 0xff",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b72",
+      "size": 4,
+      "raw": "f107c007",
+      "mnemonic": "mov",
+      "operands": "$r0 0x7c0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b76",
+      "size": 3,
+      "raw": "cf0600",
+      "mnemonic": "iord",
+      "operands": "$r6 I[$r0]",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b79",
+      "size": 3,
+      "raw": "f06404",
+      "mnemonic": "and",
+      "operands": "$r6 0x4",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b7c",
+      "size": 3,
+      "raw": "f41b09",
+      "mnemonic": "bra",
+      "operands": "ne 0xb85",
+      "branch_target": "0xb85"
+    },
+    {
+      "pc": "0x00000b7f",
+      "size": 3,
+      "raw": "b65201",
+      "mnemonic": "sub",
+      "operands": "b32 $r5 0x1",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b82",
+      "size": 3,
+      "raw": "f41bf0",
+      "mnemonic": "bra",
+      "operands": "ne 0xb72",
+      "branch_target": "0xb72"
+    },
+    {
+      "pc": "0x00000b85",
+      "size": 2,
+      "raw": "bd24",
+      "mnemonic": "clear",
+      "operands": "b32 $r2",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b87",
+      "size": 4,
+      "raw": "f1370206",
+      "mnemonic": "mov",
+      "operands": "$r3 0x602",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b8b",
+      "size": 3,
+      "raw": "fe3700",
+      "mnemonic": "mov",
+      "operands": "$xdbase $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b8e",
+      "size": 4,
+      "raw": "f117800d",
+      "mnemonic": "mov",
+      "operands": "$r1 0xd80",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b92",
+      "size": 3,
+      "raw": "f01302",
+      "mnemonic": "sethi",
+      "operands": "$r1 0x20000",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b95",
+      "size": 3,
+      "raw": "fa2106",
+      "mnemonic": "xdst",
+      "operands": "$r2 $r1",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b98",
+      "size": 2,
+      "raw": "f803",
+      "mnemonic": "xdwait",
+      "operands": "",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b9a",
+      "size": 4,
+      "raw": "f1370004",
+      "mnemonic": "mov",
+      "operands": "$r3 0x400",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000b9e",
+      "size": 3,
+      "raw": "fe3700",
+      "mnemonic": "mov",
+      "operands": "$xdbase $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000ba1",
+      "size": 4,
+      "raw": "f117900d",
+      "mnemonic": "mov",
+      "operands": "$r1 0xd90",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000ba5",
+      "size": 3,
+      "raw": "f01301",
+      "mnemonic": "sethi",
+      "operands": "$r1 0x10000",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000ba8",
+      "size": 3,
+      "raw": "fa2106",
+      "mnemonic": "xdst",
+      "operands": "$r2 $r1",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bab",
+      "size": 2,
+      "raw": "f803",
+      "mnemonic": "xdwait",
+      "operands": "",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bad",
+      "size": 4,
+      "raw": "f1370005",
+      "mnemonic": "mov",
+      "operands": "$r3 0x500",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bb1",
+      "size": 3,
+      "raw": "fe3700",
+      "mnemonic": "mov",
+      "operands": "$xdbase $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bb4",
+      "size": 4,
+      "raw": "f117a00d",
+      "mnemonic": "mov",
+      "operands": "$r1 0xda0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bb8",
+      "size": 3,
+      "raw": "f01302",
+      "mnemonic": "sethi",
+      "operands": "$r1 0x20000",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bbb",
+      "size": 3,
+      "raw": "fa2106",
+      "mnemonic": "xdst",
+      "operands": "$r2 $r1",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bbe",
+      "size": 2,
+      "raw": "f803",
+      "mnemonic": "xdwait",
+      "operands": "",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bc0",
+      "size": 4,
+      "raw": "f107e407",
+      "mnemonic": "mov",
+      "operands": "$r0 0x7e4",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bc4",
+      "size": 3,
+      "raw": "f03704",
+      "mnemonic": "mov",
+      "operands": "$r3 0x4",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bc7",
+      "size": 3,
+      "raw": "d00300",
+      "mnemonic": "iowr",
+      "operands": "I[$r0] $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bca",
+      "size": 4,
+      "raw": "f1e7f026",
+      "mnemonic": "mov",
+      "operands": "$r14 0x26f0",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bce",
+      "size": 4,
+      "raw": "f1d70100",
+      "mnemonic": "mov",
+      "operands": "$r13 0x1",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bd2",
+      "size": 3,
+      "raw": "f42134",
+      "mnemonic": "call",
+      "operands": "0x34",
+      "branch_target": "0x34"
+    },
+    {
+      "pc": "0x00000bd5",
+      "size": 4,
+      "raw": "f1e72016",
+      "mnemonic": "mov",
+      "operands": "$r14 0x1620",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bd9",
+      "size": 4,
+      "raw": "f1d7ab0a",
+      "mnemonic": "mov",
+      "operands": "$r13 0xaab",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bdd",
+      "size": 3,
+      "raw": "f42134",
+      "mnemonic": "call",
+      "operands": "0x34",
+      "branch_target": "0x34"
+    },
+    {
+      "pc": "0x00000be0",
+      "size": 4,
+      "raw": "f13705b0",
+      "mnemonic": "mov",
+      "operands": "$r3 -0x4ffb",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000be4",
+      "size": 4,
+      "raw": "f133c040",
+      "mnemonic": "sethi",
+      "operands": "$r3 0x40c00000",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000be8",
+      "size": 4,
+      "raw": "f147700d",
+      "mnemonic": "mov",
+      "operands": "$r4 0xd70",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bec",
+      "size": 3,
+      "raw": "804300",
+      "mnemonic": "st",
+      "operands": "b32 D[$r4] $r3",
+      "branch_target": null
+    },
+    {
+      "pc": "0x00000bef",
+      "size": 3,
+      "raw": "f40e00",
+      "mnemonic": "bra",
+      "operands": "0xbef",
+      "branch_target": "0xbef"
+    }
+  ]
+}

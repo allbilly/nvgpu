@@ -1,0 +1,15 @@
+{"address":5664,"kind":"MMIO_WRITE","sequence":0,"size":4,"value":8}
+{"address":9968,"kind":"MMIO_WRITE","sequence":1,"size":4,"value":0}
+{"address":2020,"kind":"MMIO_WRITE","sequence":2,"size":4,"value":4}
+{"address":2016,"kind":"MMIO_WRITE","sequence":3,"size":4,"value":4}
+{"address":1984,"kind":"MMIO_READ","sequence":4,"size":4,"value":4}
+{"address":393728,"kind":"XFER_START","metadata":{"destination_space":"direct_vram","direction":"dmem_to_direct_vram","port":0,"source_space":"dmem","token":1},"sequence":5,"size":16,"value":3456}
+{"address":393728,"kind":"XFER_COMPLETE","metadata":{"sha256":"9e2b2b80b389973f331cee99ddec40381f75d567eb552c84a39b94f226dcea62","token":1},"sequence":6,"size":16,"value":3456}
+{"address":262144,"kind":"XFER_START","metadata":{"destination_space":"direct_vram","direction":"dmem_to_direct_vram","port":0,"source_space":"dmem","token":2},"sequence":7,"size":8,"value":3472}
+{"address":262144,"kind":"XFER_COMPLETE","metadata":{"sha256":"ebaeb334608f2c327073263eb7ea23a4ace2aa98e0f5a7d04cce3af547bcc329","token":2},"sequence":8,"size":8,"value":3472}
+{"address":327680,"kind":"XFER_START","metadata":{"destination_space":"direct_vram","direction":"dmem_to_direct_vram","port":0,"source_space":"dmem","token":3},"sequence":9,"size":16,"value":3488}
+{"address":327680,"kind":"XFER_COMPLETE","metadata":{"sha256":"9f52527783ea1185acd5d4dcf1bf91b707add104b6a1c467598743246ed7ae26","token":3},"sequence":10,"size":16,"value":3488}
+{"address":2020,"kind":"MMIO_WRITE","sequence":11,"size":4,"value":4}
+{"address":9968,"kind":"MMIO_WRITE","sequence":12,"size":4,"value":1}
+{"address":5664,"kind":"MMIO_WRITE","sequence":13,"size":4,"value":2731}
+{"kind":"HALT","metadata":{"reason":"done"},"pc":3055,"sequence":14,"value":1086369797}

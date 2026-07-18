@@ -1,0 +1,9 @@
+{
+  "name": "enter_wr32_leave",
+  "description": "Fixture ladder #9: ENTER; WR32; LEAVE ownership region",
+  "commands": [
+    ["ENTER"],
+    ["WR32", "0x001620", "0x00000008"],
+    ["LEAVE"]
+  ]
+}

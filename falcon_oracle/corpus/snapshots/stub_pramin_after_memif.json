@@ -1,0 +1,13 @@
+{
+  "name": "stub_pramin_after_memif",
+  "description": "H57 class: BAR0 live, PRAMIN bad0fb stub after MEMIF-exact roots",
+  "source": "progress.md Night41g",
+  "registers": {
+    "0x0": "0x0e4040a2",
+    "0x2240c": "0x2",
+    "0x409604": "0x0",
+    "0x1700": "0x0",
+    "0x700000": "0xbad0fb03",
+    "0x619f04": "0x0"
+  }
+}

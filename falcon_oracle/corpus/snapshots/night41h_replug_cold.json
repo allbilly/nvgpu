@@ -1,0 +1,14 @@
+{
+  "name": "night41h_replug_cold",
+  "description": "Night41h entry-only enclosure replug (progress.md) — not a firmware POST",
+  "source": "examples_kepler/progress.md Night41h",
+  "registers": {
+    "0x0": "0x0e4040a2",
+    "0x2240c": "0x0",
+    "0x409604": "0xbadf1200",
+    "0x1700": "0x0",
+    "0x700000": "0xffffffff",
+    "0x619f04": "0x0",
+    "0x88050": "0x0"
+  }
+}

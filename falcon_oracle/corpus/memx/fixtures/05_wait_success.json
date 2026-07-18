@@ -1,0 +1,10 @@
+{
+  "name": "wait_success",
+  "description": "Fixture ladder #5: WAIT that matches immediately",
+  "seed_host": {"0x10f900": "0x0000000a"},
+  "commands": [
+    ["ENTER"],
+    ["WAIT", "0x10f900", "0x0000000f", "0x0000000a", "500000"],
+    ["LEAVE"]
+  ]
+}
