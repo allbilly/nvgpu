@@ -63,6 +63,7 @@ for _path in (TINYGRAD_ROOT, SHARED_KEPLER_DIR):
   if _path not in sys.path: sys.path.insert(0, _path)
 DEFAULT_VBIOS = os.path.join(SHARED_KEPLER_DIR, "Palit.GTX770.4096.131216.rom")
 DEFAULT_CUBIN = os.path.join(SHARED_KEPLER_DIR, "add_kepler.cubin")
+DEFAULT_MUL_CUBIN = os.path.join(SHARED_KEPLER_DIR, "mul_kepler.cubin")
 # Reference produced by CUDA 10.2 `ptxas -arch=sm_30` for the multiply
 # variant assembled from the checked-in Kepler PTX.  Keep this independent of
 # the add cubin so a stale/precompiled add image cannot silently run a mul test.
@@ -2653,17 +2654,24 @@ def get_kepler_cubin():
             hashlib.sha256(assembled).hexdigest() != MUL_CUBIN_SHA256):
         raise RuntimeError("local sm_30 mul cubin differs from verified reference")
       return assembled
-    if operation == "mul":
-      raise RuntimeError("live mul requires CUDA 10.2 ptxas (set KEPLER_PTXAS)")
   # Explicit cubins are accepted for bring-up, then validated as sm_30 ELF.
-  bundled = DEFAULT_CUBIN
+  bundled = DEFAULT_MUL_CUBIN if operation == "mul" else DEFAULT_CUBIN
   if not path and os.path.exists(bundled): path = bundled
-  if not path or not os.path.exists(path): path = compile_kepler_cubin_docker()
   if not path or not os.path.exists(path):
-    raise RuntimeError("live hardware requires a real sm_30 add cubin; set KEPLER_CUBIN or start Docker")
+    if operation == "add":
+      path = compile_kepler_cubin_docker()
+  if not path or not os.path.exists(path):
+    raise RuntimeError(
+        f"live hardware requires a real sm_30 {operation} cubin; "
+        "set KEPLER_CUBIN or install CUDA 10.2 ptxas")
   with open(path, "rb") as f: cubin = f.read()
   if len(cubin) < 0x40 or cubin[:4] != b"\x7fELF" or struct.unpack_from("<I", cubin, 0x30)[0] & 0xff != 0x1e:
     raise ValueError(f"KEPLER_CUBIN must be an sm_30 ELF cubin: {path}")
+  if operation == "mul":
+    digest = hashlib.sha256(cubin).hexdigest()
+    if len(cubin) != MUL_CUBIN_BYTES or digest != MUL_CUBIN_SHA256:
+      raise ValueError(
+          f"KEPLER_CUBIN mul digest mismatch: {len(cubin)} bytes sha256={digest}")
   elf_section_bytes(cubin, ".text.E_4")
   cubin_register_count(cubin, "E_4")
   return cubin
@@ -12181,7 +12189,9 @@ def run_hardware_demo(dev, cubin=None):
   else:
     allocator._copyout(out_host, out_dev)
   out_arr = array.array('f'); out_arr.frombytes(bytes(out_host))
-  expected = [a_host[i] + b_host[i] for i in range(N)]
+  operation = os.environ.get("KEPLER_OPERATION", "add")
+  expected = ([a_host[i] * b_host[i] for i in range(N)] if operation == "mul"
+              else [a_host[i] + b_host[i] for i in range(N)])
   # Debug: show first few values
   _mismatches = sum(1 for i in range(N)
                     if not math.isfinite(out_arr[i]) or
@@ -12201,7 +12211,7 @@ def run_hardware_demo(dev, cubin=None):
     print(f"[kepler] raw b_host hex: {b_host.tobytes()[:32].hex()}", flush=True)
   _freeze_stop_and_hold(dev, "output-read-complete")
   assert _mismatches == 0, f"hardware {operation} mismatch ({_mismatches}/{N} wrong)"
-  print(f"hardware_demo=ok N={N}")
+  print(f"hardware_demo=ok N={N} operation={operation}")
 
 def main():
   # The verified GTX 770 sequence needs FIFO reset; retain an environment
