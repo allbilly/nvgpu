@@ -1876,15 +1876,49 @@ class NvbiosInit:
 
 
 def find_vbios_image(data: bytes, device: int = 0x1184) -> bytes:
-  """Extract the PCI ROM image for a matching GK104 device from an NVGI dump."""
-  for pcir in range(len(data)):
-    if data[pcir:pcir + 4] != b"PCIR" or pcir + 0x12 > len(data): continue
+  """Extract the PCI ROM image for a matching GK104 device from an NVGI dump.
+
+  Prefer a real PCI Expansion ROM walk (``55 aa`` → PCIR).  Fall back to a
+  byte scan for NVGI-style containers (Palit dumps start with ``NVGI``).
+  Pass ``device=0x1183`` for GTX 660 Ti board images.
+  """
+  want = int(device)
+
+  def _from_pcir(pcir: int) -> bytes | None:
+    if data[pcir:pcir + 4] != b"PCIR" or pcir + 0x12 > len(data):
+      return None
     vendor, dev = struct.unpack_from("<HH", data, pcir + 4)
-    if vendor != 0x10de or dev != device: continue
+    if vendor != 0x10de or dev != want:
+      return None
     size = struct.unpack_from("<H", data, pcir + 0x10)[0] * 512
     base = data.rfind(b"\x55\xaa", max(0, pcir - 0x1000), pcir + 1)
     if base >= 0 and base + size <= len(data):
       return data[base:base + size]
+    return None
+
+  # 1) Structured PCI ROM walk (onboard PROM dumps).
+  off = 0
+  while off + 0x20 <= len(data) and data[off:off + 2] == b"\x55\xaa":
+    pcir_rel = struct.unpack_from("<H", data, off + 0x18)[0]
+    pcir = off + pcir_rel
+    got = _from_pcir(pcir)
+    if got is not None:
+      return got
+    if pcir + 0x16 > len(data) or data[pcir:pcir + 4] != b"PCIR":
+      break
+    img_len = struct.unpack_from("<H", data, pcir + 0x10)[0] * 512
+    indi = data[pcir + 0x15]
+    if img_len <= 0:
+      break
+    off += img_len
+    if indi & 0x80:
+      break
+
+  # 2) NVGI / loose PCIR byte scan (Palit golden dumps).
+  for pcir in range(len(data)):
+    got = _from_pcir(pcir)
+    if got is not None:
+      return got
   raise ValueError("no complete matching PCI ROM image")
 
 
