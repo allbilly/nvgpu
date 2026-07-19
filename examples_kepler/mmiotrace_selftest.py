@@ -89,6 +89,8 @@ GOLDEN_TRAIN_PHASE_LEN = 1506
 GOLDEN_ZBC_BODY_LEN = 105
 
 MACOS_WRAPPER = pathlib.Path(__file__).resolve().parent / "add.py"
+# Canonical self-contained GK104 stack (formerly split across kepler + pcie).
+STANDALONE_ADD = MACOS_WRAPPER
 
 
 Write = Tuple[int, int]  # (reg, value)
@@ -814,21 +816,22 @@ def test_12_macos_replug_preflight() -> None:
   assert "_ensure_tinygpu_server" in src, \
       "macOS live path must auto-start TinyGPU when the socket is missing"
   assert "--mmiotrace-selftest" in src, \
-      "macOS wrapper must treat --mmiotrace-selftest as an offline flag"
-  pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
-  pcie_src = pcie.read_text(encoding="utf-8")
-  assert 'setdefault("KEPLER_TINYGPU_ATOMIC_BAR1"' not in pcie_src, \
-      "shared/Linux entrypoint must not enable TinyGPU BAR1 root staging"
-  assert "KEPLER_AUTO_WARM_CONTINUE" in pcie_src, \
-      "shared launcher must implement in-process warm-continue"
-  assert "_gk104_post_ram_fb_ltc" in pcie_src, \
-      "live cold path must call shared _gk104_post_ram_fb_ltc"
+      "standalone add.py must treat --mmiotrace-selftest as an offline flag"
+  # TinyGPU classic-BAR1 defaults are macOS-gated; Linux does not take them.
+  assert "if OSX and not offline:" in src, \
+      "TinyGPU live defaults must stay behind an OSX gate"
+  _atomic = src.find('setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "0")')
+  assert _atomic > 0 and src.rfind("if OSX", 0, _atomic) >= 0, \
+      "KEPLER_TINYGPU_ATOMIC_BAR1 default must sit under the OSX live gate"
+  assert "KEPLER_AUTO_WARM_CONTINUE" in src, \
+      "standalone launcher must implement in-process warm-continue"
+  assert "_gk104_post_ram_fb_ltc" in src, \
+      "live cold path must call _gk104_post_ram_fb_ltc"
 
 
 def test_13_live_source_cold_order() -> None:
   """Optional reclock source must stay between RAM init and fb/LTC."""
-  pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
-  src = pcie.read_text(encoding="utf-8")
+  src = STANDALONE_ADD.read_text(encoding="utf-8")
   # Use the cold-path block markers (unique enough in this file).
   i_ram = src.find("nvbios_init.run_vbios_ram_init(self, image")
   i_prog = src.find("nvbios_init.run_vbios_ram_program(\n          self, image")
@@ -859,8 +862,7 @@ def test_13_live_source_cold_order() -> None:
 
 def test_14_oneshot_env_defaults() -> None:
   """Defaults required for one-command cold→ok after replug (Night41bc)."""
-  pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
-  src = pcie.read_text(encoding="utf-8")
+  src = STANDALONE_ADD.read_text(encoding="utf-8")
   assert 'os.environ.get("KEPLER_RAM_PROGRAM", "0")' in src, \
       "cold default must preserve the trained gk104_ram_init state"
   assert 'os.environ.get("KEPLER_RECLOCK_AFTER_OK", "0")' in src, \
@@ -930,8 +932,7 @@ def test_16_sysmem_flush_page_and_bar1_contracts() -> None:
   Lock the *formulas* so a one-shot run still programs them correctly once
   sysmem exists, and keep the intentional order divergence explicit.
   """
-  pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
-  src = pcie.read_text(encoding="utf-8")
+  src = STANDALONE_ADD.read_text(encoding="utf-8")
   assert "self.write32(0x100c10, dev.bus_base >> 8)" in src, \
       "live path must program sysmem flush page at 0x100c10 = bus_base>>8"
   assert "_gk104_init_bar1" in src
@@ -1051,8 +1052,7 @@ def test_21_replug_runbook_in_wrappers() -> None:
   assert "KEPLER_NVINIT_STOP_OFFSET" in mac
   assert "Night41t retired mid-POST 0x1700 sampling" in mac
   assert "stop_before" in pathlib.Path(__file__).resolve().parent.joinpath("nvbios_init.py").read_text(encoding="utf-8")
-  pcie = pathlib.Path(__file__).resolve().parent.parent / "examples_kepler_pcie" / "add.py"
-  pcie_src = pcie.read_text(encoding="utf-8")
+  pcie_src = STANDALONE_ADD.read_text(encoding="utf-8")
   assert "--mmiotrace-selftest" in pcie_src
   assert "--probe-post-ownership" in pcie_src
   assert "no hardware / pagemap" in pcie_src or "mmiotrace-selftest" in pcie_src
@@ -1065,7 +1065,7 @@ def test_21_replug_runbook_in_wrappers() -> None:
 
 @dataclass
 class KeplerMMIOHooks:
-  """Callbacks into examples_kepler_pcie.add / nvbios_init (injected by caller)."""
+  """Callbacks into examples_kepler.add / nvbios_init (injected by caller)."""
   vbios_path: str
   find_image: Callable[[bytes], bytes]
   read_ramcfg: Callable[[FakeMMIO], int]
@@ -1160,7 +1160,7 @@ def run_mmiotrace_selftest(hooks: KeplerMMIOHooks, *, verbose: bool = True) -> i
 
 
 def build_hooks_from_add_module(add_mod, vbios_path: Optional[str] = None) -> KeplerMMIOHooks:
-  """Wire hooks against the loaded ``examples_kepler_pcie.add`` module."""
+  """Wire hooks against the loaded ``examples_kepler.add`` module."""
   import nvbios_init  # shared kepler helper on sys.path
 
   path = vbios_path or getattr(add_mod, "DEFAULT_VBIOS")
@@ -1198,13 +1198,9 @@ def build_hooks_from_add_module(add_mod, vbios_path: Optional[str] = None) -> Ke
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
   argv = list(argv if argv is not None else sys.argv[1:])
-  # Prefer importing the Linux-owned bring-up module.
+  # Prefer the standalone GK104 stack in examples_kepler/add.py.
   here = pathlib.Path(__file__).resolve().parent
-  pcie = here.parent / "examples_kepler_pcie"
-  # Insert PCIe module last so it wins over examples_kepler/add.py (TinyGPU
-  # wrapper) which shares the module name "add".
   sys.path.insert(0, str(here))
-  sys.path.insert(0, str(pcie))
   import add as add_mod  # type: ignore
   hooks = build_hooks_from_add_module(add_mod)
   return run_mmiotrace_selftest(hooks)

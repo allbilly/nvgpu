@@ -27,7 +27,7 @@ os.environ.setdefault("KEPLER_BAR1_AFTER_POST", "1")
 # Force classic PRAMIN (not BAR1 substitute) so addresses > mapped BAR1 work.
 os.environ["KEPLER_FORCE_PRAMIN"] = "1"
 
-import examples_kepler_pcie.add as pcie  # noqa: E402
+import examples_kepler.add as pcie  # noqa: E402  (standalone stack)
 import examples_kepler.add as mac  # noqa: E402
 
 VRAM_SIZE = 4 << 30  # GTX 770 4GB
