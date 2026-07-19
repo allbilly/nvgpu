@@ -2967,42 +2967,6 @@ def _gk104_sample_clk_regs(dev) -> dict:
   return out
 
 
-def _gk104_reclock_after_ok(dev) -> None:
-  """Optional post-demo GDDR reclock — never during FB init (Night41b H40/H49).
-
-  Gate: KEPLER_RECLOCK_AFTER_OK=1 and train nibbles already clear.  Cold
-  KEPLER_RAM_PROGRAM during bring-up stays default-off; this path is the only
-  opt-in reclock after a proven hardware_demo=ok.
-  """
-  if os.environ.get("KEPLER_RECLOCK_AFTER_OK", "0") == "0":
-    return
-  if not _gk104_train_nibbles_clear(dev):
-    print("[kepler] reclock-after-ok skipped: train nibbles not clear",
-          flush=True)
-    return
-  _gk104_dump_ram_mc_regs(dev, label="before reclock-after-ok", strict=True)
-  before = _gk104_sample_clk_regs(dev)
-  print("[kepler] clk before reclock-after-ok: " + " ".join(
-      f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
-      for r, v in before.items()), flush=True)
-  vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
-  image, _, _ = vbios_init_info(vbios_path)
-  freq = int(os.environ.get("KEPLER_RAM_FREQ", "648"), 0)
-  debug = bool(DEBUG and getenv("KEPLER_VBIOS_TRACE", 0))
-  print(f"[kepler] reclock-after-ok: run_vbios_ram_program freq={freq}",
-        flush=True)
-  nvbios_init.run_vbios_ram_program(dev, image, freq_mhz=freq, debug=debug)
-  after = _gk104_sample_clk_regs(dev)
-  print("[kepler] clk after reclock-after-ok: " + " ".join(
-      f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
-      for r, v in after.items()), flush=True)
-  _gk104_dump_ram_mc_regs(dev, label="after reclock-after-ok", strict=True)
-  if not _gk104_train_nibbles_clear(dev):
-    raise RuntimeError(
-        "reclock-after-ok left RAM train nibbles non-zero (abort)")
-  print("[kepler] reclock-after-ok: train still clear", flush=True)
-
-
 def _gk104_bar1_verify_top(dev, mapped_size=None) -> None:
   """R/W a marker at the last mapped BAR1 page (128 MiB done criterion)."""
   if mapped_size is None:
@@ -3479,6 +3443,232 @@ def program_gk104_gpc_pll(dev, target_khz=300000, ref_khz=810000):
   if not locked: return actual, False
   dev.write32(0x137000, after | 0x4)
   return actual, locked
+
+
+def _gk104_clk_calc_gpc_info(dev, target_khz: int, crystal_khz: int = 27_000):
+  """Nouveau ``calc_clk`` for GPC (idx 0): pick closest divider vs PLL path."""
+  # Fixed sources (calc_src).
+  if target_khz in (27_000, 108_000):
+    dsrc = 0x00030000 if target_khz == 108_000 else 0
+    return {"freq": target_khz, "dsrc": dsrc, "ddiv": 0, "mdiv": 0,
+            "ssel": 0, "coef": 0}
+  if target_khz == 100_000:
+    return {"freq": target_khz, "dsrc": 2, "ddiv": 0, "mdiv": 0,
+            "ssel": 0, "coef": 0}
+
+  def read_pll(pll: int) -> int:
+    ctrl = dev.read32(pll) & 0xffffffff
+    coef = dev.read32(pll + 4) & 0xffffffff
+    if not (ctrl & 1):
+      return 0
+    p = (coef >> 16) & 0x3f
+    n = (coef >> 8) & 0xff
+    m = coef & 0xff or 1
+    if pll in (0x00e800, 0x00e820):
+      return crystal_khz * n // (m * (p or 1))
+    return 0
+
+  def read_vco() -> int:
+    ssrc = dev.read32(0x137160) & 0xffffffff
+    return read_pll(0x00e820 if (ssrc & 0x100) else 0x00e800)
+
+  def calc_div(ref: int, freq: int) -> tuple[int, int]:
+    div = min(max((ref * 2) // max(freq, 1), 2), 65)
+    return (ref * 2) // div, div - 2
+
+  vco = read_vco() or crystal_khz
+  clk0, div0 = calc_div(vco, target_khz)
+  clk0, div1d = calc_div(clk0, target_khz)
+  dsrc = 3
+  ddiv = (0x80000000 | div0) if div0 else 0
+  mdiv_div = (0x80000000 | div1d) if div1d else 0
+
+  # PLL path (calc_pll / program_gk104_gpc_pll search).
+  best = None
+  ref = vco
+  for p in range(1, 64):
+    for m in range(17, 33):
+      for n in range(8, 256):
+        vco_n = ref * n // m
+        if not 1_100_000 <= vco_n <= 2_404_000:
+          continue
+        out = vco_n // p
+        cand = (abs(out - target_khz), out, p, n, m)
+        if best is None or cand < best:
+          best = cand
+  clk1 = coef = 0
+  div1p = 0
+  if best is not None and best[1]:
+    _, clk1_raw, p, n, m = best
+    coef = (p << 16) | (n << 8) | m
+    clk1, div1p = calc_div(clk1_raw, target_khz)
+
+  if abs(target_khz - clk0) <= abs(target_khz - clk1):
+    return {"freq": clk0, "dsrc": dsrc, "ddiv": ddiv, "mdiv": mdiv_div,
+            "ssel": 0, "coef": 0}
+  mdiv_pll = (0x80000000 | (div1p << 8)) if div1p else 0
+  return {"freq": clk1, "dsrc": 0x40000100, "ddiv": 0, "mdiv": mdiv_pll,
+          "ssel": 1, "coef": coef}
+
+
+def gk104_clk_prog_gpc(dev, target_khz: int) -> dict:
+  """Program GPC domain via Nouveau ``gk104_clk_prog`` stages (idx 0 only)."""
+  info = _gk104_clk_calc_gpc_info(dev, int(target_khz))
+  idx = 0
+  # stage0: div programming
+  if not info["ssel"]:
+    nvkm_mask(dev, 0x1371d0 + idx * 4, 0x8000003f, info["ddiv"])
+    dev.write32(0x137160 + idx * 4, info["dsrc"])
+  # stage1_0: select div mode
+  nvkm_mask(dev, 0x137100, 1 << idx, 0)
+  t0 = time.time()
+  while time.time() - t0 < 2.0:
+    if not (dev.read32(0x137100) & (1 << idx)):
+      break
+    time.sleep(0.001)
+  # stage2: maybe program pll
+  addr = 0x137000 + idx * 0x20
+  nvkm_mask(dev, addr, 0x00000004, 0)
+  nvkm_mask(dev, addr, 0x00000001, 0)
+  if info["coef"]:
+    dev.write32(addr + 4, info["coef"])
+    nvkm_mask(dev, addr, 0x00000001, 0x00000001)
+    nvkm_mask(dev, addr, 0x00000010, 0)
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+      if dev.read32(addr) & 0x00020000:
+        break
+      time.sleep(0.001)
+    nvkm_mask(dev, addr, 0x00000010, 0x00000010)
+    nvkm_mask(dev, addr, 0x00000004, 0x00000004)
+  # stage3: final divider
+  if info["ssel"]:
+    nvkm_mask(dev, 0x137250 + idx * 4, 0x00003f00, info["mdiv"])
+  else:
+    nvkm_mask(dev, 0x137250 + idx * 4, 0x0000003f, info["mdiv"])
+  # stage4_0: maybe select pll mode
+  if info["ssel"]:
+    nvkm_mask(dev, 0x137100, 1 << idx, info["ssel"])
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+      if (dev.read32(0x137100) & (1 << idx)) == info["ssel"]:
+        break
+      time.sleep(0.001)
+  print(f"[kepler] gk104_clk_prog GPC target={target_khz} "
+        f"actual={info['freq']} ssel={info['ssel']} coef={info['coef']:#x}",
+        flush=True)
+  return info
+
+
+def _gk104_experimental_pstate(dev) -> None:
+  """Nouveau ``nvkm_pstate_prog`` order: ram calc/prog, then GPC clk_prog.
+
+  Experimental only.  Voltage/fan/PCIe and full multi-domain clk are out of
+  scope.  Aborts if GDDR train nibbles leave the clear state.
+  """
+  vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
+  image, _, _ = vbios_init_info(vbios_path)
+  pstates = nvbios_init.parse_perf_pstates(image)
+  if not pstates:
+    raise RuntimeError("experimental pstate: PERF table missing/unparsed")
+  idx = int(os.environ.get("KEPLER_PSTATE_IDX", "0"), 0)
+  if not 0 <= idx < len(pstates):
+    raise ValueError(
+        f"KEPLER_PSTATE_IDX={idx} out of range 0..{len(pstates) - 1}")
+  ps = pstates[idx]
+  mem_khz = int(os.environ.get("KEPLER_PSTATE_MEM_KHZ", "0"), 0) or ps["mem_khz"]
+  gpc_khz = int(os.environ.get("KEPLER_PSTATE_GPC_KHZ", "0"), 0) or ps["gpc_khz"]
+  do_mem = os.environ.get("KEPLER_EXPERIMENTAL_PSTATE_MEM", "1") != "0"
+  do_clk = os.environ.get("KEPLER_EXPERIMENTAL_PSTATE_CLK", "1") != "0"
+  print(f"[kepler] experimental pstate idx={idx} id={ps['pstate']:#x} "
+        f"mem={mem_khz}kHz gpc={gpc_khz}kHz mem_prog={do_mem} "
+        f"clk_prog={do_clk}", flush=True)
+  before = _gk104_sample_clk_regs(dev)
+  print("[kepler] clk before experimental-pstate: " + " ".join(
+      f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
+      for r, v in before.items()), flush=True)
+  if do_mem:
+    if not mem_khz:
+      raise RuntimeError("experimental pstate: mem domain frequency is 0")
+    freq_mhz = max(1, (mem_khz + 500) // 1000)
+    debug = bool(DEBUG and getenv("KEPLER_VBIOS_TRACE", 0))
+    print(f"[kepler] experimental pstate: ram_program freq={freq_mhz}",
+          flush=True)
+    nvbios_init.run_vbios_ram_program(
+        dev, image, freq_mhz=freq_mhz, debug=debug)
+    if not _gk104_train_nibbles_clear(dev):
+      raise RuntimeError(
+          "experimental pstate: train nibbles non-zero after ram_program")
+  if do_clk:
+    if not gpc_khz:
+      raise RuntimeError("experimental pstate: gpc domain frequency is 0")
+    gk104_clk_prog_gpc(dev, gpc_khz)
+  after = _gk104_sample_clk_regs(dev)
+  print("[kepler] clk after experimental-pstate: " + " ".join(
+      f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
+      for r, v in after.items()), flush=True)
+  if do_mem and not _gk104_train_nibbles_clear(dev):
+    raise RuntimeError(
+        "experimental pstate: train nibbles non-zero after clk_prog")
+  print("[kepler] experimental pstate: done"
+        + (" (train clear)" if do_mem else " (clk-only)"), flush=True)
+
+
+def _gk104_reclock_after_ok(dev) -> None:
+  """Optional pre-LAUNCH reclock — never during FB init (Night41b H40/H49).
+
+  Gates (all default off):
+    KEPLER_EXPERIMENTAL_PSTATE=1 — Nouveau-ordered pstate (ram then GPC clk)
+    KEPLER_RECLOCK_AFTER_OK=1    — legacy mem-only ``run_vbios_ram_program``
+  Experimental wins when both are set.  Called after channel setup and before
+  ``submit_launch`` so a GPC boost covers the compute kernel.  Mem reclock
+  requires clear train nibbles; clk-only experimental may run without that.
+  """
+  experimental = os.environ.get("KEPLER_EXPERIMENTAL_PSTATE", "0") != "0"
+  legacy = os.environ.get("KEPLER_RECLOCK_AFTER_OK", "0") != "0"
+  if not experimental and not legacy:
+    return
+  train_ok = _gk104_train_nibbles_clear(dev)
+  if experimental:
+    do_mem = os.environ.get("KEPLER_EXPERIMENTAL_PSTATE_MEM", "1") != "0"
+    if do_mem and not train_ok:
+      print("[kepler] experimental pstate skipped: train nibbles not clear "
+            "(set KEPLER_EXPERIMENTAL_PSTATE_MEM=0 for clk-only)",
+            flush=True)
+      return
+    if not do_mem and not train_ok:
+      print("[kepler] experimental pstate: clk-only despite non-clear train "
+            "nibbles", flush=True)
+    _gk104_dump_ram_mc_regs(dev, label="before experimental-pstate",
+                            strict=False)
+    _gk104_experimental_pstate(dev)
+    return
+  if not train_ok:
+    print("[kepler] reclock-after-ok skipped: train nibbles not clear",
+          flush=True)
+    return
+  _gk104_dump_ram_mc_regs(dev, label="before reclock-after-ok", strict=True)
+  before = _gk104_sample_clk_regs(dev)
+  print("[kepler] clk before reclock-after-ok: " + " ".join(
+      f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
+      for r, v in before.items()), flush=True)
+  vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
+  image, _, _ = vbios_init_info(vbios_path)
+  freq = int(os.environ.get("KEPLER_RAM_FREQ", "648"), 0)
+  debug = bool(DEBUG and getenv("KEPLER_VBIOS_TRACE", 0))
+  print(f"[kepler] reclock-after-ok: run_vbios_ram_program freq={freq}",
+        flush=True)
+  nvbios_init.run_vbios_ram_program(dev, image, freq_mhz=freq, debug=debug)
+  after = _gk104_sample_clk_regs(dev)
+  print("[kepler] clk after reclock-after-ok: " + " ".join(
+      f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
+      for r, v in after.items()), flush=True)
+  _gk104_dump_ram_mc_regs(dev, label="after reclock-after-ok", strict=True)
+  if not _gk104_train_nibbles_clear(dev):
+    raise RuntimeError(
+        "reclock-after-ok left RAM train nibbles non-zero (abort)")
+  print("[kepler] reclock-after-ok: train still clear", flush=True)
+
 
 def nvkm_mask(dev, addr, mask, val):
   """nouveau nvkm_mask: (r & ~mask) | (val & mask)."""
@@ -11917,6 +12107,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       dev.dev_impl.hw.mmio_write(1, _userd_mmio_base + USERD_GP_PUT,
                                  struct.pack("<I", _gp_put_initial))
       _gk104_bar_flush(dev)
+  # Host kernel window starts at doorbell (GP_PUT), not at poll entry —
+  # small N retires before the first semaphore RPC otherwise (~0ms).
+  _kernel_t0 = time.perf_counter()
   userd_put_readback = struct.unpack("<I", dev.dev_impl.hw.mmio_read(1, _userd_mmio_base + USERD_GP_PUT, 4))[0]
   # Submission paths are selected before launch.  Never fall through from the
   # normal GPFIFO path into BYPASS or direct DISPATCH in the same invocation.
@@ -12103,6 +12296,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   _sem_targets = list(range(done_value - n_gp_entries + 1, done_value + 1))
   assert _sem_targets[-1] == done_value, (_sem_targets, done_value)
   val = signal_initial
+  # Host-visible "kernel time": GP_PUT → done_value.  Includes post-kick
+  # diagnostics + TinyGPU poll RPCs; compare baseline vs boost, not FLOPs.
+  if "_kernel_t0" not in locals():
+    _kernel_t0 = time.perf_counter()
   for _ti, _target in enumerate(_sem_targets):
     if _ti > 0:
       _next_put = _ti + 1
@@ -12120,6 +12317,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         val = struct.unpack_from("<I", vram, signal_pa)[0]
       if val == _target:
         if _target == done_value:
+          _kernel_ms = (time.perf_counter() - _kernel_t0) * 1000.0
+          _prev = float(getattr(dev, "_kepler_kernel_time_ms", 0.0) or 0.0)
+          setattr(dev, "_kepler_kernel_time_ms", _prev + _kernel_ms)
+          print(f"[kepler] kernel_time_ms={_kernel_ms:.3f} "
+                f"total_ms={_prev + _kernel_ms:.3f} "
+                f"sem={done_value} ibs={n_gp_entries}", flush=True)
           return
         break
       if not _gp_get_snapshot_taken and dev.dev_impl.hw is not None:
@@ -12446,6 +12649,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   path, plan §24.1).  Requires root, a GK104 firmware tree ($NV_FIRMWARE_DIR),
   and on-silicon FIFO validation."""
   import random
+  setattr(dev, "_kepler_kernel_time_ms", 0.0)
   N = int(os.environ.get("KEPLER_N", "256"))
   if N <= 0:
     raise ValueError(f"invalid KEPLER_N={N}; expected > 0")
@@ -12647,6 +12851,10 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     spt = GK104PageTableEntry(dev.dev_impl, dev.dev_impl.mm.root_page_table.address(pgd_idx), 0)
     print(f"[kepler] vmm signal_va={signal.va_addr:#x} signal_pa={signal.meta['pa']:#x} "
           f"bus={dev.dev_impl.mm.bus_base:#x} pgd={pgd_entry:#x} pte={spt.entry(spt_idx):#x}")
+  # Opt-in reclock before LAUNCH so GPC boost actually covers the kernel.
+  # TinyGPU still allows BAR0 here; the armed final BAR1 read later does not.
+  if not _no_window:
+    _gk104_reclock_after_ok(dev)
   if sem_only:
     allocator._copyin(signal, struct.pack("<I", 0))
     # Host-only semaphore RELEASE without WFI: no engine methods precede this,
@@ -12807,11 +13015,11 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     # QMD also requests FE_SYSMEMBAR release ordering.  Read BAR1 in one RPC.
     # A host-driven LTC flush/invalidate here adds more BAR0 transactions after
     # completion and is not part of Mesa's NVE4 launch/fence sequence.
+    # (Experimental GPC boost already ran before submit_launch.)
     dev.dev_impl.hw.arm_final_output_read(
         1, out_dev.meta["vram_pa"], len(out_host))
     out_host[:] = dev.dev_impl.hw.mmio_read(
         1, out_dev.meta["vram_pa"], len(out_host))
-    dev.dev_impl.hw.freeze("output-read-complete")
     print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x}",
           flush=True)
   else:
@@ -12857,11 +13065,14 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     print(f"[kepler] raw output hex: {out_host[:32].hex()}", flush=True)
     print(f"[kepler] raw a_host hex: {a_host.tobytes()[:32].hex()}", flush=True)
     print(f"[kepler] raw b_host hex: {b_host.tobytes()[:32].hex()}", flush=True)
+  if dev.dev_impl.hw is not None:
+    dev.dev_impl.hw.freeze("output-read-complete")
   _freeze_stop_and_hold(dev, "output-read-complete")
   assert _mismatches == 0, f"hardware {operation} mismatch ({_mismatches}/{N} wrong)"
   print(f"hardware_demo=ok N={N} operation={operation}")
-  if not _no_window:
-    _gk104_reclock_after_ok(dev)
+  _kt = getattr(dev, "_kepler_kernel_time_ms", None)
+  if _kt is not None:
+    print(f"[kepler] kernel_time_total_ms={float(_kt):.3f}", flush=True)
 
 def main():
   # The verified GTX 770 sequence needs FIFO reset; retain an environment
@@ -13187,12 +13398,18 @@ def main():
         "[kepler] BAR1 top R/W",
         "[kepler] Nouveau-order BAR1",
         "[kepler] reclock-after-ok",
+        "[kepler] experimental pstate",
+        "[kepler] gk104_clk_prog",
+        "[kepler] clk before experimental",
+        "[kepler] clk after experimental",
         "[kepler] BAR1 after POST",
         "[kepler] BAR1 identity clamped",
         "[kepler] ctx copy via",
         "[kepler] PTE stabilize:",
         "[kepler] launch N=",
         "[kepler] channel window",
+        "[kepler] kernel_time_ms=",
+        "[kepler] kernel_time_total_ms=",
     )
     for line in quiet_buf.getvalue().splitlines():
       if any(line.startswith(p) for p in _keep):
