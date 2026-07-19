@@ -680,8 +680,8 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
               "after-LTC fixed-PA not positive", flush=True)
       else:
         # Nouveau-shaped BAR1 identity: PRAMIN roots + 0x1704 enable.
-        # Default one page (H89/H90); H91 uses KEPLER_LIFECYCLE_BAR_MAP_SIZE
-        # up to 0x1000000 (16 MiB) — SPT bank max before inst@0x60000.
+        # Default one page (H89/H90); H91+ use KEPLER_LIFECYCLE_BAR_MAP_SIZE
+        # up to 0x8000000 (128 MiB; SPT@1MiB).
         map_size = int(os.environ.get("KEPLER_LIFECYCLE_BAR_MAP_SIZE",
                                       "0x1000"), 0)
         print(f"probe-nouveau-base-lifecycle: through-bar; "
@@ -944,7 +944,7 @@ def main():
     os.environ.setdefault("KEPLER_PGRAPH_PACK", "1")
     os.environ.setdefault("KEPLER_BAR1_MEMX_LITERAL", "1")
     os.environ.setdefault("KEPLER_BAR1_DIRECT_PHYS", "1")
-    os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")
+    os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x8000000")
     os.environ.setdefault("KEPLER_RAM_HOST_PROG0", "0")
     # Cold first launch often NaNs while FECS is ready; one in-process warm
     # reopen finishes add (Night41bc). Opt out with =0.
