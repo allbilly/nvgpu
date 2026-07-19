@@ -3938,7 +3938,7 @@ def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
   # Live GK104 retires at most ~19 LAUNCHes per channel lifetime (20th leaves
   # work as NaN even when a later GPFIFO entry is consumed).  Mid-stream WFI
   # then more LAUNCHes also hangs.  Use channel-windowed reopen for large N
-  # (see _run_hardware_demo_windows) or KEPLER_MULTI_CTA=1 once grid_x>1 works.
+  # (see _run_hardware_demo_windows) or KEPLER_MULTI_CTA=auto (N≤20480).
   """
   assert launch_desc_addrs, "need at least one CWD"
   # batch reserved for experiments; default = all launches then one WFI.
@@ -4033,8 +4033,17 @@ def describe_args(method, args):
     return [f"invalidate_flags=0x{args[0]:08x}"]
   return [f"arg{i}=0x{arg:08x}" for i, arg in enumerate(args)]
 
-def build_cuda_param_cbuf(*ptrs):
+def build_cuda_param_cbuf(*ptrs, grid=(1, 1, 1), block=(1, 1, 1)):
+  """CUDA user const bank 0: driver ABI dims at 0x28.., kernel params at 0x140.
+
+  sm_30 ptxas emits `IMAD idx, ctaid, c[0][0x28], tid` for blockIdx*blockDim+tid,
+  so bare launches must plant blockDim/gridDim themselves (no CUDA driver).
+  """
   cbuf = bytearray(0x200)
+  gx, gy, gz = grid
+  bx, by, bz = block
+  # KeplerAs / Maxas ABI: blockDim.{x,y,z} @ 0x28/0x2c/0x30, gridDim @ 0x34/0x38/0x3c.
+  struct.pack_into("<6I", cbuf, 0x28, bx, by, bz, gx, gy, gz)
   struct.pack_into(f"<{len(ptrs)}Q", cbuf, 0x140, *ptrs)
   return cbuf
 
@@ -4173,8 +4182,9 @@ def kepler_selftest():
   assert any(m == 0x0000 for _, _, _, m, _, _ in decode_words(_ibs[1]))
   assert gk104_mp_trap_addrs(0, 0) == (0x504648, 0x504650)
   assert gk104_mp_trap_addrs(1, 1) == (0x50ce48, 0x50ce50)
-  params = build_cuda_param_cbuf(0x1122334455667788, 2, 3)
+  params = build_cuda_param_cbuf(0x1122334455667788, 2, 3, grid=(2, 1, 1), block=(256, 1, 1))
   assert len(params) == 0x200 and struct.unpack_from("<3Q", params, 0x140) == (0x1122334455667788, 2, 3)
+  assert struct.unpack_from("<6I", params, 0x28) == (256, 1, 1, 2, 1, 1)
   regs = cubin_register_count(cubin, "E_4")
   assert regs > 0
   cwd = build_cwd(0, (1, 1, 1), (256, 1, 1), cbuf_addr=0x123400, regs=regs)
@@ -5570,7 +5580,9 @@ def run_software_demo(dev):
   # Code + constant (param) buffers for the launch descriptor.
   code_dev = allocator.alloc(len(cubin))
   allocator._copyin(code_dev, cubin)
-  cbuf = build_cuda_param_cbuf(a_dev.va_addr, b_dev.va_addr, out_dev.va_addr)
+  cbuf = build_cuda_param_cbuf(
+      a_dev.va_addr, b_dev.va_addr, out_dev.va_addr,
+      grid=(1, 1, 1), block=(N, 1, 1))
   cbuf_dev = allocator.alloc(len(cbuf))
   allocator._copyin(cbuf_dev, cbuf)
 
@@ -12442,9 +12454,9 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     raise ValueError(
         f"KEPLER_N={N} exceeds KEPLER_N_MAX={_n_max} "
         f"(set KEPLER_N_FORCE=1 to override)")
-  # Live multi-CTA (grid_x>1) was previously thought CTA0-only; re-test via
-  # KEPLER_MULTI_CTA=1/auto.  Chunked single-CTA stays the default for N that
-  # fit in one IB (≤KEPLER_LAUNCH_ONE_IB_MAX launches).
+  # Multi-CTA (one LAUNCH, grid_x=n_chunks) is proven through N=20480.
+  # KEPLER_MULTI_CTA=auto uses it in that range; above that a 4 KiB VRAM hole
+  # remains, so large N keeps channel-windowed single-CTA reopen.
   if os.environ.get("KEPLER_BLOCK"):
     chunk = int(os.environ["KEPLER_BLOCK"], 0)
   elif N <= 1024:
@@ -12458,15 +12470,17 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   _ib_max = int(os.environ.get("KEPLER_LAUNCH_IB_MAX", "16"), 0)
   if _ib_max <= 0:
     _ib_max = max(_one_ib_max, 1)
+  _mcta_auto_max = int(os.environ.get("KEPLER_MULTI_CTA_AUTO_MAX", "20480"), 0)
   _mcta = os.environ.get("KEPLER_MULTI_CTA", "auto").lower()
   if _mcta in ("1", "true", "yes", "on"):
     use_multi_cta = True
   elif _mcta in ("0", "false", "no", "off"):
     use_multi_cta = False
   else:
-    # auto: never enable multi-CTA (grid_x>1 still CTA0-only).  Large N uses
-    # a fresh channel per ≤KEPLER_LAUNCH_ONE_IB_MAX chunk launches.
-    use_multi_cta = False
+    # auto: one multi-CTA LAUNCH when N fits the proven range and divides
+    # evenly by chunk (cubin has no i<N guard).  Else chunked / windows.
+    use_multi_cta = (
+        N <= _mcta_auto_max and n_chunks > 1 and (N % chunk) == 0)
   if use_multi_cta and (N % chunk) != 0:
     raise ValueError(
         f"KEPLER_MULTI_CTA requires N%{chunk}==0 (N={N}); "
@@ -12536,7 +12550,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   cbuf_devs = []
   if use_multi_cta:
     cbuf = build_cuda_param_cbuf(
-        a_dev.va_addr, b_dev.va_addr, out_dev.va_addr)
+        a_dev.va_addr, b_dev.va_addr, out_dev.va_addr,
+        grid=(n_chunks, 1, 1), block=(chunk, 1, 1))
     cbuf_dev = allocator.alloc(len(cbuf))
     allocator._copyin(cbuf_dev, cbuf)
     cwd = build_cwd(code_addr=0, grid=(n_chunks, 1, 1), block=(chunk, 1, 1),
@@ -12550,7 +12565,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
       n = min(chunk, N - off)
       cbuf = build_cuda_param_cbuf(
           a_dev.va_addr + off * 4, b_dev.va_addr + off * 4,
-          out_dev.va_addr + off * 4)
+          out_dev.va_addr + off * 4,
+          grid=(1, 1, 1), block=(n, 1, 1))
       cbuf_dev = allocator.alloc(len(cbuf))
       allocator._copyin(cbuf_dev, cbuf)
       cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(n, 1, 1),

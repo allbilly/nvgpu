@@ -1,0 +1,34 @@
+# Kernel: E_4
+# Arch: sm_35
+# RegCnt: 12
+# SharedSize: 0
+# BarCnt: 0
+# Params(3):
+#	0:0x140:8:0x8
+#	1:0x148:8:0x8
+#	2:0x150:8:0x8
+#
+
+<REGISTER_MAPPING>
+    0-15 : a0, a1, b0, b1, o0, o1, idx, tid, cta, ntid, t0, t1, t2, t3, t4, t5
+</REGISTER_MAPPING>
+
+-:-:D:-:01      S2R tid, SR_TID.X;
+-:-:D:-:01      S2R cta, SR_CTAID.X;
+-:-:D:-:01      S2R ntid, SR_NTID;
+-:-:D:-:15      IMAD idx, cta, ntid, tid;
+-:-:D:-:01      SHL t0, idx, 0x2;
+-:-:D:-:01      LDC.64 a0, c[0x0][0x140];
+-:-:D:-:01      LDC.64 b0, c[0x0][0x148];
+-:-:D:-:01      LDC.64 o0, c[0x0][0x150];
+-:-:D:-:01      IADD a0.CC, a0, t0;
+-:-:D:-:01      IADD.X a1, a1, RZ;
+-:-:D:-:01      IADD b0.CC, b0, t0;
+-:-:D:-:01      IADD.X b1, b1, RZ;
+-:-:D:-:01      IADD o0.CC, o0, t0;
+-:-:D:-:01      IADD.X o1, o1, RZ;
+-:-:D:-:01      LD.E.32 t1, [a0];
+-:-:D:-:01      LD.E.32 t2, [b0];
+-:-:D:-:15      FADD t3, t1, t2;
+-:-:D:-:01      ST.E.32 [o0], t3;
+-:-:D:-:01      RET;

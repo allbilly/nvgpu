@@ -9,13 +9,16 @@
 )
 {
     .reg .f32 %f<4>;
-    .reg .b32 %r<3>;
+    .reg .b32 %r<5>;
     .reg .b64 %rd<8>;
 
     ld.param.u64 %rd1, [E_4_param_0];
     ld.param.u64 %rd2, [E_4_param_1];
     ld.param.u64 %rd3, [E_4_param_2];
-    mov.u32 %r1, %tid.x;
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
     mul.wide.u32 %rd4, %r1, 4;
     add.s64 %rd5, %rd1, %rd4;
     add.s64 %rd6, %rd2, %rd4;
