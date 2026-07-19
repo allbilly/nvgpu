@@ -2001,6 +2001,63 @@ def run_vbios_ram_init(dev, image: bytes, debug: bool = False) -> None:
     print("[nvbios] GK104 GDDR5 RAM init/training complete")
 
 
+def parse_perf_pstates(image: bytes) -> list[dict]:
+  """Parse BIT-P PERF entries (Nouveau ``nvbios_perfEp`` / ``perfSp``).
+
+  Kepler ROMs use PERF v0x40: base entry + secondary domain frequencies.
+  Domain bios indices match ``gk104_clk.domains`` (0=gpc, 3=memory, …).
+  """
+  bit = image.find(b"BIT")
+  if bit < 2 or bit + 12 > len(image):
+    return []
+  hlen, rlen, count = image[bit + 6], image[bit + 7], image[bit + 8]
+  poff = pver = 0
+  for i in range(count):
+    p = bit - 2 + hlen + i * rlen
+    if p + 6 > len(image):
+      break
+    if image[p] == ord("P"):
+      poff = struct.unpack_from("<H", image, p + 4)[0]
+      pver = image[p + 1]
+      break
+  if not poff or pver > 2 or poff + 4 > len(image):
+    return []
+  perf = struct.unpack_from("<I", image, poff)[0]
+  if not perf or perf + 6 > len(image):
+    return []
+  ver, hdr = image[perf], image[perf + 1]
+  if ver >= 0x40 and ver < 0x41:
+    cnt, length, snr, ssz = (
+        image[perf + 5], image[perf + 2], image[perf + 4], image[perf + 3])
+  elif ver >= 0x20 and ver < 0x40:
+    cnt, length, snr, ssz = (
+        image[perf + 2], image[perf + 3], image[perf + 4], image[perf + 5])
+  else:
+    return []
+  out = []
+  for idx in range(cnt):
+    entry = perf + hdr + idx * (length + snr * ssz)
+    if entry + length > len(image):
+      break
+    item = {
+        "index": idx,
+        "pstate": image[entry],
+        "voltage": image[entry + 2] if ver >= 0x40 and length > 2 else 0,
+        "domains_khz": {},
+    }
+    if ver >= 0x40:
+      for di in range(snr):
+        s = entry + length + di * ssz
+        if s + 2 > len(image):
+          break
+        item["domains_khz"][di] = (
+            struct.unpack_from("<H", image, s)[0] & 0x3fff) * 1000
+      item["gpc_khz"] = item["domains_khz"].get(0, 0)
+      item["mem_khz"] = item["domains_khz"].get(3, 0)
+    out.append(item)
+  return out
+
+
 def _gk104_read_mem_clock_khz(dev, crystal_khz: int = 27_000) -> int:
   """Port gk104_clk.read_mem/read_pll/read_div for the former RAM clock."""
   def read_pll(pll: int) -> int:

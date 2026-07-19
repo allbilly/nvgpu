@@ -481,6 +481,19 @@ def test_00b_cold_slice_fixture_matches_gz() -> None:
   assert meta["strap_101000"] == GOLDEN_STRAP_101000
 
 
+def test_00d_perf_pstates_palit_gtx770() -> None:
+  """Palit GTX770 PERF v0x40 exposes four pstates with GPC+mem domains."""
+  import nvbios_init
+  rom = pathlib.Path(__file__).resolve().parent / "Palit.GTX770.4096.131216.rom"
+  image = nvbios_init.find_vbios_image(rom.read_bytes())
+  pstates = nvbios_init.parse_perf_pstates(image)
+  assert len(pstates) == 4, pstates
+  assert pstates[0]["pstate"] == 0x7
+  assert pstates[0]["gpc_khz"] == 810_000
+  assert pstates[0]["mem_khz"] == 324_000
+  assert pstates[2]["mem_khz"] == 3_505_000
+
+
 def test_00c_live_ram_program_preserves_golden_slice(
     run_cold: Callable[[FakeMMIO, bytes], None], image: bytes) -> None:
   """Explicit reclock diagnostics preserve the RAM-init/LTC golden slices.
@@ -852,6 +865,8 @@ def test_14_oneshot_env_defaults() -> None:
       "cold default must preserve the trained gk104_ram_init state"
   assert 'os.environ.get("KEPLER_RECLOCK_AFTER_OK", "0")' in src, \
       "reclock must stay opt-in after hardware_demo=ok"
+  assert 'os.environ.get("KEPLER_EXPERIMENTAL_PSTATE", "0")' in src, \
+      "Nouveau-ordered pstate reclock must stay experimental/opt-in"
   assert "spt_pa = 0x00100000" in src, \
       "classic BAR1 SPT must sit at 1 MiB for 128 MiB aperture"
   assert 'get("KEPLER_BAR1_MAP_SIZE", "0x8000000")' in src, \
@@ -1077,6 +1092,8 @@ def run_mmiotrace_selftest(hooks: KeplerMMIOHooks, *, verbose: bool = True) -> i
     ("00c_live_ram_program_preserves_slice",
      lambda: test_00c_live_ram_program_preserves_golden_slice(
          hooks.run_cold_ram_fb_ltc, image)),
+    ("00d_perf_pstates_palit",
+     lambda: test_00d_perf_pstates_palit_gtx770()),
     ("01_strap_ramcfg6",
      lambda: test_01_strap_selects_ramcfg_group6(hooks.read_ramcfg)),
     ("02_rammap_phase_exact",
