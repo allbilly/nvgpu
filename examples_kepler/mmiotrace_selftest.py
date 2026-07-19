@@ -786,7 +786,7 @@ def test_12_macos_replug_preflight() -> None:
   assert 'setdefault("KEPLER_PRAMIN_SOFT_LIVE", "1")' in src
   assert 'setdefault("KEPLER_REFUSE_DIRTY", "1")' in src
   assert 'setdefault("KEPLER_PGRAPH_BLCG", "0")' in src
-  assert 'setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")' in src
+  assert 'setdefault("KEPLER_BAR1_MAP_SIZE", "0x8000000")' in src
   assert 'setdefault("KEPLER_AUTO_WARM_CONTINUE", "1")' in src, \
       "macOS live path must auto warm-continue after cold NaN demo"
   assert 'setdefault("KEPLER_RPC_LIGHT", "1")' in src, \
@@ -850,6 +850,12 @@ def test_14_oneshot_env_defaults() -> None:
   src = pcie.read_text(encoding="utf-8")
   assert 'os.environ.get("KEPLER_RAM_PROGRAM", "0")' in src, \
       "cold default must preserve the trained gk104_ram_init state"
+  assert 'os.environ.get("KEPLER_RECLOCK_AFTER_OK", "0")' in src, \
+      "reclock must stay opt-in after hardware_demo=ok"
+  assert "spt_pa = 0x00100000" in src, \
+      "classic BAR1 SPT must sit at 1 MiB for 128 MiB aperture"
+  assert 'get("KEPLER_BAR1_MAP_SIZE", "0x8000000")' in src, \
+      "post-POST BAR1 default must be full 128 MiB"
   assert 'os.environ.get("KEPLER_RAM_FREQ", "648")' in src
   assert 'get("KEPLER_RAM_INIT", "1")' in src
   assert "KEPLER_AUTO_WARM_CONTINUE" in src
