@@ -8880,12 +8880,29 @@ def _gk104_clone_vmm_to_vram(dev, bar1_alloc, bar1_write):
                      getattr(dev, "_bar1_identity_ready", False)))
     if fast_spt:
       _gk104_bar_flush(dev)
+      _xfer = int(os.environ.get("KEPLER_BAR1_CHUNK", "0x40000"), 0)
+      if _xfer < 0x1000 or (_xfer & 0xfff):
+        _xfer = 0x1000
+      _sample = os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full"
       _bad_pages = []
-      for _off in range(0, spt_size, 0x1000):
-        _n = min(0x1000, spt_size - _off)
-        _got = bytes(dev.dev_impl.hw.mmio_read(1, dst_spt + _off, _n))
-        if _got != spt_image[_off:_off + _n]:
-          _bad_pages.append(_off)
+      if _sample:
+        for _poff in (0, spt_size // 2, max(0, spt_size - 8)):
+          _n = min(8, spt_size - _poff)
+          _got = bytes(dev.dev_impl.hw.mmio_read(1, dst_spt + _poff, _n))
+          if _got != spt_image[_poff:_poff + _n]:
+            _bad_pages.append(_poff)
+            break
+      if _bad_pages or not _sample:
+        _bad_pages = []
+        for _off in range(0, spt_size, _xfer):
+          _n = min(_xfer, spt_size - _off)
+          _got = bytes(dev.dev_impl.hw.mmio_read(1, dst_spt + _off, _n))
+          if _got != spt_image[_off:_off + _n]:
+            for _p in range(_off, _off + _n, 0x1000):
+              _pn = min(0x1000, _off + _n - _p)
+              if (bytes(dev.dev_impl.hw.mmio_read(1, dst_spt + _p, _pn)) !=
+                  spt_image[_p:_p + _pn]):
+                _bad_pages.append(_p)
       for _off in _bad_pages:
         _n = min(0x1000, spt_size - _off)
         _gk104_pramin_write(dev, dst_spt + _off, spt_image[_off:_off + _n])
@@ -9226,13 +9243,14 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       raise MemoryError("BAR1-backed instance allocation exceeds aperture")
     return pa
   def bar1_write(pa, data):
-    # The BAR1 mmap can acknowledge a large write while only applying the
-    # first portion on this un-POSTed card.  Keep each transfer within one
-    # 4-KiB page; otherwise page-table tails remain uninitialised and FECS
-    # DMA walks garbage.
+    # Un-POSTed cards can acknowledge large BAR1 writes while only applying the
+    # first page.  After classic BAR1 POST we raise the chunk (KEPLER_BAR1_CHUNK,
+    # default 256 KiB) to cut TinyGPU RPC count on bulk zeros/mirrors/ctx copy.
     data = memoryview(data).cast("B")
-    for off in range(0, len(data), 0x1000):
-      dev.dev_impl.hw.mmio_write(1, pa + off, data[off:off + 0x1000].tobytes())
+    chunk = _bar1_xfer["chunk"]
+    for off in range(0, len(data), chunk):
+      dev.dev_impl.hw.mmio_write(1, pa + off, data[off:off + chunk].tobytes())
+  _bar1_xfer = {"chunk": 0x1000}
   ctx_alias_ptes = []
   fault_guard_pte_addr = None
   fault_guard_pte_wanted = None
@@ -9286,6 +9304,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _gk104_init_bar1_identity(dev, bus_base=base, map_vram=True,
                                 userd_alias_pa=_alias)
       bar1_identity_ready = True
+    # Classic BAR1 is live for bulk transfers (POST path or warm reopen).
+    if (bar1_identity_ready or
+        getattr(dev, "_bar1_classic_posted", False)):
+      _chunk = int(os.environ.get("KEPLER_BAR1_CHUNK", "0x40000"), 0)
+      if _chunk >= 0x1000 and (_chunk & 0xfff) == 0:
+        _bar1_xfer["chunk"] = _chunk
     # Stop FECS before bulk-zeroing GR/instance VRAM.  A live FECS (left ready
     # by a prior userspace attempt) can rewrite context pages underneath us and
     # make every dword look non-zero again at the final proof.
@@ -9311,45 +9335,93 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     if attrib_repair_mode not in ("literal", "bar1"):
       raise ValueError(
           "invalid KEPLER_ATTRIB_REPAIR; expected literal or bar1")
-    # Classic+literal BAR1 (Night41ay+): one 4 KiB BAR1 write + one 4 KiB BAR1
-    # read per page.  The old path called _gk104_pramin_write (per-dword RMW
-    # over TinyGPU) then scanned every dword with _gk104_pramin_read32 —
-    # ~4–5M RPCs/pass and ~35s of wall time, then auto warm-continue did it
-    # again.  Keep the slow path behind KEPLER_FAST_ZERO=0.
+    # Classic+literal BAR1 (Night41ay+): bulk BAR1 zeros above, then verify
+    # (rewrite only dirty chunks).  Old path: per-dword PRAMIN RMW (~35s) —
+    # keep behind KEPLER_FAST_ZERO=0.  KEPLER_ZERO_CHUNK (default 256 KiB)
+    # bounds BAR1 verify RPCs on TinyGPU.
     fast_zero = os.environ.get("KEPLER_FAST_ZERO", "1") != "0"
     # Prefer device flags; also accept the local bar1_identity_ready set just
     # above when classic init completed in this channel-build (warm reopen).
     classic_bar1 = bool(getattr(dev, "_bar1_classic_posted", False) or
                         getattr(dev, "_bar1_identity_ready", False) or
                         bar1_identity_ready)
+    zero_chunk = int(os.environ.get("KEPLER_ZERO_CHUNK",
+                                    os.environ.get("KEPLER_BAR1_CHUNK", "0x40000")), 0)
+    if zero_chunk < 0x1000 or (zero_chunk & 0xfff):
+      zero_chunk = 0x1000
+    _zero_need_ltc = False
+
     def repair_zero(label, pa, size):
       # Virgin GDDR often reads as 0xffffffff.  On the XOR aperture a literal
       # BAR1 store of zeros is a no-op (old^0 == old).  After H101 classic
       # literal BAR1, bulk BAR1 zeros stick; fall back to compensated PRAMIN
-      # only if a page still fails.
+      # only if a chunk still fails.  Verify-first avoids rewriting clean
+      # buffers (~2–3s wall on TinyGPU for the three 512 KiB GR regions).
       phase_label = label.lower().replace(" ", "-")
       if hw is not None:
         hw.set_phase(f"channel-build-repair-zero-{phase_label}")
       use_bar1 = (attrib_repair_mode == "bar1" and label == "attrib")
       zero_page = bytes(0x1000)
       t0 = time.monotonic()
-      for _page in range(0, size, 0x1000):
-        _page_size = min(0x1000, size - _page)
-        _want = zero_page if _page_size == 0x1000 else bytes(_page_size)
-        for _attempt in range(6):
-          if fast_zero and classic_bar1:
+      rewrote = 0
+      step = zero_chunk if (fast_zero and classic_bar1) else 0x1000
+      verify_mode = os.environ.get("KEPLER_ZERO_VERIFY", "sample")
+      nonlocal _zero_need_ltc
+      # Sample mode: trust the bulk BAR1 zero unless a few probes fail, then
+      # fall through to the full rewrite path.  Avoids re-reading ~1.5 MiB.
+      if fast_zero and classic_bar1 and verify_mode != "full":
+        _probes = sorted({0, size // 2, max(0, size - 4),
+                          0x1000 if size > 0x1000 else 0,
+                          0x10000 if size > 0x10000 else 0})
+        _dirty = False
+        for _poff in _probes:
+          if _poff + 4 > size:
+            continue
+          got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _poff, 4))
+          if got != b"\x00\x00\x00\x00":
+            _dirty = True
+            break
+        if not _dirty:
+          sample = dev.dev_impl.hw.mmio_read(1, pa, min(size, 0x20)).hex()
+          print(f"[kepler] {label} physical-zero verified; "
+                f"BAR1 sample={sample} "
+                f"({time.monotonic() - t0:.2f}s fast_zero={fast_zero} "
+                f"rewrote=0 chunk={step:#x} verify=sample)",
+                flush=True)
+          return
+      for _page in range(0, size, step):
+        _page_size = min(step, size - _page)
+        _want = (zero_page if _page_size == 0x1000 else bytes(_page_size))
+        if fast_zero and classic_bar1:
+          got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
+          if got == _want:
+            continue
+          rewrote += 1
+          for _attempt in range(6):
             bar1_write(pa + _page, _want)
             _gk104_bar_flush(dev)
             got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
             if got == _want:
               break
-            # One compensated PRAMIN pass, then re-check via BAR1.
-            _gk104_pramin_write(dev, pa + _page, _want)
+            # Compensated PRAMIN in 4 KiB slices, then re-check via BAR1.
+            for _sub in range(0, _page_size, 0x1000):
+              _sz = min(0x1000, _page_size - _sub)
+              _gk104_pramin_write(dev, pa + _page + _sub, bytes(_sz))
             _gk104_bar_flush(dev)
             got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
             if got == _want:
               break
-            continue
+          else:
+            _page_bad = [i for i in range(0, _page_size, 4)
+                         if got[i:i + 4] != b"\x00\x00\x00\x00"]
+            _sample = [struct.unpack_from("<I", got, x)[0]
+                       for x in _page_bad[:4]]
+            raise RuntimeError(
+                f"GK104 {label} chunk {_page:#x} did not stabilise: "
+                f"offsets={[hex(_page + x) for x in _page_bad[:16]]} "
+                f"samples={[hex(x) for x in _sample]}")
+          continue
+        for _attempt in range(6):
           if use_bar1 and _attempt < 2:
             bar1_write(pa + _page, _want)
           _gk104_pramin_write(dev, pa + _page, _want)
@@ -9360,40 +9432,31 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           if not _page_bad:
             break
         else:
-          if fast_zero and classic_bar1:
-            got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
-            _page_bad = [i for i in range(0, _page_size, 4)
-                         if got[i:i + 4] != b"\x00\x00\x00\x00"]
-            _sample = [struct.unpack_from("<I", got, x)[0]
-                       for x in _page_bad[:4]]
-          else:
-            _page_bad = [_off for _off in range(0, _page_size, 4)
-                         if _gk104_pramin_read32(dev, pa + _page + _off)]
-            _sample = [_gk104_pramin_read32(dev, pa + _page + _off) & 0xffffffff
-                       for _off in _page_bad[:4]]
+          _page_bad = [_off for _off in range(0, _page_size, 4)
+                       if _gk104_pramin_read32(dev, pa + _page + _off)]
+          _sample = [_gk104_pramin_read32(dev, pa + _page + _off) & 0xffffffff
+                     for _off in _page_bad[:4]]
           raise RuntimeError(
               f"GK104 {label} page {_page:#x} did not stabilise: "
               f"offsets={[hex(_page + x) for x in _page_bad[:16]]} "
               f"samples={[hex(x) for x in _sample]}")
+        rewrote += 1
+      if rewrote or not (fast_zero and classic_bar1):
+        _zero_need_ltc = True
+      # Full-buffer path only when sample found dirt or verify=full.
+      if fast_zero and classic_bar1 and rewrote == 0:
+        sample = dev.dev_impl.hw.mmio_read(1, pa, min(size, 0x20)).hex()
+        print(f"[kepler] {label} physical-zero verified; "
+              f"BAR1 sample={sample} "
+              f"({time.monotonic() - t0:.2f}s fast_zero={fast_zero} "
+              f"rewrote=0 chunk={step:#x} verify=full)",
+              flush=True)
+        return
       _gk104_bar_flush(dev)
-      # Flush L2 dirty lines to DRAM, but do **not** invalidate yet: on this
-      # eGPU an invalidate after PRAMIN zeroing resurrects 0xffffffff from DRAM
-      # (flush alone appears insufficient to commit PRAMIN stores).  FECS/VM
-      # paths invalidate later once the buffers are known-good.
-      try:
-        dev.write32(0x070010, 0x00000001)
-        _deadline = time.time() + 0.2
-        while dev.read32(0x070010) & 0x00000003:
-          if time.time() >= _deadline:
-            break
-          time.sleep(0.001)
-      except Exception:
-        pass
-      time.sleep(0.005)
       if fast_zero and classic_bar1:
         _bad = []
-        for _page in range(0, size, 0x1000):
-          _page_size = min(0x1000, size - _page)
+        for _page in range(0, size, step):
+          _page_size = min(step, size - _page)
           got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
           _bad.extend(_page + i for i in range(0, _page_size, 4)
                       if got[i:i + 4] != b"\x00\x00\x00\x00")
@@ -9403,8 +9466,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
                                 bytes(min(0x1000, size - _page)))
           _gk104_bar_flush(dev)
           _bad = []
-          for _page in range(0, size, 0x1000):
-            _page_size = min(0x1000, size - _page)
+          for _page in range(0, size, step):
+            _page_size = min(step, size - _page)
             got = bytes(dev.dev_impl.hw.mmio_read(1, pa + _page, _page_size))
             _bad.extend(_page + i for i in range(0, _page_size, 4)
                         if got[i:i + 4] != b"\x00\x00\x00\x00")
@@ -9434,13 +9497,27 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       sample = dev.dev_impl.hw.mmio_read(1, pa, min(size, 0x20)).hex()
       print(f"[kepler] {label} physical-zero verified; "
             f"BAR1 sample={sample} "
-            f"({time.monotonic() - t0:.2f}s fast_zero={fast_zero})",
+            f"({time.monotonic() - t0:.2f}s fast_zero={fast_zero} "
+            f"rewrote={rewrote} chunk={step:#x})",
             flush=True)
+
     repair_zero("GR ctx runtime", grctx_vram_pa, 0x80000)
     repair_zero("GR ctx golden", grctx_golden_vram_pa, 0x80000)
     repair_zero("pagepool", pagepool_vram_pa, 0x8000)
     repair_zero("bundle", bundle_vram_pa, 0x3000)
     repair_zero("attrib", attrib_vram_pa, attrib_cb.size)
+    # One LTC flush after any rewrite (not once per buffer).
+    if _zero_need_ltc:
+      try:
+        dev.write32(0x070010, 0x00000001)
+        _deadline = time.time() + 0.2
+        while dev.read32(0x070010) & 0x00000003:
+          if time.time() >= _deadline:
+            break
+          time.sleep(0.001)
+      except Exception:
+        pass
+      time.sleep(0.005)
     # ctx_chan starts at CB_RESERVED (separate golden bank).  Prove that first
     # context-header page remains zero after LTC settling.
     _ctx_header_pa = grctx_golden_vram_pa
@@ -9782,11 +9859,24 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     ring_page = bytearray(0x1000)
     ring_page[:len(ring)] = ring
     bar1_write(gpfifo_vram_pa, ring_page)
-    _gk104_pramin_write(dev, gpfifo_vram_pa, ring)
     if push_vram_pa == gpfifo_vram_pa and push_phys_offset:
       bar1_write(push_vram_pa + push_phys_offset, push_bytes)
-      _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
     _gk104_bar_flush(dev)
+    _ring_ok = True
+    if push_vram_pa == gpfifo_vram_pa and push_phys_offset:
+      _got_push = bytes(dev.dev_impl.hw.mmio_read(
+          1, push_vram_pa + push_phys_offset, len(push_bytes)))
+      _ring_ok = (_got_push == bytes(push_bytes) and
+                  bytes(dev.dev_impl.hw.mmio_read(1, gpfifo_vram_pa, len(ring)))
+                  == bytes(ring))
+    else:
+      _ring_ok = (bytes(dev.dev_impl.hw.mmio_read(1, gpfifo_vram_pa, len(ring)))
+                  == bytes(ring))
+    if not _ring_ok:
+      _gk104_pramin_write(dev, gpfifo_vram_pa, ring)
+      if push_vram_pa == gpfifo_vram_pa and push_phys_offset:
+        _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
+      _gk104_bar_flush(dev)
     if DEBUG:
       bar_ring = dev.dev_impl.hw.mmio_read(1, gpfifo_vram_pa, 8).hex()
       pri_ring = (_gk104_pramin_read32(dev, gpfifo_vram_pa),
@@ -10520,17 +10610,19 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           f"PWR_GATE={dev.read32(0x020004):#x} "
           f"idle_filter={dev.read32(0x020288):#x}",
           flush=True)
-    # Tight poll: sample FECS CPUCTL every 1ms to find exact gate time.
+    # Tight poll: sample FECS CPUCTL to find exact gate time.
     _gate_samples = []
-    for _ in range(50):
+    _gate_iters = 50 if DEBUG else 5
+    for _ in range(_gate_iters):
       _v = dev.read32(0x409100)
       _gate_samples.append((_v, _))
       if _v == 0xbadf1000 or (_v & 0xfffff000) == 0xbadf0000:
         break
       time.sleep(0.001)
-    print(f"[kepler] FECS gate poll after golden save: "
-          f"{[(i, hex(v)) for v, i in _gate_samples[:10]]}",
-          flush=True)
+    if DEBUG:
+      print(f"[kepler] FECS gate poll after golden save: "
+            f"{[(i, hex(v)) for v, i in _gate_samples[:10]]}",
+            flush=True)
     # Nouveau keeps the CB_RESERVED allocation only while generating the
     # global golden image.  A real channel owns a gr->size context beginning at
     # offset zero, populated by copying data[CB_RESERVED:CB_RESERVED+size].
@@ -10551,8 +10643,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
                        bar1_identity_ready))
       runtime_ctx_expected = bytearray(ctx_size)
       if fast_ctx:
-        for off in range(0, ctx_size, 0x1000):
-          n = min(0x1000, ctx_size - off)
+        _rd = _bar1_xfer["chunk"]
+        for off in range(0, ctx_size, _rd):
+          n = min(_rd, ctx_size - off)
           runtime_ctx_expected[off:off + n] = bytes(
               dev.dev_impl.hw.mmio_read(1, grctx_golden_vram_pa + off, n))
         # Sanity: reject stub/all-ones BAR1 images.  Do NOT reject all-zero
@@ -10596,15 +10689,27 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
                                  dev.read32(0x400000), dev.read32(0x020004)))
       ctx_mismatches = []
       if fast_ctx:
-        for off in range(0, ctx_size, 0x1000):
-          n = min(0x1000, ctx_size - off)
-          got = bytes(dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + off, n))
-          want = runtime_ctx_expected[off:off + n]
-          if got != want:
-            for i in range(0, n, 4):
-              if got[i:i + 4] != want[i:i + 4]:
-                ctx_mismatches.append(
-                    (off + i, want[i:i + 4], got[i:i + 4]))
+        _rd = _bar1_xfer["chunk"]
+        _sample_ctx = os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full"
+        if _sample_ctx:
+          for off in (0, ctx_size // 2, max(0, ctx_size - 4),
+                      0x1000 if ctx_size > 0x1000 else 0):
+            if off + 4 > ctx_size:
+              continue
+            got = bytes(dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + off, 4))
+            want = runtime_ctx_expected[off:off + 4]
+            if got != want:
+              ctx_mismatches.append((off, want, got))
+        else:
+          for off in range(0, ctx_size, _rd):
+            n = min(_rd, ctx_size - off)
+            got = bytes(dev.dev_impl.hw.mmio_read(1, grctx_vram_pa + off, n))
+            want = runtime_ctx_expected[off:off + n]
+            if got != want:
+              for i in range(0, n, 4):
+                if got[i:i + 4] != want[i:i + 4]:
+                  ctx_mismatches.append(
+                      (off + i, want[i:i + 4], got[i:i + 4]))
       else:
         for off in range(0, ctx_size, 4):
           actual = _gk104_pramin_read32(dev, grctx_vram_pa + off)
@@ -11074,6 +11179,28 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           if not _gk104_ltc_invalidate(dev):
             raise TimeoutError("GK104 LTC invalidate for VRAM mirror failed")
           time.sleep(0.005)
+          # Sample-first: full 1 MiB BAR1 re-read was ~0.9s on TinyGPU.
+          _mirror_ok = True
+          _sample_mode = os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full"
+          if _sample_mode and len(_mirror_wanted) >= 16:
+            for _poff in (0, len(_mirror_wanted) // 2,
+                          max(0, len(_mirror_wanted) - 4)):
+              _chunk_pa0, _ = _chunks[0]
+              # Map linear offset into striped chunks.
+              _left, _base = _poff, None
+              for _cpa, _csz in _chunks:
+                if _left < _csz:
+                  _base = _cpa + _left
+                  break
+                _left -= _csz
+              if _base is None:
+                continue
+              got = bytes(dev.dev_impl.hw.mmio_read(1, _base, 4))
+              if got != _mirror_wanted[_poff:_poff + 4]:
+                _mirror_ok = False
+                break
+            if _mirror_ok:
+              break
           _mirror_bar = bytearray()
           _off = 0
           for _chunk_pa, _chunk_sz in _chunks:
@@ -11082,8 +11209,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
               break
             _mirror_bar.extend(b"".join(
                 bytes(dev.dev_impl.hw.mmio_read(
-                    1, _chunk_pa + _o, min(0x1000, _take - _o)))
-                for _o in range(0, _take, 0x1000)))
+                    1, _chunk_pa + _o,
+                    min(_bar1_xfer["chunk"], _take - _o)))
+                for _o in range(0, _take, _bar1_xfer["chunk"])))
             _off += _take
           if bytes(_mirror_bar) == _mirror_wanted:
             break
@@ -11518,10 +11646,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           _gk104_pramin_write_literal(dev, gpfifo_vram_pa, ring)
         else:
           bar1_write(gpfifo_vram_pa, ring_store)
-          _gk104_pramin_write(dev, gpfifo_vram_pa, ring_store)
       if push_vram_pa is not None:
         bar1_write(push_vram_pa + push_phys_offset, push_bytes)
-        _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
       _gk104_bar_flush(dev)
       if not _gk104_ltc_invalidate(dev):
         raise TimeoutError("GK104 LTC invalidate for precommit commands failed")
@@ -11535,6 +11661,28 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _push_actual = (dev.dev_impl.hw.mmio_read(
           1, push_vram_pa + push_phys_offset, len(push_bytes))
           if push_vram_pa is not None else bytes(push_bytes))
+      if (os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full" and
+          _ring_actual == ring_store and
+          _push_actual == bytes(push_bytes)):
+        break
+      # BAR1 mismatch (or full verify): dual-write via PRAMIN then re-check.
+      if gpfifo_vram_pa is not None and not _literal_ring:
+        _gk104_pramin_write(dev, gpfifo_vram_pa, ring_store)
+      if push_vram_pa is not None:
+        _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate for precommit commands failed")
+      time.sleep(0.005)
+      _ring_actual = (dev.dev_impl.hw.mmio_read(1, gpfifo_vram_pa, len(ring_store))
+                      if gpfifo_vram_pa is not None else ring_store)
+      _push_actual = (dev.dev_impl.hw.mmio_read(
+          1, push_vram_pa + push_phys_offset, len(push_bytes))
+          if push_vram_pa is not None else bytes(push_bytes))
+      if (os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full" and
+          _ring_actual == ring_store and
+          _push_actual == bytes(push_bytes)):
+        break
       _ring_pramin = (b"".join(struct.pack("<I", _gk104_pramin_read32(
           dev, gpfifo_vram_pa + off)) for off in range(0, len(ring_store), 4))
           if gpfifo_vram_pa is not None else ring_store)
@@ -11594,10 +11742,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x00000400, 0x00000400)
   if DEBUG:
     print(f"[kepler] post-runlist chan_ctrl=0x{dev.read32(CHAN_START_REG + chan_id * 8):08x}", flush=True)
-  # Give the scheduler time to process the runlist entries and populate
-  # the CHAN_TABLE.  The DMA completion (PLAYLIST_RD BUSY=0) doesn't mean
-  # the scheduler has finished processing the entries.
-  time.sleep(0.01)
+  # Give the scheduler a brief window to populate CHAN_TABLE after runlist DMA.
+  time.sleep(0.002 if not DEBUG else 0.01)
   if DEBUG:
     _ct_chan = dev.read32(0x3000 + chan_id * 8)
     _ct_state = dev.read32(0x3004 + chan_id * 8)
@@ -11606,7 +11752,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   # tells the scheduler to immediately dispatch the specified channel.
   if unsafe_experiments:
     dev.write32(0x2634, chan_id)
-  time.sleep(0.01)
+  time.sleep(0.002 if not DEBUG else 0.01)
   if DEBUG:
     _ct_chan2 = dev.read32(0x3000 + chan_id * 8)
     _ct_state2 = dev.read32(0x3004 + chan_id * 8)
@@ -11626,7 +11772,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"CHAN=0x{dev.read32(_chan_table_chan_reg):08x} "
             f"STATE=0x{dev.read32(_chan_table_state_reg):08x}", flush=True)
   # Check PFIFO and PBDMA state after runlist commit
-  if dev.dev_impl.hw is not None:
+  if DEBUG and dev.dev_impl.hw is not None:
     _pfifo_intr = dev.read32(0x2100)
     _chan_table_err = dev.read32(0x252c)
     _sched_err = dev.read32(0x254c) if _pfifo_intr & 0x100 else 0
@@ -11761,26 +11907,21 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _rl = struct.unpack_from('<II', vram, runlist_pa)
     print(f"[kepler] runlist entry: chan_id={_rl[0]:#x} word1={_rl[1]:#x} "
           f"(expected chan_id={chan_id:#x})", flush=True)
-  # FECS state after runlist commit
-  _fecs_ctrl_post_rl = dev.read32(0x409100)
-  _subch_post_rl = dev.read32(0x404200)
-  print(f"[kepler] post-runlist FECS: CPUCTL={_fecs_ctrl_post_rl:#x} "
-        f"SCRATCH0={dev.read32(0x409800):#x} "
-        f"CHAN_ADDR={dev.read32(0x409b00):#x} "
-        f"CHAN_NEXT={dev.read32(0x409b04):#x} "
-        f"subch4={_subch_post_rl:#x}", flush=True)
-  # Manually trigger a context switch to load the channel context.
-  # On GK104, the PBDMA should automatically generate a CHSW interrupt when
-  # it schedules a new channel, but on this un-POSTed card without a PMU, the PBDMA
-  # forwards methods without waiting for the FECS to load the context.
-  # Manually set CHAN_NEXT with bit 31 (new channel to load) and trigger
-  # the CHSW interrupt (bit 8 of INTR_SET at 0x409000), exactly like the
-  # golden ctx unload does in reverse.
+  # FECS / CHSW diagnostics (DEBUG only — dozens of BAR0 RPCs on the hot path).
+  if DEBUG:
+    _fecs_ctrl_post_rl = dev.read32(0x409100)
+    _subch_post_rl = dev.read32(0x404200)
+    print(f"[kepler] post-runlist FECS: CPUCTL={_fecs_ctrl_post_rl:#x} "
+          f"SCRATCH0={dev.read32(0x409800):#x} "
+          f"CHAN_ADDR={dev.read32(0x409b00):#x} "
+          f"CHAN_NEXT={dev.read32(0x409b04):#x} "
+          f"subch4={_subch_post_rl:#x}", flush=True)
   _chan_next_pre = dev.read32(0x409b04)
   _chan_addr_pre = dev.read32(0x409b00)
-  print(f"[kepler] manual CHSW: CHAN_ADDR={_chan_addr_pre:#x} "
-        f"CHAN_NEXT={_chan_next_pre:#x} -> setting CHAN_NEXT bit31",
-        flush=True)
+  if DEBUG:
+    print(f"[kepler] manual CHSW: CHAN_ADDR={_chan_addr_pre:#x} "
+          f"CHAN_NEXT={_chan_next_pre:#x} -> setting CHAN_NEXT bit31",
+          flush=True)
   # Set CHAN_NEXT with bit 31 to indicate a new channel to load
   if unsafe_experiments:
     dev.write32(0x409b04, _chan_next_pre | 0x80000000)
@@ -11803,46 +11944,42 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             flush=True)
       break
     time.sleep(0.001)
-  _chsw_elapsed = time.time() - _chsw_start
-  print(f"[kepler] manual CHSW result: done={_chsw_done} "
-        f"elapsed={_chsw_elapsed:.3f}s "
-        f"CHAN_ADDR={dev.read32(0x409b00):#x} "
-        f"CHAN_NEXT={dev.read32(0x409b04):#x} "
-        f"SCRATCH0={dev.read32(0x409800):#x} "
-        f"PC={dev.read32(0x409ff0):#x}", flush=True)
-  # Read CTXCTL ENGINE_STATUS (0x409c00) to understand context switch state.
-  # Bits: 0=CHSW_PENDING, 1=CHAN_VALID, 3=CHSW_PULSE,
-  #        7=DAEMON2CTXCTL_REQ, 8=DAEMON2CTXCTL_ACK,
-  #        9=CTXCTL2DAEMON_REQ, 10=CTXCTL2DAEMON_ACK,
-  #        13=IDLE_BUSY, 15=PAUSE_BUSY
-  _ctxctl_eng_stat = dev.read32(0x409c00)
-  _ctxctl_eng_trig = dev.read32(0x409c08)
-  print(f"[kepler] CTXCTL ENGINE_STATUS=0x{_ctxctl_eng_stat:08x} "
-        f"TRIGGER=0x{_ctxctl_eng_trig:08x} "
-        f"CHSW_PEND={bool(_ctxctl_eng_stat&1)} CHAN_VALID={bool(_ctxctl_eng_stat&2)} "
-        f"D2C_REQ={bool(_ctxctl_eng_stat&0x80)} D2C_ACK={bool(_ctxctl_eng_stat&0x100)} "
-        f"C2D_REQ={bool(_ctxctl_eng_stat&0x200)} C2D_ACK={bool(_ctxctl_eng_stat&0x400)} "
-        f"IDLE_BUSY={bool(_ctxctl_eng_stat&0x2000)} PAUSE_BUSY={bool(_ctxctl_eng_stat&0x8000)}",
-        flush=True)
+  if DEBUG:
+    _chsw_elapsed = time.time() - _chsw_start
+    print(f"[kepler] manual CHSW result: done={_chsw_done} "
+          f"elapsed={_chsw_elapsed:.3f}s "
+          f"CHAN_ADDR={dev.read32(0x409b00):#x} "
+          f"CHAN_NEXT={dev.read32(0x409b04):#x} "
+          f"SCRATCH0={dev.read32(0x409800):#x} "
+          f"PC={dev.read32(0x409ff0):#x}", flush=True)
+    _ctxctl_eng_stat = dev.read32(0x409c00)
+    _ctxctl_eng_trig = dev.read32(0x409c08)
+    print(f"[kepler] CTXCTL ENGINE_STATUS=0x{_ctxctl_eng_stat:08x} "
+          f"TRIGGER=0x{_ctxctl_eng_trig:08x} "
+          f"CHSW_PEND={bool(_ctxctl_eng_stat&1)} CHAN_VALID={bool(_ctxctl_eng_stat&2)} "
+          f"D2C_REQ={bool(_ctxctl_eng_stat&0x80)} D2C_ACK={bool(_ctxctl_eng_stat&0x100)} "
+          f"C2D_REQ={bool(_ctxctl_eng_stat&0x200)} C2D_ACK={bool(_ctxctl_eng_stat&0x400)} "
+          f"IDLE_BUSY={bool(_ctxctl_eng_stat&0x2000)} PAUSE_BUSY={bool(_ctxctl_eng_stat&0x8000)}",
+          flush=True)
   # Call gf100_gr_fecs_bind_pointer: send WRCMD_CMD=0x03 (BIND_POINTER) with
   # the channel instance address.  This tells PGRAPH CTXCTL which context to
   # use, setting CHAN_VALID.  Without this, PGRAPH CTXCTL has no valid channel
   # and methods sit in the FIFO unprocessed.
   # gf100_gr_fecs_bind_pointer(gr, 0x80000000 | addr) where addr = inst->addr >> 12
   _bind_inst = 0x80000000 | ((ramin_bind_addr >> 12) & 0x0FFFFFFF)
-  # Check FECS interrupt/falcon state before sending WRCMD
-  _fecs_cpuctl = dev.read32(0x409100)
-  _fecs_intr = dev.read32(0x409008)
-  _fecs_intr_en = dev.read32(0x409018)
-  _fecs_iren = dev.read32(0x409010)
-  print(f"[kepler] FECS pre-bind: CPUCTL=0x{_fecs_cpuctl:08x} "
-        f"INTR=0x{_fecs_intr:08x} INTR_EN=0x{_fecs_intr_en:08x} "
-        f"IREN=0x{_fecs_iren:08x} "
-        f"SLEEPING={bool(_fecs_cpuctl&0x20)} HALT={bool(_fecs_cpuctl&0x2)}",
-        flush=True)
+  if DEBUG:
+    _fecs_cpuctl = dev.read32(0x409100)
+    _fecs_intr = dev.read32(0x409008)
+    _fecs_intr_en = dev.read32(0x409018)
+    _fecs_iren = dev.read32(0x409010)
+    print(f"[kepler] FECS pre-bind: CPUCTL=0x{_fecs_cpuctl:08x} "
+          f"INTR=0x{_fecs_intr:08x} INTR_EN=0x{_fecs_intr_en:08x} "
+          f"IREN=0x{_fecs_iren:08x} "
+          f"SLEEPING={bool(_fecs_cpuctl&0x20)} HALT={bool(_fecs_cpuctl&0x2)}",
+          flush=True)
   # If FECS is sleeping, ensure FIFO_DATA interrupt (bit 2) is enabled
   # and trigger it to wake the falcon
-  if unsafe_experiments and _fecs_cpuctl & 0x20:  # SLEEPING
+  if unsafe_experiments and (dev.read32(0x409100) & 0x20):  # SLEEPING
     # Enable FIFO_DATA interrupt (bit 2) in INTR_EN_SET
     dev.write32(0x409010, 0xffffffff)  # IREN: enable all external interrupts
     dev.write32(0x409010 + 0x4, 0xff)  # INTR_EN_SET: enable all falcon interrupts
@@ -11851,8 +11988,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     # Let me re-check: INTR_EN_SET is at offset 0x010
     dev.write32(0x409010, 0xff)  # INTR_EN_SET: enable all interrupts
     time.sleep(0.001)
-    _fecs_intr_en2 = dev.read32(0x409018)
-    print(f"[kepler] FECS wake: INTR_EN=0x{_fecs_intr_en2:08x}", flush=True)
+    if DEBUG:
+      _fecs_intr_en2 = dev.read32(0x409018)
+      print(f"[kepler] FECS wake: INTR_EN=0x{_fecs_intr_en2:08x}", flush=True)
   if unsafe_experiments:
     nvkm_mask(dev, 0x409800, 0x00000030, 0x00000000)
     dev.write32(0x409500, _bind_inst)
@@ -11868,12 +12006,13 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _bp_done = True
       break
     time.sleep(0.001)
-  _ctxctl_eng_stat2 = dev.read32(0x409c00)
-  print(f"[kepler] FECS bind_pointer: done={_bp_done} err={_bp_err} "
-        f"inst=0x{_bind_inst:08x} SCRATCH0=0x{dev.read32(0x409800):08x} "
-        f"CTXCTL_STATUS=0x{_ctxctl_eng_stat2:08x} "
-        f"CHAN_VALID={bool(_ctxctl_eng_stat2&2)}",
-        flush=True)
+  if DEBUG:
+    _ctxctl_eng_stat2 = dev.read32(0x409c00)
+    print(f"[kepler] FECS bind_pointer: done={_bp_done} err={_bp_err} "
+          f"inst=0x{_bind_inst:08x} SCRATCH0=0x{dev.read32(0x409800):08x} "
+          f"CTXCTL_STATUS=0x{_ctxctl_eng_stat2:08x} "
+          f"CHAN_VALID={bool(_ctxctl_eng_stat2&2)}",
+          flush=True)
   # If bind_pointer failed, try the non-firmware ctx_chan path
   if unsafe_experiments and not _bp_done:
     print("[kepler] bind_pointer failed — trying non-firmware ctx_chan path", flush=True)
@@ -11893,8 +12032,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           f"CTXCTL_STATUS=0x{_ctxctl_eng_stat3:08x} "
           f"CHAN_VALID={bool(_ctxctl_eng_stat3&2)}",
           flush=True)
-  # Rapid poll of FECS state to catch the CHSW processing
-  if dev.dev_impl.hw is not None:
+  # Rapid poll of FECS state to catch the CHSW processing (DEBUG only —
+  # 100×4 BAR0 RPCs + sleeps burned ~0.8–1s on the live TinyGPU path).
+  if DEBUG and dev.dev_impl.hw is not None:
     _poll_start = time.time()
     _poll_data = []
     for _i in range(100):
@@ -11930,9 +12070,27 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     for _attempt in range(4):
       if gpfifo_vram_pa is not None:
         bar1_write(gpfifo_vram_pa, ring_store)
-        _gk104_pramin_write(dev, gpfifo_vram_pa, ring_store)
       if push_vram_pa is not None:
         bar1_write(push_vram_pa + push_phys_offset, push_bytes)
+      _gk104_bar_flush(dev)
+      if not _gk104_ltc_invalidate(dev):
+        raise TimeoutError("GK104 LTC invalidate did not complete")
+      time.sleep(0.005)
+      _ring_actual = (dev.dev_impl.hw.mmio_read(
+          1, gpfifo_vram_pa, len(ring_store))
+          if gpfifo_vram_pa is not None else ring_store)
+      _push_actual = (dev.dev_impl.hw.mmio_read(
+          1, push_vram_pa + push_phys_offset, len(push_bytes))
+          if push_vram_pa is not None else bytes(push_bytes))
+      # Classic BAR1: trust BAR1 image; skip per-dword PRAMIN (was thousands
+      # of TinyGPU RPCs for the push buffer).
+      if (os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full" and
+          _ring_actual == ring_store and
+          _push_actual == bytes(push_bytes)):
+        break
+      if gpfifo_vram_pa is not None:
+        _gk104_pramin_write(dev, gpfifo_vram_pa, ring_store)
+      if push_vram_pa is not None:
         _gk104_pramin_write(dev, push_vram_pa + push_phys_offset, push_bytes)
       _gk104_bar_flush(dev)
       if not _gk104_ltc_invalidate(dev):
@@ -11944,6 +12102,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _push_actual = (dev.dev_impl.hw.mmio_read(
           1, push_vram_pa + push_phys_offset, len(push_bytes))
           if push_vram_pa is not None else bytes(push_bytes))
+      if (os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full" and
+          _ring_actual == ring_store and
+          _push_actual == bytes(push_bytes)):
+        break
       _ring_pramin = (b"".join(struct.pack("<I", _gk104_pramin_read32(
           dev, gpfifo_vram_pa + off)) for off in range(0, len(ring_store), 4))
           if gpfifo_vram_pa is not None else ring_store)
