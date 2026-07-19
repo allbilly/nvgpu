@@ -68,7 +68,7 @@ DEFAULT_MUL_CUBIN = os.path.join(SHARED_KEPLER_DIR, "mul_kepler.cubin")
 # variant assembled from the checked-in Kepler PTX.  Keep this independent of
 # the add cubin so a stale/precompiled add image cannot silently run a mul test.
 MUL_CUBIN_BYTES = 1768
-MUL_CUBIN_SHA256 = "edde9272ed2b6e5a98c47cd52c18cfdfec40670af77383ab14d59762bb77fbd8"
+MUL_CUBIN_SHA256 = "7f0e019e5fe8dc5e68e1b14a70c3841391b63062df2daba26d01f8e6d0ac2a52"
 
 # The Linux implementation owns the RM/GMMU/launch code, while the macOS
 # wrapper supplies a TinyGPU socket transport.  This small hook avoids
@@ -9401,6 +9401,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     # The cold BAR path leaves unused SPT dwords as all ones.  SCC context
     # load touches this otherwise-unallocated scratch VA; give it a dedicated
     # writable guard page instead of accepting the stale RO PTE.
+    # VA 0x67000 sits inside large out[] mirrors (e.g. N>=24576 with out at
+    # 0x50000).  Guards are fill-ins for holes only — live_pte_map must apply
+    # them *before* mirrors so compute buffers keep their real PTEs.
     ctx_alias_ptes.append(
         (cloned_by_pgd[0] + 0x67 * 8, (_alias_cursor >> 8) | 1))
     _alias_cursor += 0x1000
@@ -9408,7 +9411,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     # GPC read at VA 0x100000 on this GK104.  Nouveau's fully populated channel
     # VM satisfies it; our sparse userspace VM did not.  Back only that observed
     # leaf with a dedicated writable guard page, preserving faults everywhere
-    # else instead of adding a broad identity/aperture mapping.
+    # else instead of adding a broad identity/aperture mapping.  temp_dev also
+    # lives at 0x100000; mirrors must win over this guard in live_pte_map.
     fault_guard_pte_addr = cloned_by_pgd[0] + 0x100 * 8
     fault_guard_pte_wanted = (_alias_cursor >> 8) | 1
     ctx_alias_ptes.append(
@@ -10701,6 +10705,11 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           _pte = struct.unpack_from("<Q", vram, _src_spt + _spti * 8)[0]
           if _pte:
             _live_pte_map[_dst_spt + _spti * 8] = _pte
+    # Scratch/fault guards fill unallocated VAs only.  Apply them before real
+    # buffer maps so a/b/out/temp mirrors are not stomped (the old order left a
+    # 4 KiB hole at VA 0x67000 whenever out[] covered that page).
+    for _pte_addr, _pte in ctx_alias_ptes:
+      _live_pte_map[_pte_addr] = _pte
     for _buf, _buf_pa, _priv in ((pagepool, pagepool_vram_pa, True),
                                  (bundle_cb, bundle_vram_pa, True),
                                  (attrib_cb, attrib_vram_pa, False)):
@@ -10741,8 +10750,6 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _src_spt = mm.root_page_table.address(_pgdi)
       _src_pte = struct.unpack_from("<Q", vram, _src_spt + _spti * 8)[0]
       _live_pte_map[cloned_by_pgd[_pgdi] + _spti * 8] = _src_pte
-    for _pte_addr, _pte in ctx_alias_ptes:
-      _live_pte_map[_pte_addr] = _pte
     _signal_buf = HCQBuffer(signal_va, 0x1000, meta={"pa": signal_vram_pa})
     for _buf, _buf_pa in ((gpfifo, gpfifo_vram_pa),
                           (push, push_vram_pa),
@@ -12454,9 +12461,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     raise ValueError(
         f"KEPLER_N={N} exceeds KEPLER_N_MAX={_n_max} "
         f"(set KEPLER_N_FORCE=1 to override)")
-  # Multi-CTA (one LAUNCH, grid_x=n_chunks) is proven through N=20480.
-  # KEPLER_MULTI_CTA=auto uses it in that range; above that a 4 KiB VRAM hole
-  # remains, so large N keeps channel-windowed single-CTA reopen.
+  # Multi-CTA (one LAUNCH, grid_x=n_chunks).  Default auto max tracks N_MAX;
+  # the old 20480 cap was only to dodge a 4 KiB PTE hole at VA 0x67000.
   if os.environ.get("KEPLER_BLOCK"):
     chunk = int(os.environ["KEPLER_BLOCK"], 0)
   elif N <= 1024:
@@ -12470,7 +12476,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   _ib_max = int(os.environ.get("KEPLER_LAUNCH_IB_MAX", "16"), 0)
   if _ib_max <= 0:
     _ib_max = max(_one_ib_max, 1)
-  _mcta_auto_max = int(os.environ.get("KEPLER_MULTI_CTA_AUTO_MAX", "20480"), 0)
+  _mcta_auto_max = int(os.environ.get("KEPLER_MULTI_CTA_AUTO_MAX",
+                                      str(_n_max)), 0)
   _mcta = os.environ.get("KEPLER_MULTI_CTA", "auto").lower()
   if _mcta in ("1", "true", "yes", "on"):
     use_multi_cta = True
