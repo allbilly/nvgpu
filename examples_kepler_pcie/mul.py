@@ -47,9 +47,9 @@ def main() -> None:
     print("software_mul=ok N=256")
     return
   os.environ["KEPLER_OPERATION"] = "mul"
-os.environ["KEPLER_CUBIN"] = os.environ.get(
-    "KEPLER_MUL_CUBIN", shared.DEFAULT_MUL_CUBIN)
-shared.main()
+  os.environ["KEPLER_CUBIN"] = os.environ.get(
+      "KEPLER_MUL_CUBIN", shared.DEFAULT_MUL_CUBIN)
+  shared.main()
 
 
 if __name__ == "__main__":
