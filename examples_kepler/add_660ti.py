@@ -404,8 +404,9 @@ class FileIOInterface:
     self.path = path
     self.fd = fd or os.open(path, flags)
   def __del__(self):
-    if hasattr(self, 'fd'):
-      try: os.close(self.fd)
+    fd = getattr(self, 'fd', None)
+    if fd is not None:
+      try: os.close(fd)
       except: pass
   def ioctl(self, request, arg):
     import fcntl
@@ -632,6 +633,10 @@ class APLRemotePCIDevice(RemotePCIDevice):
     self._trace_light = os.environ.get("KEPLER_RPC_LIGHT", "1") != "0"
     self._trace_mmio_count = 0
     self._trace_mmio_logged = 0
+    # H25: track sysmem mmaps + fds so fini() can release them.  Without this,
+    # each windowed NVDevice reopen leaks a 256 MB mmap + fd; 64 windows =
+    # 16 GB leaked VM, which crashed macOS.
+    self._sysmem_maps = []  # list of (mmap_addr, nbytes, fd)
     # Light mode keeps PHASE/FREEZE + non-MMIO RPCs; skips per-dword MMIO
     # BEGIN/END (those were ~2 GiB/run and dominated wall time).
     self._trace_mmio_sample = int(os.environ.get("KEPLER_RPC_MMIO_SAMPLE", "0") or "0")
@@ -849,6 +854,24 @@ class APLRemotePCIDevice(RemotePCIDevice):
         pass
     self._sock = None
     self._server_proc = None
+    # H25: munmap + close all tracked sysmem allocations.  Without this,
+    # each windowed NVDevice reopen leaks 256 MB of mmap'd VM; 64 windows
+    # accumulated 16 GB and crashed macOS.
+    for addr, nbytes, fio in getattr(self, "_sysmem_maps", []):
+      try:
+        libc.munmap(addr, nbytes)
+      except Exception:
+        pass
+      # Close fd and clear it on the FileIOInterface so its __del__ doesn't
+      # double-close the same fd number after it may have been reused.
+      fd = getattr(fio, "fd", None)
+      if fd is not None:
+        try:
+          os.close(fd)
+        except Exception:
+          pass
+        fio.fd = None
+    self._sysmem_maps = []
     trace_fd = getattr(self, "_trace_fd", None)
     if trace_fd is not None:
       try:
@@ -866,7 +889,12 @@ class APLRemotePCIDevice(RemotePCIDevice):
     via MAP_SYSMEM_FD + recvmsg fd + mmap — CPU-coherent, so copies go straight
     to the mmap (no SYSMEM_READ/WRITE RPCs).  Matches examples/add.py."""
     mapped_size, _, _, fd = self._rpc(RemoteCmd.MAP_SYSMEM_FD, 0, size, int(contiguous), has_fd=True)
-    memview = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt='B')
+    fio = FileIOInterface(fd=fd)
+    mmap_addr = fio.mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0)
+    memview = MMIOInterface(mmap_addr, mapped_size, fmt='B')
+    # H25: track for cleanup in fini().  Keep the FileIOInterface alive so
+    # its __del__ doesn't close the fd before we munmap.
+    self._sysmem_maps.append((memview.addr, memview.nbytes, fio))
     paddrs_raw = list(itertools.takewhile(lambda p: p[1] != 0, zip(memview.view(fmt='Q')[0::2], memview.view(fmt='Q')[1::2])))
     paddrs = [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
     return memview, paddrs
@@ -1155,6 +1183,16 @@ class LinuxPCIDevice(RemotePCIDevice):
       try: os.close(fd)
       except Exception: pass
     self._bars.clear()
+    # H25 twin: release mlocked sysmem buffer explicitly (twin of macOS
+    # mmap leak).  Without this, mlocked pages survive until GC and the
+    # mmap may not be released promptly in windowed runs.
+    buf = getattr(self, "_sysmem_buf", None)
+    if buf is not None:
+      try: libc.munlock(buf)
+      except Exception: pass
+      try: buf.close()
+      except Exception: pass
+      self._sysmem_buf = None
     if self._config_fd is not None:
       try: os.close(self._config_fd)
       except Exception: pass
@@ -2643,7 +2681,21 @@ class NVDevice:
     teardown = getattr(self, "_kepler_emergency_teardown", None)
     try:
       if teardown is not None:
-        teardown("device close")
+        try:
+          teardown("device close")
+        except Exception:
+          pass
+        # H27: unregister from atexit so accumulated windowed closures don't
+        # all fire at process exit.  teardown already ran (set _teardown_done),
+        # so the atexit call would be a no-op anyway, but unregistering
+        # prevents 64 stale closures from consuming atexit slots and avoids
+        # 2.5s join timeouts per unjoined window if close() wasn't called.
+        # Must run even if teardown raised, so the stale handler doesn't
+        # fire at exit.
+        try:
+          atexit.unregister(teardown)
+        except Exception:
+          pass
       if self.backend != "software":
         # No teardown MMIO is safe after the successful command/output phase.
         # The transport simply unmaps the BARs and closes the resource fds.
@@ -2928,16 +2980,20 @@ def assemble_kepler_cubin(operation="add"):
 def compile_kepler_cubin_docker(tag="nvidia/cuda:11.0.3-devel-ubuntu20.04"):
   """Compile a genuine sm_30 cubin with the locally cached CUDA 11.0 image."""
   try:
-    import tempfile, subprocess
+    import tempfile, subprocess, shutil
     d = tempfile.mkdtemp(prefix="kepler_cubin_")
-    cu = os.path.join(d, "add.cu")
-    with open(cu, "w") as f: f.write(KEPLER_CU_SRC)
-    out = os.path.join(d, "add.cubin")
-    subprocess.run(
-      ["docker", "run", "--rm", "-v", f"{d}:/work", "-w", "/work", tag,
-       "bash", "-c", "nvcc -arch=sm_30 -cubin add.cu -o add.cubin"],
-      check=True, capture_output=True, timeout=600)
-    return out if os.path.exists(out) else None
+    try:
+      cu = os.path.join(d, "add.cu")
+      with open(cu, "w") as f: f.write(KEPLER_CU_SRC)
+      out = os.path.join(d, "add.cubin")
+      subprocess.run(
+        ["docker", "run", "--rm", "-v", f"{d}:/work", "-w", "/work", tag,
+         "bash", "-c", "nvcc -arch=sm_30 -cubin add.cu -o add.cubin"],
+        check=True, capture_output=True, timeout=600)
+      if not os.path.exists(out): return None
+      with open(out, "rb") as f: return f.read()
+    finally:
+      shutil.rmtree(d, ignore_errors=True)
   except Exception as e:
     if DEBUG: print(f"[kepler] docker nvcc unavailable: {e}")
     return None
@@ -2966,14 +3022,15 @@ def get_kepler_cubin():
   # Explicit cubins are accepted for bring-up, then validated as sm_30 ELF.
   bundled = DEFAULT_MUL_CUBIN if operation == "mul" else DEFAULT_CUBIN
   if not path and os.path.exists(bundled): path = bundled
-  if not path or not os.path.exists(path):
-    if operation == "add":
-      path = compile_kepler_cubin_docker()
-  if not path or not os.path.exists(path):
-    raise RuntimeError(
-        f"live hardware requires a real sm_30 {operation} cubin; "
-        "set KEPLER_CUBIN or install CUDA 10.2 ptxas")
-  with open(path, "rb") as f: cubin = f.read()
+  cubin = None
+  if (not path or not os.path.exists(path)) and operation == "add":
+    cubin = compile_kepler_cubin_docker()
+  if cubin is None:
+    if not path or not os.path.exists(path):
+      raise RuntimeError(
+          f"live hardware requires a real sm_30 {operation} cubin; "
+          "set KEPLER_CUBIN or install CUDA 10.2 ptxas")
+    with open(path, "rb") as f: cubin = f.read()
   if len(cubin) < 0x40 or cubin[:4] != b"\x7fELF" or struct.unpack_from("<I", cubin, 0x30)[0] & 0xff != 0x1e:
     raise ValueError(f"KEPLER_CUBIN must be an sm_30 ELF cubin: {path}")
   if operation == "mul":
@@ -9369,20 +9426,44 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
           f"bus_base={bus_base:#x}",
           flush=True)
 
-def _gk104_ltc_invalidate(dev):
-  """Invalidate GK104's L2 after CPU BAR1/PRAMIN framebuffer stores."""
-  if getattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", False):
+def _gk104_ltc_invalidate(dev, *, force=False, flush=True):
+  """Invalidate GK104's L2 after CPU BAR1/PRAMIN framebuffer stores.
+
+  H23: after PRAMIN (BAR0) writes that bypass L2, pass flush=False to drop
+  stale dirty L2 lines WITHOUT writing them back — a flush would overwrite
+  the fresh PRAMIN data with older L2-cached BAR1 data (bit-15 mantissa
+  flips on compute mirror `b` at N>1024).
+
+  H26: on desktop GK104, Nouveau never calls nvkm_ltc_invalidate() — it's
+  only used on GK20a (Tegra).  Desktop coherency uses g84_bar_flush()
+  (0x070000), which times out on TinyGPU.  This function may only affect
+  compression tag state, not data lines.  The real L2 warming is done by
+  BAR1 bulk reads in the pre-GP_PUT mirror verify path.
+
+  KEPLER_SKIP_LTC=1 skips all hot-path LTC invalidate calls (force=False)
+  to test H26's hypothesis that they're unnecessary on desktop GK104.
+  """
+  if os.environ.get("KEPLER_SKIP_LTC", "0") == "1" and not force:
+    return True
+  if getattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", False) and not force:
     # 0x070010/0x070004 share the post-bit0-inaccessible BAR/LTC block with
     # 0x070000.  On the cold first-use path no GPU client has cached these
     # freshly written objects yet; use the safe BAR1 posting read instead.
-    return _gk104_bar_flush(dev)
-  # gf100_ltc_flush(): commit BAR/PRAMIN writes held by LTC first.
-  dev.write32(0x070010, 0x00000001)
-  deadline = time.time() + 0.2
-  while dev.read32(0x070010) & 0x00000003:
-    if time.time() >= deadline:
-      return False
-    time.sleep(0.001)
+    # H23: compute mirrors (a/b/out) bypass L2 via PRAMIN but the SM loads
+    # through L2; real LTC flush/invalidate is safe on 0x070010/0x070004 after
+    # bit0 (only 0x070000 BAR-flush is the 43-ms timeout source).  Default ON;
+    # KEPLER_LTC_FORCE=0 restores the old BAR-flush-only skip.
+    if os.environ.get("KEPLER_LTC_FORCE", "1") == "0":
+      return _gk104_bar_flush(dev)
+    # fall through to real LTC flush/invalidate with a generous timeout.
+  if flush:
+    # gf100_ltc_flush(): commit BAR/PRAMIN writes held by LTC first.
+    dev.write32(0x070010, 0x00000001)
+    deadline = time.time() + 0.2
+    while dev.read32(0x070010) & 0x00000003:
+      if time.time() >= deadline:
+        return False
+      time.sleep(0.001)
   dev.write32(0x070004, 0x00000001)
   deadline = time.time() + 0.2
   while dev.read32(0x070004) & 0x00000003:
@@ -11863,6 +11944,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"pramin={_signal_pramin:#x}")
     if hw is not None:
       hw.set_phase("golden-context-mirror-stabilize")
+    # H23: flush stale dirty L2 lines ONCE before all mirror writes, not per-
+    # mirror.  A per-mirror flush writes back stale L2 lines that can alias
+    # over earlier mirrors' PRAMIN-written data (L2 set aliasing at >64 KiB).
+    _gk104_ltc_invalidate(dev, flush=True)
     for _mirror in getattr(dev, "_kepler_vram_mirrors", ()):
       _chunks = _mirror.meta.get("vram_chunks")
       _mirror_pa = _mirror.meta.get("vram_pa")
@@ -11906,15 +11991,20 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
                                 label="mirror-stabilize"))
             _off += _take
           _gk104_bar_flush(dev)
-          if not _gk104_ltc_invalidate(dev):
+          # H23: flush=True if any chunk was stored via BAR1 (BAR1 writes go
+          # through L2 and need a flush to commit dirty lines to VRAM).
+          # flush=False if all chunks were PRAMIN (PRAMIN bypasses L2; a flush
+          # would write back stale dirty L2 lines over fresh VRAM data).
+          _need_flush = "bar1" in _via
+          if not _gk104_ltc_invalidate(dev, flush=_need_flush):
             raise TimeoutError("GK104 LTC invalidate for VRAM mirror failed")
           time.sleep(0.005)
-          # H22: sample offsets (0, mid, end) missed bit15 flips at +0x4/+0x18
-          # on the 32-byte `b` mirror.  Always full-verify small compute mirrors.
+          # H22/H23: sample offsets (0, mid, end) missed bit15 flips.  Always
+          # full-verify compute mirrors up to 64 KiB; sample only for TLS/heap.
           _mirror_ok = True
           _sample_mode = (
               os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full" and
-              len(_mirror_wanted) > 0x1000)
+              len(_mirror_wanted) > 0x10000)
           if _sample_mode and len(_mirror_wanted) >= 16:
             for _poff in (0, len(_mirror_wanted) // 2,
                           max(0, len(_mirror_wanted) - 4)):
@@ -11971,7 +12061,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     for _attempt in range(4):
       _gk104_pramin_write(dev, ramin_vram_pa, _ramin_expected)
       _gk104_bar_flush(dev)
-      if not _gk104_ltc_invalidate(dev):
+      # H23: flush=False — RAMFC PRAMIN write must not be overwritten by a
+      # stale dirty L2 writeback from the flush step.
+      if not _gk104_ltc_invalidate(dev, flush=False):
         raise TimeoutError("GK104 LTC invalidate for RAMFC did not complete")
       time.sleep(0.005)
       _ramin_actual = b"".join(
@@ -12942,25 +13034,55 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"actual={_guard_after_vmm:#x}", flush=True)
     print(f"[kepler] runtime context armed: CHAN_ADDR={dev.read32(0x409b00):#x} "
           f"CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
-    # H22: bad add lanes matched a+(b with mantissa bit15 flipped).  Prove
-    # whether VRAM already holds the flipped bits before GP_PUT.
+    # H22/H23: read every read-only compute mirror before GP_PUT to warm L2.
+    # The LTC invalidate register (0x070004) is not effective on this post-bit0
+    # card, but read-through populates L2 with correct VRAM lines, which the SM
+    # then hits.  Without this, N>1024 scattered ~14% of lanes read stale L2
+    # data (bit 13/15 flips on b/cbuf).  Use BAR1 bulk reads for large mirrors
+    # (fast, also goes through L2); per-dword PRAMIN for small mirrors (≤64 KiB)
+    # to also verify bit-level correctness.  Skip write-only/scratch mirrors
+    # (out, TLS, heap) — the SM doesn't read them as data.
+    _warm_ro_only = os.environ.get("KEPLER_L2_WARM_RO_ONLY", "1") != "0"
+    _all_mirrors = getattr(dev, "_kepler_vram_mirrors", ()) or ()
+    # Mirrors list order: [a, b, out, temp, txc, code, *cbufs, *cwds].
+    # out (index 2) is write-only; temp (index 3) and txc (index 4) are scratch.
+    _skip_indices = {2, 3, 4} if _warm_ro_only else set()
     if (use_vram_inst and
         os.environ.get("KEPLER_DUMP_MIRROR_AB", "1") != "0"):
-      for _m in getattr(dev, "_kepler_vram_mirrors", ()) or ():
+      for _mi, _m in enumerate(_all_mirrors):
         _mpa = _m.meta.get("vram_pa")
-        if _mpa is None or _m.size > 0x100:
+        if _mpa is None or _m.size > 0x100000:
+          continue
+        # Skip write-only output and scratch (TLS/heap) — SM doesn't read them.
+        if _mi in _skip_indices:
           continue
         try:
           _want = bytes(_m.cpu_view()[:_m.size])
         except Exception:
           continue
+        # H23: per-dword PRAMIN reads warm L2 with correct data for the SM
+        # to hit.  Cap at 128 KiB per mirror (= L2 size): warming more is
+        # pointless since L2 can't hold it, and the SM fetches the rest
+        # from VRAM on L2 miss (VRAM is correct via PRAMIN writes).
+        # Full verify for ≤128 KiB; head-only for larger mirrors.
+        # H23g: KEPLER_L2_WARM_VIA_BAR1=1 uses a single BAR1 bulk read
+        # instead of per-dword PRAMIN reads (1 RPC vs 16384).  BAR1 reads
+        # go through L2 and warm it with correct VRAM data.  BAR1 bulk
+        # reads are reliable up to 128 KiB; 256 KiB corrupts (H23b/OQ2).
+        # H26: LTC invalidate (0x70004) is not the desktop coherency
+        # mechanism (Nouveau only calls it on GK20a); BAR1 read-through
+        # is the correct L2 warming approach for this platform.
+        _warm_n = min(_m.size, 0x20000)
         _got = bytearray(_m.size)
-        for _off in range(0, _m.size, 4):
-          struct.pack_into("<I", _got, _off,
-                          _gk104_pramin_read32(dev, _mpa + _off,
-                                               force_bar0=True))
+        if os.environ.get("KEPLER_L2_WARM_VIA_BAR1", "1") == "1" and _warm_n <= 0x20000:
+          _got[:_warm_n] = dev.dev_impl.hw.mmio_read(1, _mpa, _warm_n)
+        else:
+          for _off in range(0, _warm_n, 4):
+            struct.pack_into("<I", _got, _off,
+                            _gk104_pramin_read32(dev, _mpa + _off,
+                                                 force_bar0=True))
         _xors = []
-        for _off in range(0, _m.size, 4):
+        for _off in range(0, _warm_n, 4):
           _w = struct.unpack_from("<I", _want, _off)[0]
           _g = struct.unpack_from("<I", _got, _off)[0]
           if _w != _g:
@@ -12973,7 +13095,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           _gk104_bar_flush(dev)
           time.sleep(0.002)
           _xors2 = []
-          for _off in range(0, _m.size, 4):
+          for _off in range(0, _warm_n, 4):
             _w = struct.unpack_from("<I", _want, _off)[0]
             _g = _gk104_pramin_read32(dev, _mpa + _off, force_bar0=True)
             struct.pack_into("<I", _got, _off, _g)
@@ -13019,6 +13141,16 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         # BAR1 precisely so GP_PUT can be written through the CPU aperture.
         if os.environ.get("KEPLER_SUBMIT_FE_PWR", "1") != "0":
           _gk104_fe_pwr_force_on(dev)
+        # H23: final L2 invalidate (drop, no writeback) right before GP_PUT so
+        # the SM loads fresh VRAM, not stale L2 lines re-cached by PTE/RAMFC
+        # BAR1 traffic between mirror-stabilize and launch.
+        # H23f: skip if KEPLER_SKIP_FINAL_LTC_INV=1 to test whether the
+        # invalidate drops the warmed L2 lines (making pre-GP_PUT warming
+        # appear necessary when it's actually the invalidate causing the
+        # re-pollution).
+        if os.environ.get("KEPLER_SKIP_FINAL_LTC_INV", "0") != "1":
+          if not _gk104_ltc_invalidate(dev, flush=False):
+            print("[kepler] WARN: pre-GP_PUT LTC invalidate timed out", flush=True)
         dev.dev_impl.hw.mmio_write(
             1, _userd_mmio_base + USERD_GP_PUT, struct.pack("<I", _gp_put_initial))
         _gk104_bar_flush(dev)
@@ -13044,6 +13176,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"get={_get_phys:#x}/{_get_bar:#x} "
             f"put={_put_phys:#x}/{_put_bar:#x}")
     else:
+      if not _gk104_ltc_invalidate(dev, flush=False):
+        print("[kepler] WARN: pre-GP_PUT LTC invalidate timed out", flush=True)
       dev.dev_impl.hw.mmio_write(1, _userd_mmio_base + USERD_GP_PUT,
                                  struct.pack("<I", _gp_put_initial))
       _gk104_bar_flush(dev)
@@ -13601,6 +13735,12 @@ def _run_hardware_demo_windows(dev, cubin, a_host, b_host, chunk, window_chunks)
           cur.close()
         except Exception as e:
           print(f"[kepler] window close: {e}", flush=True)
+        # H25: sleep between windows to let USB4 transport recover.
+        # 64+ rapid device open/close cycles crashed macOS.
+        _inter_win_sleep = float(
+            os.environ.get("KEPLER_INTER_WINDOW_SLEEP", "0.5"))
+        if _inter_win_sleep > 0:
+          time.sleep(_inter_win_sleep)
         os.environ["KEPLER_ALLOW_DIRTY"] = "1"
         cur = NVDevice("NV", backend=backend)
       os.environ["KEPLER_N"] = str(n_win)
@@ -13657,12 +13797,18 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   if chunk <= 0 or chunk > 1024:
     raise ValueError(f"invalid KEPLER_BLOCK={chunk}; expected 1..1024")
   n_chunks = (N + chunk - 1) // chunk
-  _one_ib_max = int(os.environ.get("KEPLER_LAUNCH_ONE_IB_MAX", "19"), 0)
+  # H23: GK104 L2 is 128 KiB.  a+b = N*8 bytes must fit in L2 for the PRAMIN
+  # read-through L2 warming to cover all elements.  Max N for multi-CTA =
+  # 128 KiB / 8 = 16384.  Max chunks per window = 16384 / chunk = 16.
+  _l2_max_elements = int(os.environ.get("KEPLER_L2_MAX_ELEMENTS", "16384"), 0)
+  _l2_max_chunks = max(1, _l2_max_elements // chunk)
+  _one_ib_max = int(os.environ.get("KEPLER_LAUNCH_ONE_IB_MAX",
+                                    str(_l2_max_chunks)), 0)
   _ib_max = int(os.environ.get("KEPLER_LAUNCH_IB_MAX", "16"), 0)
   if _ib_max <= 0:
     _ib_max = max(_one_ib_max, 1)
   _mcta_auto_max = int(os.environ.get("KEPLER_MULTI_CTA_AUTO_MAX",
-                                      str(_n_max)), 0)
+                                      str(_l2_max_elements)), 0)
   _mcta = os.environ.get("KEPLER_MULTI_CTA", "auto").lower()
   if _mcta in ("1", "true", "yes", "on"):
     use_multi_cta = True
@@ -13694,6 +13840,14 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
       and test_stage == "full-add"):
     # Build hosts once (same RNG as a single-shot run), then reopen the
     # device between ≤19-LAUNCH windows.
+    _n_wins_check = (n_chunks + _one_ib_max - 1) // _one_ib_max
+    _max_wins = int(os.environ.get("KEPLER_MAX_WINDOWS", "32"), 0)
+    if _n_wins_check > _max_wins:
+      raise ValueError(
+          f"N={N} requires {_n_wins_check} channel windows but "
+          f"KEPLER_MAX_WINDOWS={_max_wins} (64+ windows crash macOS via "
+          f"TinyGPU USB4 transport exhaustion). Reduce N or raise "
+          f"KEPLER_MAX_WINDOWS.")
     if _hosts is not None:
       a_host, b_host = _hosts
     else:
@@ -14327,7 +14481,10 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
             f"w7={struct.unpack_from('<I', _cwd, 0x1c)[0]:#x} "
             f"w8={struct.unpack_from('<I', _cwd, 0x20)[0]:#x} "
             f"gridxy={struct.unpack_from('<II', _cwd, 0x30)}", flush=True)
+      _b_pa = b_dev.meta.get("vram_pa")
       print(f"[kepler] mirror verify a_pa={_a_pa:#x} head={_b1(_a_pa).hex()}",
+            flush=True)
+      print(f"[kepler] mirror verify b_pa={_b_pa:#x} head={_b1(_b_pa).hex()}",
             flush=True)
       print(f"[kepler] mirror verify cbuf_pa={_cbuf_pa:#x} "
             f"params140={_b1(_cbuf_pa, 0x160)[0x140:0x158].hex()}", flush=True)
@@ -14337,7 +14494,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
             f"CTXCTL=0x{dev.read32(0x409c00):08x}", flush=True)
       # Channel PTE vs mirror PA: if SM used a stale SYS PTE, mirror stays sentinel.
       _pgd = getattr(dev, "_kepler_cloned_by_pgd", None) or {}
-      for _nm, _buf in (("out", out_dev), ("code", code_dev), ("cbuf", cbuf_devs[0]),
+      for _nm, _buf in (("a", a_dev), ("b", b_dev), ("out", out_dev),
+                        ("code", code_dev), ("cbuf", cbuf_devs[0]),
                         ("cwd", cwd_devs[0])):
         _va = _buf.va_addr
         _spt = _pgd.get((_va >> 27) & 0x1fff)
@@ -14904,14 +15062,15 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
 
 def _tinygpu_sock_reachable(sock_path=None, timeout_s=0.2):
   sock_path = sock_path or _temp_sock()
+  s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
   try:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout_s)
     s.connect(sock_path)
-    s.close()
     return True
   except OSError:
     return False
+  finally:
+    s.close()
 
 def _ensure_tinygpu_server():
   """Start TinyGPU.app's shared server if /tmp/tinygpu.sock is missing.
