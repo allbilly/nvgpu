@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone NV stack for a GTX 660 Ti (Kepler GK104 / NVE4, sm_30).
-
-Fork of ``examples_kepler/add.py`` (GTX 770 / Palit strap-6 golden) with the
-board-specific defaults this eGPU actually needs:
-
-  - live ``0x101000`` RAMCFG group **5** (not the Palit 770 pin of 6)
-  - 7-TPC fuse map (``[2,2,2,1]``) is read from HW; do not assume 8 SM
-  - PCI id ``0x1183`` (660 Ti); some runs may show ``0x1184`` after a foreign
-    (Palit 770) BIT-I POST rewrote identity — refuse that ROM on this board
-  - this enclosure's card is Gigabyte ``1458:3556`` (GV-N66TWF2-2GD class);
-    cold POST must use the onboard PROM (dumped) or a matching 0x1183 VBIOS,
-    never the Palit GTX770 image
-
+"""Standalone NV stack for a GTX 660 Ti (Kepler GK104 / NVE4, sm_30).  Fork of ``examples_kepler/add.py`` (GTX 770 / Palit strap-6 golden) with board-specific defaults: live 0x101000 RAMCFG group 5 (not Palit 770 pin 6); 7-TPC fuse map [2,2,2,1] read from HW; PCI id 0x1183 (660 Ti), Gigabyte 1458:3556 — cold POST must use onboard PROM (dumped) or a matching 0x1183 VBIOS, never the Palit GTX770 image.
 Self-contained like ``examples/add.py``.  Transport is platform-selected:
 
   - macOS: TinyGPU.app DriverKit Unix socket (``/tmp/tinygpu.sock``)
@@ -70,13 +58,11 @@ SHARED_KEPLER_DIR = SCRIPT_DIR  # assets + nvbios_init live beside this file
 TINYGRAD_ROOT = os.path.join(REPO_ROOT, "ref")
 for _path in (TINYGRAD_ROOT, SHARED_KEPLER_DIR):
   if _path not in sys.path: sys.path.insert(0, _path)
-# Palit 770 is the add.py / offline golden only.  Live 660 Ti cold POST must
-# use onboard PROM (dumped to ONBOARD_VBIOS_CACHE) or an explicit KEPLER_VBIOS.
+# Palit 770 is the offline golden only; live 660 Ti cold POST uses onboard PROM (ONBOARD_VBIOS_CACHE) or explicit KEPLER_VBIOS.
 PALIT_770_VBIOS = os.path.join(SHARED_KEPLER_DIR, "Palit.GTX770.4096.131216.rom")
 ONBOARD_VBIOS_CACHE = os.path.join(SHARED_KEPLER_DIR, "onboard_gk104.rom")
 DEFAULT_VBIOS = PALIT_770_VBIOS
-# Gigabyte GTX 660 Ti WindForce (TechPowerUp #128422) observed on this enclosure.
-GIGABYTE_660TI_SUBSYS = 0x35561458  # little-endian config dword: vend|dev
+GIGABYTE_660TI_SUBSYS = 0x35561458  # Gigabyte GTX 660 Ti WindForce (TechPowerUp #128422); little-endian vend|dev
 DEFAULT_CUBIN = os.path.join(SHARED_KEPLER_DIR, "add_kepler.cubin")
 DEFAULT_MUL_CUBIN = os.path.join(SHARED_KEPLER_DIR, "mul_kepler.cubin")
 # Reference produced by CUDA 10.2 `ptxas -arch=sm_30` for the multiply
@@ -501,11 +487,8 @@ def cubin_register_count(blob, kernel):
 # ============================================================================
 PAGESIZE = 0x1000
 
-# GK104 PCI device ids — used by Linux probe() when NV_PCIBDF is unset.
-# 0x1183 = GTX 660 Ti; 0x1184 = GTX 770 (some fused 7-TPC boards still report it).
-GK104_PCI_IDS = {
-    0x1180, 0x1183, 0x1184, 0x1185, 0x1187, 0x1188, 0x1189, 0x118e, 0x1195,
-}
+# GK104 PCI device ids for Linux probe() when NV_PCIBDF is unset.  0x1183 = GTX 660 Ti; 0x1184 = GTX 770 (some fused 7-TPC boards still report it).
+GK104_PCI_IDS = {0x1180, 0x1183, 0x1184, 0x1185, 0x1187, 0x1188, 0x1189, 0x118e, 0x1195}
 
 
 class RemotePCIDevice:
@@ -1285,8 +1268,7 @@ class PCIIfaceBase:
 KEPLER_CHANNEL_GROUP_A  = 0xa06c
 KEPLER_CHANNEL_GPFIFO_A = 0xa06f
 KEPLER_COMPUTE_A        = 0xa0c0
-# Default matches full GK104 GTX 770 (8 SM).  660 Ti fuse maps are often 7;
-# live bring-up overwrites via NVDevice._gk104_mp_count after GR topology read.
+# Default matches full GK104 GTX 770 (8 SM); 660 Ti fuse maps are often 7, overwritten via NVDevice._gk104_mp_count after GR topology read.
 GK104_MP_COUNT           = 8
 GK104_MAX_WARPS_PER_MP   = 64
 GK104_CRS_BYTES_PER_WARP = 0x800
@@ -1297,13 +1279,7 @@ KEPLER_DMA_COPY_A       = 0xa0b5
 
 
 def _gk104_mp_count_for(dev=None, default=GK104_MP_COUNT) -> int:
-  """Return the live SM/MP count (sum of per-GPC TPC enables).
-
-  Mesa's nve4_compute_setup uses ``screen->mp_count`` from GRAPH_UNITS
-  (``(mp_count << 8) | gpc_count``), not a hard-coded 8.  GTX 660 Ti fuse
-  maps commonly report 7 TPCs; programming TEMP as if there were 8 SMs
-  mismatches SKED's view of the floorswept topology.
-  """
+  """Return the live SM/MP count (sum of per-GPC TPC enables).  Mesa's nve4_compute_setup uses screen->mp_count from GRAPH_UNITS, not a hard-coded 8.  GTX 660 Ti fuse maps commonly report 7 TPCs; programming TEMP as if there were 8 SMs mismatches SKED's view of the floorswept topology."""
   env = os.environ.get("KEPLER_MP_COUNT", "").strip()
   if env:
     return max(1, int(env, 0))
@@ -1314,8 +1290,7 @@ def _gk104_mp_count_for(dev=None, default=GK104_MP_COUNT) -> int:
     try:
       gpc_nr = dev.read32(0x409604) & 0x1f
       if gpc_nr:
-        total = sum(dev.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f
-                    for g in range(gpc_nr))
+        total = sum(dev.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f for g in range(gpc_nr))
         if total:
           return total
     except Exception:
@@ -1649,10 +1624,8 @@ class NVDevice:
     image = None
     scripts = None
     if _need_vbios_image:
-      # Prefer onboard PROM whenever the cache is missing (SPI flash is still
-      # the Gigabyte image even after a foreign BIT-I flipped PCI id to 0x1184).
-      vbios_path = _gk104_resolve_vbios_path(
-          self, allow_dump=not os.path.exists(ONBOARD_VBIOS_CACHE))
+      # Prefer onboard PROM whenever the cache is missing (SPI flash is still the Gigabyte image even after a foreign BIT-I flipped PCI id to 0x1184).
+      vbios_path = _gk104_resolve_vbios_path(self, allow_dump=not os.path.exists(ONBOARD_VBIOS_CACHE))
       os.environ["KEPLER_VBIOS"] = vbios_path
       print(f"[kepler] VBIOS image: {vbios_path}", flush=True)
       image, _, scripts = vbios_init_info(vbios_path)
@@ -2208,20 +2181,14 @@ class NVDevice:
     # In particular, the FECS/GPC exception routing is also how context-switch
     # work reaches the GPCCS falcons; without it GPCCS remains in wait (0x50b).
     gpc_nr = self.read32(0x409604) & 0x1f
-    tpc_nr = [self.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f
-              for g in range(gpc_nr)]
+    tpc_nr = [self.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f for g in range(gpc_nr)]
     rop_nr = (self.read32(0x409604) >> 16) & 0x1f
     tpc_total = sum(tpc_nr)
     if gpc_nr == 0 or tpc_total == 0:
-      raise RuntimeError(
-          f"GK104 GR topology unusable after init: gpc_nr={gpc_nr} tpc_nr={tpc_nr} "
-          f"topo={self.read32(0x409604):#x}")
-    try:
-      setattr(self, "_gk104_mp_count", tpc_total)
-    except Exception:
-      pass
-    print(f"[kepler] live MP/TPC count={tpc_total} (gpc={gpc_nr} tpc_nr={tpc_nr})",
-          flush=True)
+      raise RuntimeError(f"GK104 GR topology unusable after init: gpc_nr={gpc_nr} tpc_nr={tpc_nr} topo={self.read32(0x409604):#x}")
+    try: setattr(self, "_gk104_mp_count", tpc_total)
+    except Exception: pass
+    print(f"[kepler] live MP/TPC count={tpc_total} (gpc={gpc_nr} tpc_nr={tpc_nr})", flush=True)
     row, tile = _gk104_grctx_tiles(tpc_nr)
     # VSC stream master + GF117 zcull setup.
     self.write32(0x503018, 1)
@@ -2342,34 +2309,17 @@ class NVDevice:
       _gk104_require_bar0_live(self, "after BLCG bulk clear")
     _gk104_require_bar0_live(self, "before falcon load")
     print(f"[kepler] before falcon load: FECS_CTRL={self.read32(0x409100):#x} GPCCS_CTRL={self.read32(0x41a100):#x} PGRAPH_CTRL={self.read32(0x400500):#x} PGRAPH_STATUS={self.read32(0x400000):#x} RED_SWITCH={self.read32(0x409614):#x}")
-    # ponytail: If the FECS is stuck in an EFI overlay from a previous failed
-    # run, reset the falcon via CPUCTL RESET bit (bit 7).  The GR reset (PMC
-    # bit 12 toggle) doesn't reset the falcon PC — it preserves IMEM/ITLB/PC.
-    # The falcon RESET clears the PC and ITLB, allowing a clean firmware reload.
-    #
-    # envytools falcon.xml uc_cpuctl: bit4=STOPPED, bit5=SLEEPING.  STOPPED is
-    # the normal park state after FECS posts ready — NOT a wedge.  The old
-    # `CPUCTL & 0x10` check forced IMEM reload+restart on every warm open and
-    # left FECS_MMIO_CTRL=0x40404170 (FE_PWR address leaked) with sticky GPC
-    # busy on SET_OBJECT.  Healthy warm keeps GPCCS_CTRL=0x10 and
-    # FECS_MMIO_CTRL in the 0x005xxxxx GPC window.
+    # envytools falcon.xml uc_cpuctl: bit4=STOPPED is normal park after FECS posts ready — NOT a wedge.  Healthy warm keeps GPCCS_CTRL=0x10 and FECS_MMIO_CTRL in the 0x005xxxxx GPC window; 0 and 0x40404170 (FE_PWR leaked) both mean ctxctl can't talk to GPCs — must reload+start.
     _fecs_pc = self.read32(0x409ff0)
     _fecs_cpuctl_pre = self.read32(FECS_FALCON_BASE + 0x100)
     _fecs_mmio_ctrl = self.read32(0x409728)
     _fecs_scratch0_now = self.read32(0x409800)
     _fecs_still_ready = bool(_fecs_scratch0_now & 0x80000000)
     _fecs_efi_overlay = _fecs_pc > 0x8000
-    # Healthy FECS MMIO window points into GPC space (0x005xxxxx), e.g.
-    # 0x00502800 / 0x0051a800.  0 and 0x40404170 (FE_PWR address leaked) both
-    # mean ctxctl cannot talk to GPCs — must reload+start.
-    _fecs_mmio_sane = ((_fecs_mmio_ctrl & 0xfff00000) == 0x00500000)
+    _fecs_mmio_sane = (_fecs_mmio_ctrl & 0xfff00000) == 0x00500000
     _force_reload = os.environ.get("KEPLER_FORCE_RELOAD") == "1"
-    # Re-check ready at falcon-load time: early _fecs_already_ready can go
-    # stale after the second PGRAPH/pgob path clears SCRATCH0 while leaving
-    # CPUCTL=STOPPED, which previously warm-kept a dead FECS.
-    _need_falcon_reload = (
-        (not _posted) or (not _fecs_still_ready) or _force_reload
-        or _fecs_efi_overlay or (not _fecs_mmio_sane))
+    # Re-check ready at falcon-load time: early _fecs_already_ready can go stale after the second PGRAPH/pgob path clears SCRATCH0 while leaving CPUCTL=STOPPED.
+    _need_falcon_reload = ((not _posted) or (not _fecs_still_ready) or _force_reload or _fecs_efi_overlay or (not _fecs_mmio_sane))
     if _posted and _fecs_efi_overlay:
       print(f"[kepler] FECS EFI-overlay wedge (PC={_fecs_pc:#x} CPUCTL={_fecs_cpuctl_pre:#x}), resetting falcon", flush=True)
       self.write32(FECS_FALCON_BASE + 0x100, 0x00000080)  # RESET
@@ -2380,21 +2330,15 @@ class NVDevice:
       _cpuctl_after = self.read32(FECS_FALCON_BASE + 0x100)
       print(f"[kepler] After falcon reset: PC={_pc_after:#x} CPUCTL={_cpuctl_after:#x}", flush=True)
     elif not _fecs_mmio_sane:
-      print(f"[kepler] FECS_MMIO_CTRL not sane ({_fecs_mmio_ctrl:#x}); forcing falcon reload",
-            flush=True)
+      print(f"[kepler] FECS_MMIO_CTRL not sane ({_fecs_mmio_ctrl:#x}); forcing falcon reload", flush=True)
     elif not _fecs_still_ready:
-      print(f"[kepler] FECS not ready (SCRATCH0={_fecs_scratch0_now:#x} "
-            f"CPUCTL={_fecs_cpuctl_pre:#x} MMIO_CTRL={_fecs_mmio_ctrl:#x}); "
-            f"loading+starting falcons", flush=True)
+      print(f"[kepler] FECS not ready (SCRATCH0={_fecs_scratch0_now:#x} CPUCTL={_fecs_cpuctl_pre:#x} MMIO_CTRL={_fecs_mmio_ctrl:#x}); loading+starting falcons", flush=True)
     else:
-      print(f"[kepler] FECS warm-keep (PC={_fecs_pc:#x} CPUCTL={_fecs_cpuctl_pre:#x} "
-            f"MMIO_CTRL={_fecs_mmio_ctrl:#x} GPCCS={self.read32(0x41a100):#x})",
-            flush=True)
+      print(f"[kepler] FECS warm-keep (PC={_fecs_pc:#x} CPUCTL={_fecs_cpuctl_pre:#x} MMIO_CTRL={_fecs_mmio_ctrl:#x} GPCCS={self.read32(0x41a100):#x})", flush=True)
     # Clear ALL stale code TLB entries from previous runs.  ITLB(physidx)
     # clears the TLB entry for a physical page [envytools: falcon/vm.html].
     # Without this, duplicate virt->phys mappings cause multihit faults.
-    # Clear ITLB only when we are about to reload IMEM.  Blasting TLB entries
-    # on a warm-kept FECS that is already STOPPED parks the wrong mappings.
+    # Clear ITLB only when we are about to reload IMEM — blasting TLB entries on a warm-kept FECS that is already STOPPED parks the wrong mappings.
     if _posted and _need_falcon_reload:
       _pages = self.read32(FECS_FALCON_BASE + 0x108) & 0x1ff
       # ponytail: Clear all 512 possible ITLB entries, not just _pages.
@@ -2517,32 +2461,15 @@ class NVDevice:
       _dmem_exp = [struct.unpack_from('<I', fecs_data, i)[0] for i in range(0, 16, 4)]
       print(f"[kepler] FECS DMEM verify: read={[hex(x) for x in _dmem_rb]} expected={[hex(x) for x in _dmem_exp]} match={_dmem_rb == _dmem_exp}")
       self.write32(0x409800, 0x00000000)
-      # FECS-only start after reload (matches add-660ti-013040 which got
-      # FECS_MMIO_CTRL=0x0051a800).  Host-starting GPCCS here made
-      # discover_image_size return 0 with mailbox stuck at 0x8c000.
-      _cpuctl_after_reset = self.read32(FECS_FALCON_BASE + 0x100)
-      print(f"[kepler] FECS CPUCTL before start: 0x{_cpuctl_after_reset:08x}", flush=True)
+      # FECS-only start after reload (host-starting GPCCS here made discover_image_size return 0 with mailbox stuck at 0x8c000).
       self.write32(FECS_FALCON_BASE + FALCON_UC_CTRL, 0x00000000)
       self.write32(FECS_FALCON_BASE + 0x004, 0xffffffff)
       self.write32(FECS_FALCON_BASE + 0x014, 0xffffffff)
       self.write32(FECS_FALCON_BASE + 0x10c, 0x00000000)
       self.write32(FECS_FALCON_BASE + FALCON_UC_ENTRY, 0)
       self.write32(FECS_FALCON_BASE + FALCON_UC_CTRL, FALCON_UC_CTRL_START)
-      print(f"[kepler] FECS started immediately after DMEM+csdata load")
       print(f"[kepler] after FECS start: FECS_CTRL=0x{self.read32(0x409100):08x} FECS_SIGNAL=0x{self.read32(0x409400):08x} GPCCS_CTRL=0x{self.read32(0x41a100):08x} FECS_MMIO_BASE=0x{self.read32(0x409724):08x} FECS_MMIO_CTRL=0x{self.read32(0x409728):08x} ACCESS_EN=0x{self.read32(0x409048):08x} INTR=0x{self.read32(0x409008):08x} IRQMSET=0x{self.read32(0x409010):08x} IRQMASK=0x{self.read32(0x409018):08x} HWCFG2=0x{self.read32(0x40916c):08x} CPUSTAT=0x{self.read32(0x409128):08x} XFER_STATUS=0x{self.read32(0x409120):08x}")
-      _fe_pwr_after_start = self.read32(0x404170)
-      print(f"[kepler] FE_PWR after FECS start: {_fe_pwr_after_start:#x}", flush=True)
       import time as _time
-      pcs = []
-      for _ in range(10):
-        pcs.append(self.read32(0x409ff0))
-        _time.sleep(0.001)
-      print(f"[kepler] FECS PC samples after start: {[hex(p) for p in pcs]}")
-      for gpc in range(4):
-        gpc_base = 0x502000 + gpc * 0x8000
-        print(f"[kepler] GPC{gpc} fuc: CTRL={self.read32(gpc_base+0x100):#x} ENTRY={self.read32(gpc_base+0x104):#x} "
-              f"SCRATCH0={self.read32(gpc_base+0x800):#x} SCRATCH1={self.read32(gpc_base+0x804):#x} "
-              f"BLOCK={self.read32(gpc_base+0x10c):#x}")
       def _fecs_ready_with_gpc3_workaround():
         if falcon_ready(self, FECS_FALCON_BASE):
           return True
@@ -2554,13 +2481,10 @@ class NVDevice:
             _time.sleep(0.01)
         return falcon_ready(self, FECS_FALCON_BASE)
       try:
-        wait_cond(_fecs_ready_with_gpc3_workaround,
-                  timeout_ms=10000, msg="FECS ready (0x409800 bit31)")
+        wait_cond(_fecs_ready_with_gpc3_workaround, timeout_ms=10000, msg="FECS ready (0x409800 bit31)")
       except TimeoutError:
         rd = lambda o: self.read32(o)
-        print(f"[kepler] FECS NOT ready. CPUCTL(0x409100)={rd(0x409100):#x} "
-              f"MB0(0x409800)={rd(0x409800):#x} MMIO_CTRL(0x409728)={rd(0x409728):#x} "
-              f"GPCCS={rd(0x41a100):#x}", flush=True)
+        print(f"[kepler] FECS NOT ready. CPUCTL(0x409100)={rd(0x409100):#x} MB0(0x409800)={rd(0x409800):#x} MMIO_CTRL(0x409728)={rd(0x409728):#x} GPCCS={rd(0x41a100):#x}", flush=True)
         raise
     else:
       # Warm-keep: FECS already ready with sane MMIO_CTRL; do not reload/restart.
@@ -2582,18 +2506,14 @@ class NVDevice:
     print(f"[kepler] FE_PWR after FECS ready: {_fe_pwr_ready:#x} "
           f"idle_filter={self.read32(0x020288):#x}", flush=True)
     self.write32(FECS_FALCON_BASE + 0x048, 0x00000003)
-    # Wait out transient FECS MMIO (e.g. WRITE to FE_PWR → 0x40404170) before
-    # discover; method 0x10 returns 0 while the window is not in GPC space.
+    # Wait out transient FECS MMIO (e.g. WRITE to FE_PWR → 0x40404170) before discover; method 0x10 returns 0 while the window is not in GPC space.
     for _ in range(50):
       _mc = self.read32(0x409728)
       if (_mc & 0xfff00000) == 0x00500000 or _mc == 0:
         break
       time.sleep(0.002)
     _mailbox_size = self.read32(0x409804)
-    # H9: always run Nouveau gf100_gr_fecs_discover_image_size (method 0x10 →
-    # size in 0x409800).  Mailbox 0x409804 alone can be stale on warm-keep or
-    # wrong for this die's floorsweep; GTX 770 notes used 0x2c400 while 660 Ti
-    # often reports 0x29b00 (7 SM).  Override with KEPLER_GR_CTX_SIZE=0x….
+    # H9: always run Nouveau gf100_gr_fecs_discover_image_size; mailbox can be stale on warm-keep.  Override with KEPLER_GR_CTX_SIZE=0x….
     _ready = self.read32(0x409800)
     self.write32(0x409800, 0x00000000)
     self.write32(0x409500, 0x00000000)
@@ -2605,29 +2525,21 @@ class NVDevice:
         break
       time.sleep(0.001)
     if not (0 < ctx_size <= 0x80000):
-      # Do NOT forge SCRATCH0 bit31 — that made warm-skip look "ready" and
-      # then hung ctx_chan.  Prefer a sane mailbox, else known 660 Ti size.
+      # Do NOT forge SCRATCH0 bit31 — that made warm-skip look "ready" and then hung ctx_chan.  Prefer a sane mailbox, else known 660 Ti size.
       _fallback = (_mailbox_size if 0 < _mailbox_size <= 0x80000 else 0x29b00)
       if not (_ready & 0x80000000):
-        raise RuntimeError(
-            f"FECS discover_image_size failed (got {ctx_size:#x}) and FECS "
-            f"was not ready (SCRATCH0 was {_ready:#x})")
-      print(f"[kepler] FECS discover_image_size failed "
-            f"(got {ctx_size:#x}, mailbox={_mailbox_size:#x}); "
-            f"using fallback {_fallback:#x}", flush=True)
+        raise RuntimeError(f"FECS discover_image_size failed (got {ctx_size:#x}) and FECS was not ready (SCRATCH0 was {_ready:#x})")
+      print(f"[kepler] FECS discover_image_size failed (got {ctx_size:#x}, mailbox={_mailbox_size:#x}); using fallback {_fallback:#x}", flush=True)
       ctx_size = _fallback
     else:
-      print(f"[kepler] FECS discover_image_size={ctx_size:#x} "
-            f"(mailbox={_mailbox_size:#x}; ready was {_ready:#x})", flush=True)
+      print(f"[kepler] FECS discover_image_size={ctx_size:#x} (mailbox={_mailbox_size:#x}; ready was {_ready:#x})", flush=True)
     # discover overwrites 0x409800 with the size; restore ready bit.
     self.write32(0x409800, 0x80000000)
     _ov = os.environ.get("KEPLER_GR_CTX_SIZE", "").strip()
     if _ov:
       _forced = int(_ov, 0)
-      if not (0 < _forced <= 0x80000):
-        raise RuntimeError(f"invalid KEPLER_GR_CTX_SIZE={_ov!r}")
-      print(f"[kepler] GR ctx size override: discover={ctx_size:#x} "
-            f"→ forced={_forced:#x}", flush=True)
+      if not (0 < _forced <= 0x80000): raise RuntimeError(f"invalid KEPLER_GR_CTX_SIZE={_ov!r}")
+      print(f"[kepler] GR ctx size override: discover={ctx_size:#x} → forced={_forced:#x}", flush=True)
       ctx_size = _forced
     self.gr_ctx_size = ctx_size
     print(f"[kepler] GR ctx image size={ctx_size:#x}", flush=True)
@@ -2685,13 +2597,7 @@ class NVDevice:
           teardown("device close")
         except Exception:
           pass
-        # H27: unregister from atexit so accumulated windowed closures don't
-        # all fire at process exit.  teardown already ran (set _teardown_done),
-        # so the atexit call would be a no-op anyway, but unregistering
-        # prevents 64 stale closures from consuming atexit slots and avoids
-        # 2.5s join timeouts per unjoined window if close() wasn't called.
-        # Must run even if teardown raised, so the stale handler doesn't
-        # fire at exit.
+        # H27: unregister from atexit so accumulated windowed closures don't fire at process exit.  Teardown already ran (set _teardown_done), so the atexit call would be a no-op, but unregistering prevents 64 stale closures from consuming atexit slots and avoids 2.5s join timeouts per unjoined window if close() wasn't called.  Must run even if teardown raised.
         try:
           atexit.unregister(teardown)
         except Exception:
@@ -3354,22 +3260,17 @@ def _gk104_bar1_verify_top(dev, mapped_size=None) -> None:
       _gk104_bar_flush(dev)
       got = _gk104_pramin_read32(dev, top) & 0xffffffff
   except Exception as e:
-    raise RuntimeError(
-        f"BAR1 top R/W probe failed at {top:#x} (size={mapped_size:#x}): {e}")
+    raise RuntimeError(f"BAR1 top R/W probe failed at {top:#x} (size={mapped_size:#x}): {e}")
   if got != marker:
-    raise RuntimeError(
-        f"BAR1 top mismatch at {top:#x}: wanted={marker:#x} got={got:#x} "
-        f"via={'BAR1' if used_bar1 else 'PRAMIN'} size={mapped_size:#x}")
+    raise RuntimeError(f"BAR1 top mismatch at {top:#x}: wanted={marker:#x} got={got:#x} via={'BAR1' if used_bar1 else 'PRAMIN'} size={mapped_size:#x}")
   if used_bar1:
     try:
       via_pramin = _gk104_pramin_read32(dev, top) & 0xffffffff
       if via_pramin != marker:
-        print(f"[kepler] BAR1 top BAR1={got:#x} PRAMIN={via_pramin:#x} "
-              f"(BAR1 match; PRAMIN diverge ok if window)", flush=True)
+        print(f"[kepler] BAR1 top BAR1={got:#x} PRAMIN={via_pramin:#x} (BAR1 match; PRAMIN diverge ok if window)", flush=True)
     except Exception:
       pass
-  print(f"[kepler] BAR1 top R/W ok va={top:#x} size={mapped_size:#x} "
-        f"via={'BAR1' if used_bar1 else 'PRAMIN'}", flush=True)
+  print(f"[kepler] BAR1 top R/W ok va={top:#x} size={mapped_size:#x} via={'BAR1' if used_bar1 else 'PRAMIN'}", flush=True)
 
 
 def _pmu_wait_data_access(dev, value, timeout_s=0.25):
@@ -3772,12 +3673,10 @@ def vbios_init_info(path):
       pcir = struct.unpack_from("<H", raw, 0x18)[0]
       if raw[pcir:pcir + 4] == b"PCIR":
         device = struct.unpack_from("<H", raw, pcir + 6)[0]
-    except Exception:
-      pass
+    except Exception: pass
   image = nvbios_init.find_vbios_image(raw, device=device)
   scripts = nvbios_init.find_vbios_scripts(image)
-  print(f"vbios-init: image_bytes={len(image)} scripts={len(scripts)} "
-        f"pcir_device={device:#x}")
+  print(f"vbios-init: image_bytes={len(image)} scripts={len(scripts)} pcir_device={device:#x}")
   for i, script in enumerate(scripts):
     print(f"  script[{i}]={script:#x}")
   return image, 0, scripts
@@ -4454,9 +4353,7 @@ METHOD_NAMES = {
 def nvm(subchannel, method, *args, typ=2):
   return [(typ << 28) | (len(args) << 16) | (subchannel << 13) | (method >> 2), *args]
 
-# NV906F_SEMAPHORED: OPERATION_RELEASE | RELEASE_WFI_DIS (bit20).
-# NOT 0x01000002 — that sets RELEASE_SIZE_4BYTE (bit24) and leaves WFI enabled.
-# After SET_OBJECT/LAUNCH leaves PGRAPH sticky-busy, a WFI RELEASE never stores.
+# NV906F_SEMAPHORED: OPERATION_RELEASE | RELEASE_WFI_DIS (bit20) = 0x00100002.  NOT 0x01000002 (RELEASE_SIZE_4BYTE, bit24) — that leaves WFI enabled, and SET_OBJECT/LAUNCH leaves PGRAPH sticky-busy so a WFI RELEASE never stores.
 GK104_SEM_RELEASE_NO_WFI = 0x00100002
 
 def gk104_semaphore(addr, value, operation):
@@ -4481,38 +4378,18 @@ def build_launch_words(timeline_addr, wait_value, done_value, launch_desc_addr,
   return words
 
 
-def _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=None,
-                                tic_va=0):
+def _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=None, tic_va=0):
   """Mesa nve4_screen_compute_setup()-shaped methods shared by launch builders."""
   mp_count = int(mp_count or GK104_MP_COUNT)
   min_temp = mp_count * GK104_TEMP_PER_MP
-  assert temp_size >= min_temp and temp_size % mp_count == 0, (
-      f"temp_size={temp_size:#x} mp_count={mp_count} min={min_temp:#x}")
+  assert temp_size >= min_temp and temp_size % mp_count == 0, f"temp_size={temp_size:#x} mp_count={mp_count} min={min_temp:#x}"
   temp_per_mp = temp_size // mp_count
-  # Mesa programs the enable mask as 0xff; size is what tracks mp_count.
-  # TIC/TSC: Mesa always points these at a real VRAM heap even for pure
-  # global LD/ST kernels (TEX_CB_INDEX=7).  Leaving them 0 left SKED quiet
-  # but SMs never retired stores on this 660 Ti path.
-  words = [
-    *nvm(1, 0x0000, KEPLER_COMPUTE_A),            # SET_OBJECT: bind compute class
-    *nvm(1, 0x0790, temp_va >> 32, temp_va & 0xffffffff), # TEMP_ADDRESS HIGH/LOW
-    *nvm(1, 0x02e4, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), # MP_TEMP_SIZE[0]
-    *nvm(1, 0x02f0, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), # MP_TEMP_SIZE[1]
-    *nvm(1, 0x077c, 0xff << 24),                  # LOCAL_BASE
-    *nvm(1, 0x0214, 0xfe << 24),                  # SHARED_BASE
-    *nvm(1, 0x0310, 0x300),                       # SASS_VERSION (Kepler)
-  ]
+  # TIC/TSC: Mesa always points these at a real VRAM heap even for pure global LD/ST kernels (TEX_CB_INDEX=7).  Leaving them 0 left SKED quiet but SMs never retired stores on this 660 Ti path.
+  words = [*nvm(1, 0x0000, KEPLER_COMPUTE_A), *nvm(1, 0x0790, temp_va >> 32, temp_va & 0xffffffff), *nvm(1, 0x02e4, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), *nvm(1, 0x02f0, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), *nvm(1, 0x077c, 0xff << 24), *nvm(1, 0x0214, 0xfe << 24), *nvm(1, 0x0310, 0x300)]
   if tic_va:
     tsc_va = tic_va + 0x10000  # Mesa: TSC follows 2048*32B TIC entries
-    words.extend([
-      *nvm(1, 0x1574, tic_va >> 32, tic_va & 0xffffffff, 2047),  # TIC_ADDRESS
-      *nvm(1, 0x155c, tsc_va >> 32, tsc_va & 0xffffffff, 2047),  # TSC_ADDRESS
-    ])
-  words.extend([
-    *nvm(1, 0x2608, 7),                           # TEX_CB_INDEX (Mesa NVE4 setup)
-    *nvm(1, 0x1698, 0x00001011),                  # FLUSH CODE|GLOBAL|CB
-    *nvm(1, 0x1608, code_va >> 32, code_va & 0xffffffff), # CODE_ADDRESS HIGH/LOW
-  ])
+    words.extend([*nvm(1, 0x1574, tic_va >> 32, tic_va & 0xffffffff, 2047), *nvm(1, 0x155c, tsc_va >> 32, tsc_va & 0xffffffff, 2047)])
+  words.extend([*nvm(1, 0x2608, 7), *nvm(1, 0x1698, 0x00001011), *nvm(1, 0x1608, code_va >> 32, code_va & 0xffffffff)])
   return words
 
 
@@ -4530,8 +4407,7 @@ def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
   # batch reserved for experiments; default = all launches then one WFI.
   if batch is None:
     batch = int(os.environ.get("KEPLER_LAUNCH_BATCH", "0"), 0)
-  words = _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=mp_count,
-                                      tic_va=tic_va)
+  words = _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=mp_count, tic_va=tic_va)
   done = done_value
   n = len(launch_desc_addrs)
   for i, launch_desc_addr in enumerate(launch_desc_addrs):
@@ -4541,19 +4417,12 @@ def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
       *nvm(1, 0x0110, 0),                          # NV50_GRAPH_SERIALIZE
     ])
     if batch > 0 and ((i + 1) % batch == 0 or (i + 1) == n):
-      words.extend([
-        *gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI),
-      ])
+      words.extend([*gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI)])
       if (i + 1) < n:
         done += 1
   if batch <= 0:
-    # RELEASE_WFI=DIS: SET_OBJECT leaves PGRAPH_STATUS sticky-busy on this
-    # 7-TPC GK104, so a WFI RELEASE never stores even after SERIALIZE.  Rely
-    # on NV50_GRAPH_SERIALIZE above for method retirement; verify compute by
-    # reading the GPU-written output, not by WFI alone.
-    words.extend([
-      *gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI),
-    ])
+    # RELEASE_WFI=DIS: SET_OBJECT leaves PGRAPH_STATUS sticky-busy on this 7-TPC GK104, so a WFI RELEASE never stores even after SERIALIZE.  Rely on NV50_GRAPH_SERIALIZE above for method retirement; verify compute by reading the GPU-written output, not by WFI alone.
+    words.extend([*gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI)])
   words.extend([*nvm(0, 0x0020, 0)])
   return words, done
 
@@ -4572,10 +4441,7 @@ def build_multi_launch_ibs(timeline_addr, done_value, launch_desc_addrs,
   if ib_max is None:
     ib_max = int(os.environ.get("KEPLER_LAUNCH_IB_MAX", "16"), 0)
   if ib_max <= 0:
-    words, done = build_multi_launch_words(
-        timeline_addr, done_value, launch_desc_addrs,
-        code_va=code_va, temp_va=temp_va, temp_size=temp_size,
-        mp_count=mp_count, tic_va=tic_va)
+    words, done = build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs, code_va=code_va, temp_va=temp_va, temp_size=temp_size, mp_count=mp_count, tic_va=tic_va)
     return [words], done
   batches = []
   done = done_value
@@ -4584,8 +4450,7 @@ def build_multi_launch_ibs(timeline_addr, done_value, launch_desc_addrs,
     addrs = launch_desc_addrs[start:start + ib_max]
     words = []
     # Every IB re-binds compute state for same-channel staged GP_PUT.
-    words.extend(_gk104_compute_setup_words(
-        code_va, temp_va, temp_size, mp_count=mp_count, tic_va=tic_va))
+    words.extend(_gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=mp_count, tic_va=tic_va))
     for launch_desc_addr in addrs:
       words.extend([
         *nvm(1, 0x02b4, launch_desc_addr >> 8),
@@ -4596,10 +4461,7 @@ def build_multi_launch_ibs(timeline_addr, done_value, launch_desc_addrs,
     # Live: any WFI after the first IB's completion leaves the next IB's
     # semaphore unretired (GET advances, DMA_GET moves, sem stuck).  All
     # multi-IB semaphores use RELEASE_WFI=DIS; host still stages on the value.
-    words.extend([
-      *gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI),
-      *nvm(0, 0x0020, 0),
-    ])
+    words.extend([*gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI), *nvm(0, 0x0020, 0)])
     batches.append(words)
     if not last:
       done += 1
@@ -4640,8 +4502,7 @@ def build_cuda_param_cbuf(*ptrs, grid=(1, 1, 1), block=(1, 1, 1)):
   struct.pack_into(f"<{len(ptrs)}Q", cbuf, 0x140, *ptrs)
   return cbuf
 
-def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=0x200, regs=4,
-              cb7_addr=0, cb7_size=0x800):
+def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=0x200, regs=4, cb7_addr=0, cb7_size=0x800):
   """Build a GK104 Compute Work Descriptor (QMD) using the NVA0C0_QMDV00_06
   field layout from NVIDIA's cla0c0qmd.h, matching Mesa's
   nve4_compute_setup_launch_desc().
@@ -4707,10 +4568,9 @@ def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=0x200, re
   # Word 30 (0x78): CB_ADDR_UPPER(0) bits 7:0 + CB_SIZE(0) bits 31:15.
   field(960, 967, (cbuf_addr >> 32) & 0xff)
   field(975, 991, cbuf_size)
-  # Mesa always binds CB7 (driver aux) because TEX_CB_INDEX=7.
+  # Mesa always binds CB7 (driver aux) because TEX_CB_INDEX=7.  CB index i uses bits at +64*i from CB0's fields.
   if cb7_addr:
     field(640 + 7, 640 + 7, 1)  # CONSTANT_BUFFER_VALID(7)
-    # CB index i uses bits at +64*i from CB0's fields.
     field(928 + 7 * 64, 959 + 7 * 64, cb7_addr & 0xffffffff)
     field(960 + 7 * 64, 967 + 7 * 64, (cb7_addr >> 32) & 0xff)
     field(975 + 7 * 64, 991 + 7 * 64, cb7_size)
@@ -6763,28 +6623,10 @@ def _gk104_grctx_tiles(tpc_nr):
   return row, tile + [0xff] * (32 - len(tile))
 
 def _gk104_read_tpc_nr(dev, gpc_nr=None):
-  """Silicon TPC_NR per GPC, optionally overridden by KEPLER_FORCE_TPC_NR.
-
-  H2 discriminator: e.g. ``KEPLER_FORCE_TPC_NR=2`` or ``2,0,0,0`` forces a
-  reduced floorsweep.  If SET_OBJECT then idles (GPC_STATUS=0), the 7-SM
-  asymmetric map is causal; if it still hangs, look elsewhere (H1/H15).
-  """
+  """Silicon TPC_NR per GPC (sum of per-GPC TPC enables from 0x2608)."""
   if gpc_nr is None:
     gpc_nr = max(1, dev.read32(0x409604) & 0x1f)
-  tpc_nr = [dev.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f
-            for g in range(gpc_nr)]
-  _ov = os.environ.get("KEPLER_FORCE_TPC_NR", "").strip()
-  if not _ov:
-    return tpc_nr
-  forced = [int(x, 0) for x in _ov.split(",") if x.strip() != ""]
-  if not forced or any(n < 0 or n > 8 for n in forced):
-    raise RuntimeError(f"invalid KEPLER_FORCE_TPC_NR={_ov!r}")
-  if len(forced) < gpc_nr:
-    forced = forced + [0] * (gpc_nr - len(forced))
-  elif len(forced) > gpc_nr:
-    forced = forced[:gpc_nr]
-  print(f"[kepler] FORCE_TPC_NR: silicon={tpc_nr} → forced={forced}", flush=True)
-  return forced
+  return [dev.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f for g in range(gpc_nr)]
 
 
 def _gk104_grctx_floorsweep(dev, tpc_nr, ppc_tpc_mask):
@@ -6794,11 +6636,6 @@ def _gk104_grctx_floorsweep(dev, tpc_nr, ppc_tpc_mask):
 
   # gf100_gr_oneinit_sm_id orders SMs by TPC index, then GPC index.
   sm = 0
-  for gpc in range(gpc_nr):
-    # Explicitly clear disabled GPCs (H2 FORCE_TPC_NR zeros).
-    if tpc_nr[gpc] == 0:
-      dev.write32(0x500c08 + gpc * 0x8000, 0)
-      dev.write32(0x500c8c + gpc * 0x8000, 0)
   for tpc in range(max(tpc_nr) if tpc_nr else 0):
     for gpc in range(gpc_nr):
       if tpc >= tpc_nr[gpc]: continue
@@ -6873,12 +6710,10 @@ def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
   gpc_nr, tpc_total = len(tpc_nr), sum(tpc_nr)
   ppc_tpc_mask = [dev.read32(0x500c30 + gpc * 0x8000) & 0xff
                   for gpc in range(gpc_nr)]
-  # Prefer silicon PPC mask when non-zero; if TPC_NR was forced to 0 for a
-  # GPC (H2 discriminator), keep that GPC's PPC mask cleared.
-  ppc_tpc_mask = [
-      (0 if tpc_nr[gpc] == 0 else
-       (m or ((1 << tpc_nr[gpc]) - 1)))
-      for gpc, m in enumerate(ppc_tpc_mask)]
+  # A zero mask is not a valid active PPC; topology registers occasionally
+  # read late on this cold-attached card, so fall back to the known TPC mask.
+  ppc_tpc_mask = [m or ((1 << tpc_nr[gpc]) - 1)
+                  for gpc, m in enumerate(ppc_tpc_mask)]
   dev.write32(0x000260, 0)
   # Diagnostic: check if GR registers are accessible before writing.
   _test_read = dev.read32(0x404154)
@@ -6924,17 +6759,14 @@ def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
         f"{dev.read32(0x419004):#x} expected={pagepool_pa >> 8:#x} "
         f"bundle={dev.read32(0x408004):#x}/{dev.read32(0x418808):#x} "
         f"expected={bundle_pa >> 8:#x}", flush=True)
-  # 6. Attrib configuration (gf117_grctx_generate_attrib).
-  # Prefer channel-build attrib set (may be bit19-shrunk) so golden save and
-  # the per-channel mmio list write identical PPC+0xc0/0xe4 values (H16).
+  # 6. Attrib configuration (gf117_grctx_generate_attrib).  Prefer channel-build attrib set (may be bit19-shrunk) so golden save and per-channel mmio list write identical PPC+0xc0/0xe4 values (H16).
   _attr = getattr(dev, "_kepler_attrib", None) or {}
   alpha = int(_attr.get("alpha_nr", C["alpha_nr"]))
   beta = int(_attr.get("attrib_nr", C["attrib_nr"]))
   _anmax = int(_attr.get("attrib_nr_max", C["attrib_nr_max"]))
   _almax = int(_attr.get("alpha_nr_max", C["alpha_nr_max"]))
   if _attr:
-    print(f"[kepler] grctx attrib consts: alpha={alpha:#x} beta={beta:#x} "
-          f"anmax={_anmax:#x} almax={_almax:#x} (channel-build)", flush=True)
+    print(f"[kepler] grctx attrib consts: alpha={alpha:#x} beta={beta:#x} anmax={_anmax:#x} almax={_almax:#x} (channel-build)", flush=True)
   dev.write32(0x405830, (beta << 16) | alpha)
   dev.write32(0x4064c4, ((alpha // 4) << 16) | 0xffff)
   bo, ao = 0, _anmax * tpc_total
@@ -6947,12 +6779,8 @@ def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
     ao += _almax * count
   _ppc_e4 = [dev.read32(0x503000 + g * 0x8000 + 0xe4) for g in range(gpc_nr)]
   print(f"[kepler] grctx PPC+0xe4: {[hex(x) for x in _ppc_e4]}", flush=True)
-  # Preserve the LTC context registers in the generated image
-  # (Nouveau gk104_grctx_generate_patch_ltc).  After SET_OBJECT hang,
-  # FECS_MMIO_CTRL often shows a WRITE to 0x17e920; that is the last
-  # eng-ctx MMIO, not proof these self-writes are optional.
-  print(f"[kepler] LTC ctx preserve: 0x17e91c={dev.read32(0x17e91c):#x} "
-        f"0x17e920={dev.read32(0x17e920):#x}", flush=True)
+  # Preserve the LTC context registers (Nouveau gk104_grctx_generate_patch_ltc).  After SET_OBJECT hang, FECS_MMIO_CTRL often shows a WRITE to 0x17e920; that is the last eng-ctx MMIO, not proof these self-writes are optional.
+  print(f"[kepler] LTC ctx preserve: 0x17e91c={dev.read32(0x17e91c):#x} 0x17e920={dev.read32(0x17e920):#x}", flush=True)
   dev.write32(0x17e91c, dev.read32(0x17e91c))
   dev.write32(0x17e920, dev.read32(0x17e920))
   # 7. unkn (gk104_grctx_generate_unkn)
@@ -6965,8 +6793,7 @@ def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
   # 8. Topology-dependent floorsweep state.
   row, tile = _gk104_grctx_floorsweep(dev, tpc_nr, ppc_tpc_mask)
   _gpc_tpc_readback = dev.read32(0x405b00)
-  print(f"[kepler] grctx_main GPC/TPC: wrote {(tpc_total << 8) | gpc_nr:#x} "
-        f"readback {_gpc_tpc_readback:#x}", flush=True)
+  print(f"[kepler] grctx_main GPC/TPC: wrote {(tpc_total << 8) | gpc_nr:#x} readback {_gpc_tpc_readback:#x}", flush=True)
   # 9. floorsweep already performed gk104_grctx_generate_r419f78(); wait for
   # those topology writes to settle before entering ICMD mode.
   _gk104_gr_wait_idle(dev)
@@ -6986,14 +6813,11 @@ def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
   nvkm_mask(dev, 0x419cb8, 0x00007c00, 0x00000000)
   _idle_ok = _gk104_gr_wait_idle(dev)
   print(f"[kepler] grctx after step13: 0x40060c={dev.read32(0x40060c):#x} idle={_idle_ok} ctrl={dev.read32(0x400500):#x}", flush=True)
-  print(f"[kepler] grctx topology: tpc_nr={tpc_nr} ppc_masks="
-        f"{[hex(x) for x in ppc_tpc_mask]} row={row} tile={tile}", flush=True)
+  print(f"[kepler] grctx topology: tpc_nr={tpc_nr} ppc_masks={[hex(x) for x in ppc_tpc_mask]} row={row} tile={tile}", flush=True)
   _c08 = [dev.read32(0x500c08 + g * 0x8000) for g in range(gpc_nr)]
   _c8c = [dev.read32(0x500c8c + g * 0x8000) for g in range(gpc_nr)]
   _c30 = [dev.read32(0x500c30 + g * 0x8000) for g in range(gpc_nr)]
-  print(f"[kepler] grctx GPC TPC_NR: c08={[hex(x) for x in _c08]} "
-        f"c8c={[hex(x) for x in _c8c]} c30={[hex(x) for x in _c30]}",
-        flush=True)
+  print(f"[kepler] grctx GPC TPC_NR: c08={[hex(x) for x in _c08]} c8c={[hex(x) for x in _c8c]} c30={[hex(x) for x in _c30]}", flush=True)
 
 def _gk104_vmm_flush(dev):
   """Flush the GF100/GK104 page tables after populating new mappings."""
@@ -7067,13 +6891,7 @@ def _gk104_ensure_pmu_memx_ready(dev) -> None:
 
 
 def _gk104_pramin_write_memx(dev, pa, data) -> None:
-  """Store PRAMIN words via PMU MEMX WR32 (host 0x1700 after bit0 kills TinyGPU).
-
-  After deferred bit0, night14 showed host ``write32(0x1700, …)`` alone drops
-  BAR0.  MEMX already programs ``0x10f*`` safely; use it for the PRAMIN
-  window + XOR aperture stores.  Assume virgin ``0xffffffff`` after bit0
-  (night5) so each store is ``0xffffffff ^ wanted`` without a host readback.
-  """
+  """Store PRAMIN words via PMU MEMX WR32 (host 0x1700 after bit0 kills TinyGPU).  After deferred bit0, night14 showed host ``write32(0x1700, …)`` alone drops BAR0.  MEMX already programs ``0x10f*`` safely; use it for the PRAMIN window + XOR aperture stores.  Assume virgin ``0xffffffff`` after bit0 (night5) so each store is ``0xffffffff ^ wanted`` without a host readback."""
   _gk104_ensure_pmu_memx_ready(dev)
   data = memoryview(data).cast("B")
   if len(data) & 3:
@@ -7109,37 +6927,21 @@ def _gk104_pramin_write_memx(dev, pa, data) -> None:
       _gk104_require_bar0_live(dev, f"during MEMX PRAMIN exec={execs}")
   _gk104_require_bar0_live(dev, f"after MEMX PRAMIN @{pa:#x}")
   if not hasattr(dev, "ops"):
-    print(f"[kepler] PRAMIN via MEMX: pa={pa:#x} bytes={len(data)} "
-          f"execs={execs}", flush=True)
+    print(f"[kepler] PRAMIN via MEMX: pa={pa:#x} bytes={len(data)} execs={execs}", flush=True)
 
 
 def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
-  """Store framebuffer words through BAR0 PRAMIN and verify each result.
-
-  On the un-POSTed card, writes through 0x700000 sometimes behave as
-  XOR updates against the old framebuffer word (an uncleared 0xffffffff plus
-  value V becomes ~V).  Use current^wanted first, which is the correct delta
-  for that path, then fall back to a literal store if the aperture is behaving
-  normally.  Never return with silently inverted channel data.
-
-  When BAR1 identity is up, the default path substitutes verified BAR1 stores
-  (faster on TinyGPU).  H22: that substitute left mantissa bit15 sticky on
-  compute mirror `b` (pre-GP_PUT xor=0x8000).  Pass force_bar0=True for
-  eng-ctx / compute mirrors that must use the real 0x1700/0x700000 aperture.
-  """
+  """Store framebuffer words through BAR0 PRAMIN and verify each result.  On the un-POSTed card, writes through 0x700000 sometimes behave as XOR updates against the old framebuffer word (an uncleared 0xffffffff plus value V becomes ~V).  Use current^wanted first, which is the correct delta for that path, then fall back to a literal store if the aperture is behaving normally.  Never return with silently inverted channel data.  When BAR1 identity is up, the default path substitutes verified BAR1 stores (faster on TinyGPU).  That substitute left mantissa bit15 sticky on compute mirror `b` (pre-GP_PUT xor=0x8000).  Pass force_bar0=True for eng-ctx / compute mirrors that must use the real 0x1700/0x700000 aperture."""
   # TinyGPU: once BAR0 is all-ones, 0x1700/0x700000 pokes hang the USB4 path.
   # Deferred bit0 (after PGRAPH/FECS) must run before the first PRAMIN store.
   if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
     _gk104_bit0_unstub(dev)
   _gk104_require_bar0_live(dev, f"before PRAMIN store @{pa:#x}")
-  if (not force_bar0 and
-      getattr(dev, "_bar1_identity_ready", False)):
-    _gk104_bar1_write_verified(
-        dev, pa, data, label=f"BAR1 PRAMIN substitute @{pa:#x}")
+  if (not force_bar0 and getattr(dev, "_bar1_identity_ready", False)):
+    _gk104_bar1_write_verified(dev, pa, data, label=f"BAR1 PRAMIN substitute @{pa:#x}")
     return
   # Host 0x1700 after bit0 kills TinyGPU (night14); prefer MEMX WR32.
-  if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and
-      hasattr(dev, "pmu_memx_exec_commands")):
+  if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and hasattr(dev, "pmu_memx_exec_commands")):
     _gk104_pramin_write_memx(dev, pa, data)
     return
   data = memoryview(data).cast("B")
@@ -7147,9 +6949,7 @@ def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
     raise ValueError("PRAMIN write must be 4-byte aligned")
   window = None
   allow_literal = os.environ.get("KEPLER_PRAMIN_LITERAL", "1") != "0"
-  # Night41ap: warm POSTed FB is a literal aperture. XOR-first then corrupts
-  # (e.g. 0x4001→0x4000) and, with macOS KEPLER_PRAMIN_LITERAL=0, never
-  # recovers. Virgin GDDR still reads 0xffffffff and needs XOR compensation.
+  # Night41ap: warm POSTed FB is a literal aperture. XOR-first then corrupts (e.g. 0x4001→0x4000) and, with macOS KEPLER_PRAMIN_LITERAL=0, never recovers. Virgin GDDR still reads 0xffffffff and needs XOR compensation.
   force_literal_first = os.environ.get("KEPLER_PRAMIN_LITERAL_FIRST", "") == "1"
   force_xor_first = os.environ.get("KEPLER_PRAMIN_LITERAL_FIRST", "") == "0"
   for off in range(0, len(data), 4):
@@ -7166,11 +6966,8 @@ def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
     if current == wanted:
       continue
     virgin = (current == 0xffffffff)
-    # Warm/dirty dwords always prefer literal (Nouveau instmem).  KEPLER_PRAMIN_LITERAL
-    # only gates the virgin-XOR → literal fallback (night13: literal 0 on XOR hung).
-    literal_first = (
-        force_literal_first or
-        (not force_xor_first and not virgin))
+    # Warm/dirty dwords always prefer literal (Nouveau instmem).  KEPLER_PRAMIN_LITERAL only gates the virgin-XOR → literal fallback (night13: literal 0 on XOR hung).
+    literal_first = (force_literal_first or (not force_xor_first and not virgin))
     if literal_first:
       # Warm/dirty dword: Nouveau-shaped literal store (instmem wr32_slow).
       dev.write32(reg, wanted)
@@ -7182,8 +6979,7 @@ def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
         actual = dev.read32(reg) & 0xffffffff
         _gk104_require_bar0_live(dev, f"after PRAMIN XOR @{addr:#x}")
     else:
-      # XOR aperture: virgin 0xffffffff + wanted 0 needs write of 0xffffffff,
-      # not a literal 0 (literal 0 on XOR leaves all-ones and has killed TinyGPU).
+      # XOR aperture: virgin 0xffffffff + wanted 0 needs write of 0xffffffff, not a literal 0 (literal 0 on XOR leaves all-ones and has killed TinyGPU).
       dev.write32(reg, (current ^ wanted) & 0xffffffff)
       actual = dev.read32(reg) & 0xffffffff
       _gk104_require_bar0_live(dev, f"after PRAMIN XOR @{addr:#x}")
@@ -7192,14 +6988,11 @@ def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
         actual = dev.read32(reg) & 0xffffffff
         _gk104_require_bar0_live(dev, f"after PRAMIN literal @{addr:#x}")
     if actual != wanted:
-      stub = (" (FB aperture stub/untrained — cold RAM/MEMX did not enable "
-              "PRAMIN)" if _gk104_pramin_word_is_stub(actual) else "")
-      raise RuntimeError(f"PRAMIN store failed at {addr:#x}: "
-                         f"wanted={wanted:#x} actual={actual:#x}{stub}")
+      stub = (" (FB aperture stub/untrained — cold RAM/MEMX did not enable PRAMIN)" if _gk104_pramin_word_is_stub(actual) else "")
+      raise RuntimeError(f"PRAMIN store failed at {addr:#x}: wanted={wanted:#x} actual={actual:#x}{stub}")
 
 def _gk104_pramin_read32(dev, pa, *, force_bar0=False):
-  if (not force_bar0 and
-      getattr(dev, "_bar1_identity_ready", False)):
+  if (not force_bar0 and getattr(dev, "_bar1_identity_ready", False)):
     return _gk104_bar1_read32(dev, pa)
   base = pa & 0xffffff00000
   dev.write32(0x001700, base >> 16)
@@ -7238,11 +7031,9 @@ def _gk104_pramin_write_literal(dev, pa, data):
   if os.environ.get("KEPLER_RAM_BIT0_DEFER", "0") == "1":
     _gk104_bit0_unstub(dev)
   if getattr(dev, "_bar1_identity_ready", False):
-    _gk104_bar1_write_verified(
-        dev, pa, data, label=f"BAR1 literal substitute @{pa:#x}")
+    _gk104_bar1_write_verified(dev, pa, data, label=f"BAR1 literal substitute @{pa:#x}")
     return
-  if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and
-      hasattr(dev, "pmu_memx_exec_commands")):
+  if (os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1" and hasattr(dev, "pmu_memx_exec_commands")):
     # Still use virgin-XOR encoding via MEMX — literal host path is TinyGPU-hostile.
     _gk104_pramin_write_memx(dev, pa, data)
     return
@@ -7252,16 +7043,12 @@ def _gk104_pramin_write_literal(dev, pa, data):
   for off in range(0, len(data), 4):
     addr = pa + off
     dev.write32(0x001700, (addr & 0xffffff00000) >> 16)
-    dev.write32(0x700000 + (addr & 0xfffff),
-                struct.unpack_from("<I", data, off)[0])
+    dev.write32(0x700000 + (addr & 0xfffff), struct.unpack_from("<I", data, off)[0])
 
 def _gk104_bar_flush(dev):
   """Flush pending framebuffer/BAR writes (g84_bar_flush)."""
   if getattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", False):
-    # Nights19/20 proved 0x070000 becomes a 43-ms timeout source after the
-    # host bit0-only crossing, even with BAR1 enabled.  A BAR1 read is the only
-    # safe posting barrier left on TinyGPU; verified writers additionally
-    # require exact readback for every dword.
+    # Nights19/20 proved 0x070000 becomes a 43-ms timeout source after the host bit0-only crossing, even with BAR1 enabled.  A BAR1 read is the only safe posting barrier left on TinyGPU; verified writers additionally require exact readback for every dword.
     try:
       raw = dev.dev_impl.hw.mmio_read(1, 0, 4)
       return len(raw) == 4
@@ -7608,43 +7395,20 @@ def _gk104_rom_shadow_entry_probe(dev) -> dict:
 
 def _gk104_pci_hw(dev):
   """Return the live PCI transport for config/PROM access."""
-  hw = getattr(getattr(dev, "dev_impl", None), "hw", None)
-  if hw is None:
-    hw = getattr(dev, "hw", None)
-  if hw is None:
-    hw = getattr(getattr(dev, "iface", None), "pci_dev", None)
-  if hw is None:
-    hw = getattr(getattr(dev, "dev_impl", None), "pci_dev", None)
+  hw = getattr(getattr(dev, "dev_impl", None), "hw", None) or getattr(dev, "hw", None) or getattr(getattr(dev, "iface", None), "pci_dev", None) or getattr(getattr(dev, "dev_impl", None), "pci_dev", None)
   return hw
 
 
-def _gk104_pci_id32(dev) -> int:
+def _gk104_pci_config32(dev, off) -> int:
   hw = _gk104_pci_hw(dev)
   if hw is None or not hasattr(hw, "read_config"):
     return 0
-  try:
-    return hw.read_config(0, 4) & 0xffffffff
-  except Exception:
-    return 0
-
-
-def _gk104_pci_subsys(dev) -> int:
-  hw = _gk104_pci_hw(dev)
-  if hw is None or not hasattr(hw, "read_config"):
-    return 0
-  try:
-    return hw.read_config(0x2c, 4) & 0xffffffff
-  except Exception:
-    return 0
+  try: return hw.read_config(off, 4) & 0xffffffff
+  except Exception: return 0
 
 
 def _gk104_dump_prom_rom(dev, out_path=None, max_size=0x80000) -> bytes:
-  """Dump the SPI PROM via BAR0 0x300000 with PCI ROM-shadow disabled.
-
-  Matches Nouveau ``nvbios_prom_*`` (clear ``0x088050`` bit0, read PROM window).
-  Dumps up to 512 KiB, then trims to the end of the last complete PCI ROM
-  image (PCIR walk).  Restores the shadow bit in ``finally``.
-  """
+  """Dump the SPI PROM via BAR0 0x300000 with PCI ROM-shadow disabled.  Matches Nouveau nvbios_prom_* (clear 0x088050 bit0, read PROM window).  Dumps up to 512 KiB, trims to the last complete PCI ROM image (PCIR walk).  Restores the shadow bit in finally."""
   out_path = out_path or ONBOARD_VBIOS_CACHE
   old_shadow = dev.read32(0x088050) & 0xffffffff
   data = bytearray()
@@ -7679,41 +7443,30 @@ def _gk104_dump_prom_rom(dev, out_path=None, max_size=0x80000) -> bytes:
     if end >= 0x200:
       raw = raw[:end]
     if len(raw) < 0x200:
-      raise RuntimeError(
-          f"PROM dump too small ({len(raw):#x} B); head={raw[:16].hex()}")
+      raise RuntimeError(f"PROM dump too small ({len(raw):#x} B); head={raw[:16].hex()}")
     # Prove BIT-I parse works for 0x1183/0x1184 before caching.
     image = nvbios_init.find_vbios_image(raw)
     scripts = nvbios_init.find_vbios_scripts(image)
     if not scripts:
       raise RuntimeError("PROM dump has no BIT-I scripts")
     pathlib.Path(out_path).write_bytes(raw)
-    print(f"[kepler] dumped onboard PROM → {out_path} "
-          f"({len(raw):#x} B, scripts={[hex(s) for s in scripts]})",
-          flush=True)
+    print(f"[kepler] dumped onboard PROM → {out_path} ({len(raw):#x} B, scripts={[hex(s) for s in scripts]})", flush=True)
     return raw
   finally:
-    try:
-      dev.write32(0x088050, old_shadow)
-    except Exception:
-      pass
+    try: dev.write32(0x088050, old_shadow)
+    except Exception: pass
 
 
 def _gk104_resolve_vbios_path(dev=None, *, allow_dump=False) -> str:
-  """Pick a VBIOS image safe for this 660 Ti board.
-
-  Order: explicit ``KEPLER_VBIOS`` (not the Palit golden) → cached onboard dump
-  → cold PROM dump → refuse Palit on Gigabyte/0x1183 unless
-  ``KEPLER_ALLOW_FOREIGN_VBIOS=1``.
-  """
+  """Pick a VBIOS image safe for this 660 Ti board.  Order: explicit KEPLER_VBIOS (not Palit golden) → cached onboard dump → cold PROM dump → refuse Palit on Gigabyte/0x1183 unless KEPLER_ALLOW_FOREIGN_VBIOS=1."""
   env = os.environ.get("KEPLER_VBIOS", "").strip()
-  # Ignore a Palit path left in the environment — that is not an operator
-  # choice for this board (older launchers setdefault'd it).
+  # Ignore a Palit path left in the environment — not an operator choice for this board (older launchers setdefault'd it).
   if env and os.path.abspath(env) != os.path.abspath(PALIT_770_VBIOS):
     return env
   if os.path.exists(ONBOARD_VBIOS_CACHE):
     return ONBOARD_VBIOS_CACHE
-  pci_id = (_gk104_pci_id32(dev) >> 16) & 0xffff if dev is not None else 0
-  subsys = _gk104_pci_subsys(dev) if dev is not None else 0
+  pci_id = (_gk104_pci_config32(dev, 0) >> 16) & 0xffff if dev is not None else 0
+  subsys = _gk104_pci_config32(dev, 0x2c) if dev is not None else 0
   looks_660ti = (pci_id == 0x1183 or subsys == GIGABYTE_660TI_SUBSYS)
   foreign_ok = os.environ.get("KEPLER_ALLOW_FOREIGN_VBIOS", "0") == "1"
   if allow_dump and dev is not None:
@@ -7723,20 +7476,9 @@ def _gk104_resolve_vbios_path(dev=None, *, allow_dump=False) -> str:
     except Exception as e:
       print(f"[kepler] onboard PROM dump failed: {e}", flush=True)
       if looks_660ti and not foreign_ok:
-        raise RuntimeError(
-            f"cold PROM dump failed on 660 Ti (pci_id={pci_id:#x} "
-            f"subsys={subsys:#010x}): {e}. Power-cycle and retry, or set "
-            "KEPLER_VBIOS= to a matching Gigabyte 0x1183 ROM "
-            "(TechPowerUp #128422). Do not use the Palit GTX770 image.") from e
+        raise RuntimeError(f"cold PROM dump failed on 660 Ti (pci_id={pci_id:#x} subsys={subsys:#010x}): {e}. Power-cycle and retry, or set KEPLER_VBIOS= to a matching Gigabyte 0x1183 ROM (TechPowerUp #128422). Do not use the Palit GTX770 image.") from e
   if looks_660ti and not foreign_ok:
-    raise RuntimeError(
-        "add_660ti refuses Palit GTX770 VBIOS on this board "
-        f"(pci_id={pci_id:#x} subsys={subsys:#010x}). "
-        "Power-cycle the eGPU, then either: "
-        "(1) re-run so cold PROM dump writes examples_kepler/onboard_gk104.rom, "
-        "or (2) set KEPLER_VBIOS= to a Gigabyte 0x1183 ROM matching "
-        "1458:3556 (TechPowerUp #128422). "
-        "Set KEPLER_ALLOW_FOREIGN_VBIOS=1 only to force the Palit image.")
+    raise RuntimeError(f"add_660ti refuses Palit GTX770 VBIOS on this board (pci_id={pci_id:#x} subsys={subsys:#010x}). Power-cycle the eGPU, then either: (1) re-run so cold PROM dump writes examples_kepler/onboard_gk104.rom, or (2) set KEPLER_VBIOS= to a Gigabyte 0x1183 ROM matching 1458:3556 (TechPowerUp #128422). Set KEPLER_ALLOW_FOREIGN_VBIOS=1 only to force the Palit image.")
   return PALIT_770_VBIOS
 
 
@@ -7754,41 +7496,17 @@ GK104_GOLDEN_PREINIT_READS = (
 
 
 def _gk104_golden_preinit_entry_probe(dev) -> dict:
-  """Compare every safe non-aperture golden read before device preinit.
-
-  The table is mechanically extracted from the checked-in mmiotrace before
-  line 42907.  PRAMIN/PROM aperture reads and their selector/shadow writes are
-  deliberately excluded, leaving seven read-only registers.
-  """
-  actual = tuple((reg, dev.read32(reg) & 0xffffffff)
-                 for reg, _expected in GK104_GOLDEN_PREINIT_READS)
+  """Compare every safe non-aperture golden read before device preinit.  The table is mechanically extracted from the checked-in mmiotrace before line 42907.  PRAMIN/PROM aperture reads and their selector/shadow writes are deliberately excluded, leaving seven read-only registers."""
+  actual = tuple((reg, dev.read32(reg) & 0xffffffff) for reg, _expected in GK104_GOLDEN_PREINIT_READS)
   expected = dict(GK104_GOLDEN_PREINIT_READS)
-  mismatch_regs = tuple(reg for reg, value in actual
-                        if value != expected[reg])
-  snap = {
-      "actual": actual,
-      "mismatch_regs": mismatch_regs,
-      "exact_match": not mismatch_regs,
-  }
-  print(
-      "[kepler] golden preinit entry diff: " + " ".join(
-          f"{reg:#08x}={value:#010x}/golden={expected[reg]:#010x}"
-          f"{'*' if value != expected[reg] else ''}"
-          for reg, value in actual) +
-      f" mismatches={[f'{reg:#x}' for reg in mismatch_regs]}",
-      flush=True)
+  mismatch_regs = tuple(reg for reg, value in actual if value != expected[reg])
+  snap = {"actual": actual, "mismatch_regs": mismatch_regs, "exact_match": not mismatch_regs}
+  print("[kepler] golden preinit entry diff: " + " ".join(f"{reg:#08x}={value:#010x}/golden={expected[reg]:#010x}{'*' if value != expected[reg] else ''}" for reg, value in actual) + f" mismatches={[f'{reg:#x}' for reg in mismatch_regs]}", flush=True)
   return snap
 
 
 def _gk104_pramin_word_is_stub(word: int) -> bool:
-  """True when a PRAMIN dword is a dead/stub sentinel, not framebuffer data.
-
-  Cold eGPUs that have not completed EFI/Nouveau memory training return the
-  ``0xbad0fbXX`` aperture stub (low byte counts host touches).  ``0xbadf…``
-  power-gate patterns are also unusable.  Do **not** treat ``0`` / ``0xffffffff``
-  as stubs: virgin GDDR often reads all-ones, and the PRAMIN store path already
-  compensates XOR-vs-``0xffffffff`` updates.
-  """
+  """True when a PRAMIN dword is a dead/stub sentinel, not framebuffer data.  Cold eGPUs that have not completed EFI/Nouveau memory training return the ``0xbad0fbXX`` aperture stub (low byte counts host touches).  ``0xbadf…`` power-gate patterns are also unusable.  Do **not** treat ``0`` / ``0xffffffff`` as stubs: virgin GDDR often reads all-ones, and the PRAMIN store path already compensates XOR-vs-``0xffffffff`` updates."""
   if (word & 0xffffff00) == 0xbad0fb00:
     return True
   if (word & 0xffff0000) in (0xbadf0000, 0xbad00000, 0xbad0d000):
@@ -7880,18 +7598,12 @@ def _gk104_require_bar0_live(dev, label: str) -> int:
   except Exception as e:
     raise RuntimeError(f"BAR0 unreadable {label}: {e}") from e
   if not _gk104_boot0_looks_live(boot0):
-    raise RuntimeError(
-        f"BAR0 dead {label} (PMC_BOOT_0={boot0:#x}); refusing further MMIO.  "
-        "Power-cycle the eGPU enclosure and cold-run once.")
+    raise RuntimeError(f"BAR0 dead {label} (PMC_BOOT_0={boot0:#x}); refusing further MMIO.  Power-cycle the eGPU enclosure and cold-run once.")
   return boot0
 
 
 def _gk104_bit0_unstub(dev) -> None:
-  """Legacy-only late framebuffer bit0 clear; once per device.
-
-  MEMX ENTER owns this bit and LEAVE deliberately restores it.  Atomic mode
-  must put framebuffer stores inside ENTER/LEAVE instead of clearing it late.
-  """
+  """Legacy-only late framebuffer bit0 clear; once per device.  MEMX ENTER owns this bit and LEAVE deliberately restores it.  Atomic mode must put framebuffer stores inside ENTER/LEAVE instead of clearing it late."""
   if getattr(dev, "_bit0_unstub_done", False):
     return
   if os.environ.get("KEPLER_RAM_BLOCK", "0") != "bit0":
@@ -8141,13 +7853,7 @@ def _gk104_dump_bar1_client_regs(dev, label: str) -> dict[int, int]:
 
 
 def _gk104_bar1_write_verified(dev, va: int, data, *, label="BAR1") -> None:
-  """Write framebuffer dwords through BAR1 with XOR/literal compensation.
-
-  Cold TinyGPU BAR1 has exhibited both ordinary stores and XOR-like/stale
-  stores.  Read the current dword, try the exact XOR delta first, then a
-  literal store, and require readback before advancing.  This replaces the
-  old post-bit0 PRAMIN repair path, whose 0x1700 access is fatal.
-  """
+  """Write framebuffer dwords through BAR1 with XOR/literal compensation.  Cold TinyGPU BAR1 has exhibited both ordinary stores and XOR-like/stale stores.  Read the current dword, try the exact XOR delta first, then a literal store, and require readback before advancing.  This replaces the old post-bit0 PRAMIN repair path, whose 0x1700 access is fatal."""
   data = memoryview(data).cast("B")
   if (va & 3) or (len(data) & 3):
     raise ValueError("verified BAR1 write must be dword aligned")
@@ -8168,31 +7874,20 @@ def _gk104_bar1_write_verified(dev, va: int, data, *, label="BAR1") -> None:
       if actual == wanted:
         break
     if actual != wanted:
-      raise RuntimeError(
-          f"{label} store failed at {addr:#x}: wanted={wanted:#x} "
-          f"actual={actual:#x}")
+      raise RuntimeError(f"{label} store failed at {addr:#x}: wanted={wanted:#x} actual={actual:#x}")
 
 
 def _gk104_fecs_embed_bar1_bootstrap(fecs_code):
-  """Splice the autonomous BAR1 bootstrap into the FECS IMEM zero pad.
-
-  The live ``gk104_fecs_code.bin`` is 0xc00 bytes with zeros at 0xb0a..0xbff.
-  Runtime IMEM stores after FECS has run read back 0xbadf5000 (night27), so
-  the routine must be present in the image that ``falcon_write_imem`` loads.
-  """
+  """Splice the autonomous BAR1 bootstrap into the FECS IMEM zero pad.  The live ``gk104_fecs_code.bin`` is 0xc00 bytes with zeros at 0xb0a..0xbff.  Runtime IMEM stores after FECS has run read back 0xbadf5000 (night27), so the routine must be present in the image that ``falcon_write_imem`` loads."""
   code = bytearray(fecs_code)
   end = FECS_BAR1_BOOTSTRAP_END
   if end > len(code):
-    raise RuntimeError(
-        f"FECS bootstrap end {end:#x} exceeds firmware image {len(code):#x}")
+    raise RuntimeError(f"FECS bootstrap end {end:#x} exceeds firmware image {len(code):#x}")
   pad = memoryview(code)[FECS_BAR1_BOOTSTRAP_IMEM:end]
   if any(pad) and bytes(pad) != FECS_BAR1_BOOTSTRAP_CODE:
-    raise RuntimeError(
-        f"FECS IMEM pad at {FECS_BAR1_BOOTSTRAP_IMEM:#x} is not empty "
-        f"(found {bytes(pad)[:16].hex()}...)")
+    raise RuntimeError(f"FECS IMEM pad at {FECS_BAR1_BOOTSTRAP_IMEM:#x} is not empty (found {bytes(pad)[:16].hex()}...)")
   code[FECS_BAR1_BOOTSTRAP_IMEM:end] = FECS_BAR1_BOOTSTRAP_CODE
-  print(f"[kepler] FECS BAR1 bootstrap embedded at "
-        f"{FECS_BAR1_BOOTSTRAP_IMEM:#x}..{end:#x}", flush=True)
+  print(f"[kepler] FECS BAR1 bootstrap embedded at {FECS_BAR1_BOOTSTRAP_IMEM:#x}..{end:#x}", flush=True)
   return code
 
 
@@ -8201,32 +7896,21 @@ def _gk104_pmu_embed_bar1_bootstrap(pmu_code):
   code = bytearray(pmu_code)
   end = PMU_BAR1_BOOTSTRAP_END
   if end > len(code):
-    raise RuntimeError(
-        f"PMU bootstrap end {end:#x} exceeds firmware image {len(code):#x}")
+    raise RuntimeError(f"PMU bootstrap end {end:#x} exceeds firmware image {len(code):#x}")
   pad = memoryview(code)[PMU_BAR1_BOOTSTRAP_IMEM:end]
   if any(pad) and bytes(pad) != PMU_BAR1_BOOTSTRAP_CODE:
-    raise RuntimeError(
-        f"PMU IMEM pad at {PMU_BAR1_BOOTSTRAP_IMEM:#x} is not empty "
-        f"(found {bytes(pad)[:16].hex()}...)")
+    raise RuntimeError(f"PMU IMEM pad at {PMU_BAR1_BOOTSTRAP_IMEM:#x} is not empty (found {bytes(pad)[:16].hex()}...)")
   code[PMU_BAR1_BOOTSTRAP_IMEM:end] = PMU_BAR1_BOOTSTRAP_CODE
-  print(f"[kepler] PMU BAR1 bootstrap embedded at "
-        f"{PMU_BAR1_BOOTSTRAP_IMEM:#x}..{end:#x}", flush=True)
+  print(f"[kepler] PMU BAR1 bootstrap embedded at {PMU_BAR1_BOOTSTRAP_IMEM:#x}..{end:#x}", flush=True)
   return code
 
 
 def _gk104_pmu_patch_live_imem_pad(dev) -> None:
-  """Night40h: patch the pad into the live MEMX PMU without MC reset.
-
-  Night40g proved Falcon IO XFER after MC-reload still yields BAR1 `bad0fb`.
-  Night24's completing MEMIF path ran on the live post-FECS PMU.  Soft-stop
-  leaves CPUCTL SLEEPING (never STOPPED); still try an IMEM pad write +
-  readback there so MEMIF keeps the live engine's FB binding.
-  """
+  """Night40h: patch the pad into the live MEMX PMU without MC reset.  Night40g proved Falcon IO XFER after MC-reload still yields BAR1 `bad0fb`.  Night24's completing MEMIF path ran on the live post-FECS PMU.  Soft-stop leaves CPUCTL SLEEPING (never STOPPED); still try an IMEM pad write + readback there so MEMIF keeps the live engine's FB binding."""
   code = getattr(dev, "_pmu_code", None)
   if not code or len(code) < PMU_BAR1_BOOTSTRAP_END:
     raise RuntimeError("PMU image missing for live IMEM pad patch")
-  if code[PMU_BAR1_BOOTSTRAP_IMEM:PMU_BAR1_BOOTSTRAP_END] != \
-      PMU_BAR1_BOOTSTRAP_CODE:
+  if code[PMU_BAR1_BOOTSTRAP_IMEM:PMU_BAR1_BOOTSTRAP_END] != PMU_BAR1_BOOTSTRAP_CODE:
     code = _gk104_pmu_embed_bar1_bootstrap(code)
     try:
       setattr(dev, "_pmu_code", bytes(code))
@@ -8447,8 +8131,7 @@ def _gk104_pmu_dmem_read(dev, addr: int, size: int) -> bytes:
   out = bytearray(size)
   for off in range(0, size, 4):
     dev.write32(PMU_FALCON_BASE + FALCON_DATA_INDEX, (addr + off) & 0x00ffffff)
-    struct.pack_into("<I", out, off,
-                     dev.read32(PMU_FALCON_BASE + FALCON_DATA) & 0xffffffff)
+    struct.pack_into("<I", out, off, dev.read32(PMU_FALCON_BASE + FALCON_DATA) & 0xffffffff)
   return bytes(out)
 
 
@@ -8458,10 +8141,8 @@ def _gk104_pmu_dmem_write(dev, addr: int, data) -> None:
   if (addr & 3) or (len(data) & 3) or not data:
     raise ValueError("PMU DMEM write must be dword-aligned and non-empty")
   for off in range(0, len(data), 4):
-    dev.write32(PMU_FALCON_BASE + FALCON_DATA_INDEX,
-                ((addr + off) & 0x00ffffff) | FALCON_IDX_WRITE)
-    dev.write32(PMU_FALCON_BASE + FALCON_DATA,
-                struct.unpack_from("<I", data, off)[0])
+    dev.write32(PMU_FALCON_BASE + FALCON_DATA_INDEX, ((addr + off) & 0x00ffffff) | FALCON_IDX_WRITE)
+    dev.write32(PMU_FALCON_BASE + FALCON_DATA, struct.unpack_from("<I", data, off)[0])
 
 
 def _gk104_pmu_arm_autonomous_bootstrap(dev) -> None:
@@ -9427,35 +9108,12 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
           flush=True)
 
 def _gk104_ltc_invalidate(dev, *, force=False, flush=True):
-  """Invalidate GK104's L2 after CPU BAR1/PRAMIN framebuffer stores.
-
-  H23: after PRAMIN (BAR0) writes that bypass L2, pass flush=False to drop
-  stale dirty L2 lines WITHOUT writing them back — a flush would overwrite
-  the fresh PRAMIN data with older L2-cached BAR1 data (bit-15 mantissa
-  flips on compute mirror `b` at N>1024).
-
-  H26: on desktop GK104, Nouveau never calls nvkm_ltc_invalidate() — it's
-  only used on GK20a (Tegra).  Desktop coherency uses g84_bar_flush()
-  (0x070000), which times out on TinyGPU.  This function may only affect
-  compression tag state, not data lines.  The real L2 warming is done by
-  BAR1 bulk reads in the pre-GP_PUT mirror verify path.
-
-  KEPLER_SKIP_LTC=1 skips all hot-path LTC invalidate calls (force=False)
-  to test H26's hypothesis that they're unnecessary on desktop GK104.
-  """
+  """Invalidate GK104's L2 after CPU BAR1/PRAMIN framebuffer stores.  After PRAMIN (BAR0) writes that bypass L2, pass flush=False to drop stale dirty L2 lines WITHOUT writing them back — a flush would overwrite the fresh PRAMIN data with older L2-cached BAR1 data."""
   if os.environ.get("KEPLER_SKIP_LTC", "0") == "1" and not force:
     return True
   if getattr(dev, "_tinygpu_post_bit0_bar_flush_unsafe", False) and not force:
-    # 0x070010/0x070004 share the post-bit0-inaccessible BAR/LTC block with
-    # 0x070000.  On the cold first-use path no GPU client has cached these
-    # freshly written objects yet; use the safe BAR1 posting read instead.
-    # H23: compute mirrors (a/b/out) bypass L2 via PRAMIN but the SM loads
-    # through L2; real LTC flush/invalidate is safe on 0x070010/0x070004 after
-    # bit0 (only 0x070000 BAR-flush is the 43-ms timeout source).  Default ON;
-    # KEPLER_LTC_FORCE=0 restores the old BAR-flush-only skip.
-    if os.environ.get("KEPLER_LTC_FORCE", "1") == "0":
-      return _gk104_bar_flush(dev)
-    # fall through to real LTC flush/invalidate with a generous timeout.
+    # Post-bit0 cold path: 0x070000 BAR-flush times out (43 ms), but 0x070010/0x070004 are safe.  Use BAR1 posting read for cold first-use.
+    return _gk104_bar_flush(dev)
   if flush:
     # gf100_ltc_flush(): commit BAR/PRAMIN writes held by LTC first.
     dev.write32(0x070010, 0x00000001)
@@ -9649,9 +9307,7 @@ def _reload_fecs_after_pgob(dev):
     wait_cond(lambda: falcon_ready(dev, FECS_FALCON_BASE),
               timeout_ms=2000, msg="FECS ready after reload")
   except TimeoutError:
-    print(f"[kepler] FECS NOT ready after reload: CPUCTL={dev.read32(0x409100):#x} "
-          f"SCRATCH0={dev.read32(0x409800):#x} PC={dev.read32(0x409ff0):#x}",
-          flush=True)
+    print(f"[kepler] FECS NOT ready after reload: CPUCTL={dev.read32(0x409100):#x} SCRATCH0={dev.read32(0x409800):#x} PC={dev.read32(0x409ff0):#x}", flush=True)
     return False
   # Set FE_PWR FORCE_ON and disable idle filter after FECS is ready.
   dev.write32(0x404170, 0x00000012)
@@ -9666,18 +9322,10 @@ def _reload_fecs_after_pgob(dev):
   return True
 
 def _gk104_fe_pwr_force_on(dev):
-  """Ack FECS ctx_4170s handshake and keep FE domain FORCE_ON.
-
-  Without a PMU, FECS sets 0x404170 bit4 then waits for clear; if bit4
-  sticks or FE_PWR drops to 0, eng-ctx load parks with sticky GPC busy.
-  H18: FECS returns to main wait@0x567 (done) while FE_PWR=0 / GPC_STATUS=0x6.
-  """
-  try:
-    _pwr = dev.read32(0x404170) & 0xffffffff
-  except Exception:
-    return
-  # Prefer 0x12 (FORCE_ON|request-ack style) so bit1 stays set after FECS
-  # clears bit4; fall back to 0x02 if the card only latches FORCE_ON.
+  """Ack FECS ctx_4170s handshake and keep FE domain FORCE_ON.  Without a PMU, FECS sets 0x404170 bit4 then waits for clear; if bit4 sticks or FE_PWR drops to 0, eng-ctx load parks with sticky GPC busy."""
+  try: _pwr = dev.read32(0x404170) & 0xffffffff
+  except Exception: return
+  # Prefer 0x12 (FORCE_ON|request-ack style) so bit1 stays set after FECS clears bit4; fall back to 0x02 if the card only latches FORCE_ON.
   if _pwr & 0x10:
     dev.write32(0x404170, (_pwr & ~0x10) | 0x02)
   elif _pwr not in (0x02, 0x12):
@@ -9763,23 +9411,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _alpha_nr_max = max(1, _sum_max - _attrib_nr_max)
       _attrib_nr = min(_attrib_nr, _attrib_nr_max)
       _alpha_nr = min(_alpha_nr, _alpha_nr_max)
-      print(f"[kepler] bit19-safe attrib shrink: "
-            f"attrib_nr_max={_attrib_nr_max:#x} alpha_nr_max={_alpha_nr_max:#x} "
-            f"attrib_nr={_attrib_nr:#x} alpha_nr={_alpha_nr:#x} "
-            f"tpc={_tpc_total}", flush=True)
-  # H16: eng-ctx hang's last MMIO is GPC3 PPC+0xe4 = 0x51b0e4 with the
-  # *shrunk* e4 value (0x61839e4).  Golden/grctx_main previously programmed
-  # full Nouveau alpha_nr=0x648 — mmio-list then overwrote with shrunk
-  # numbers and left GPC1+2 sticky.  Keep one consistent set on the device.
-  try:
-    setattr(dev, "_kepler_attrib", {
-        "attrib_nr_max": _attrib_nr_max,
-        "alpha_nr_max": _alpha_nr_max,
-        "attrib_nr": _attrib_nr,
-        "alpha_nr": _alpha_nr,
-    })
-  except Exception:
-    pass
+      print(f"[kepler] bit19-safe attrib shrink: attrib_nr_max={_attrib_nr_max:#x} alpha_nr_max={_alpha_nr_max:#x} attrib_nr={_attrib_nr:#x} alpha_nr={_alpha_nr:#x} tpc={_tpc_total}", flush=True)
+  # H16: keep one consistent attrib/alpha_nr set — mmio-list must not overwrite grctx_main's shrunk values (causes sticky GPC1+2).
+  try: setattr(dev, "_kepler_attrib", {"attrib_nr_max": _attrib_nr_max, "alpha_nr_max": _alpha_nr_max, "attrib_nr": _attrib_nr, "alpha_nr": _alpha_nr})
+  except Exception: pass
   _attrib_size = round_up(
       0x20 * (_attrib_nr_max + _alpha_nr_max) * _tpc_total, 0x1000)
   attrib_cb = alloc.alloc(_attrib_size, align=0x1000)
@@ -9822,52 +9457,19 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         f"attrib={attrib_cb.va_addr:#x}+{attrib_cb.size:#x} "
         f"mmio={mmio_list.va_addr:#x}+{mmio_list.size:#x}", flush=True)
   _bo, _ao = 0, _attrib_nr_max * sum(_tpc_nr)
-  # H16b: last eng-ctx MMIO is GPC3 PPC+0xe4 (0x51b0e4).  Default keep PPC
-  # entries (Nouveau-shaped).  Set KEPLER_PPC_MMIO_LIST=0 to omit and test
-  # whether mmio-list PPC restores alone cause sticky GPC1+2.
-  _ppc_mmio = os.environ.get("KEPLER_PPC_MMIO_LIST", "1") != "0"
+  # PPC+0xc0/0xe4 entries stay (Nouveau-shaped); LTC patch_ltc entries (0x17e91c/0x17e920) are omitted — they stuck FECS_MMIO_CTRL on WRITE.
   for _gpc, _mask in enumerate(_ppc_masks):
     _count = _mask.bit_count()
     _ppc = 0x503000 + _gpc * 0x8000
     _c0 = (1 << 28) | (_beta * _count << 16) | _bo
     _e4 = (_alpha * _count << 16) | _ao
-    if _ppc_mmio:
-      runtime_mmio_entries.append((_ppc + 0xc0, _c0))
-      runtime_mmio_entries.append((_ppc + 0xe4, _e4))
+    runtime_mmio_entries.append((_ppc + 0xc0, _c0))
+    runtime_mmio_entries.append((_ppc + 0xe4, _e4))
     _bo += _attrib_nr_max * _count
     _ao += _alpha_nr_max * _count
-  if _ppc_mmio:
-    print(f"[kepler] PPC mmio-list: "
-          f"{[(hex(r), hex(v)) for r, v in runtime_mmio_entries if (r & 0xff) in (0xc0, 0xe4) and 0x503000 <= r <= 0x51b0e4]}",
-          flush=True)
-  else:
-    print("[kepler] PPC mmio-list: omitted (H16b; set KEPLER_PPC_MMIO_LIST=1 "
-          "to include)", flush=True)
-  # H10 discriminator: SET_OBJECT hang leaves FECS_MMIO_CTRL as WRITE to
-  # 0x17e920.  Nouveau patch_ltc puts these in the channel mmio list; default
-  # omit them so we can prove/disprove mmio-list LTC as the sticky-GPC cause.
-  # Golden FECS save may still restore LTC via strands.  Set
-  # KEPLER_LTC_MMIO_LIST=1 to restore Nouveau-shaped entries.
-  if os.environ.get("KEPLER_LTC_MMIO_LIST", "0") == "1":
-    _ltc_a, _ltc_b = dev.read32(0x17e91c), dev.read32(0x17e920)
-    runtime_mmio_entries.extend(((0x17e91c, _ltc_a), (0x17e920, _ltc_b)))
-    print(f"[kepler] LTC mmio-list: included 0x17e91c={_ltc_a:#x} "
-          f"0x17e920={_ltc_b:#x}", flush=True)
-  else:
-    print(f"[kepler] LTC mmio-list: omitted (H10; set KEPLER_LTC_MMIO_LIST=1 "
-          f"to include) live=0x17e91c={dev.read32(0x17e91c):#x} "
-          f"0x17e920={dev.read32(0x17e920):#x}", flush=True)
   mmio_blob = b"".join(struct.pack("<II", reg, value & 0xffffffff)
                        for reg, value in runtime_mmio_entries)
-  # H16c: empty the channel mmio list so eng-ctx load skips FECS MMIO walk.
-  # If GPC_STATUS still sticks, strands (not mmio-list) are the hang site.
-  if os.environ.get("KEPLER_MMIO_LIST_EMPTY", "0") == "1":
-    print(f"[kepler] MMIO list emptied (H16c; had {len(runtime_mmio_entries)} "
-          f"entries)", flush=True)
-    runtime_mmio_entries = []
-    mmio_blob = b""
-  vram[mmio_list.meta["pa"]:mmio_list.meta["pa"] + max(len(mmio_blob), 8)] = (
-      mmio_blob + bytes(max(0, 8 - len(mmio_blob))))
+  vram[mmio_list.meta["pa"]:mmio_list.meta["pa"] + max(len(mmio_blob), 8)] = (mmio_blob + bytes(max(0, 8 - len(mmio_blob))))
   mmio_list.meta["priv"] = True
   if os.environ.get("KEPLER_MMIO_LIST_VRAM") == "1":
     dev._kepler_vram_mirrors = list(
@@ -9945,23 +9547,13 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     for off in range(0, len(data), chunk):
       dev.dev_impl.hw.mmio_write(1, pa + off, data[off:off + chunk].tobytes())
   def vram_store(pa, data, *, label="vram"):
-    """Store into framebuffer for GPU clients.
-
-    H21/H22: BAR1 bulk stores can false-pass host readback while FECS/SM see
-    different bits (eng-ctx hang; float mantissa flips on add).  Default
-    PRAMIN for small compute mirrors; large scratch (TLS/TXC) stays BAR1
-    unless KEPLER_MIRROR_COPY=pramin-all.  KEPLER_MIRROR_COPY=bar1 forces BAR1.
-    """
+    """Store into framebuffer for GPU clients.  BAR1 bulk stores can false-pass host readback while FECS/SM see different bits (eng-ctx hang; float mantissa flips on add).  Default PRAMIN for small compute mirrors; large scratch (TLS/TXC) stays BAR1 unless KEPLER_MIRROR_COPY=pramin-all.  KEPLER_MIRROR_COPY=bar1 forces BAR1."""
     mode = os.environ.get("KEPLER_MIRROR_COPY", "pramin").strip().lower()
     if mode not in ("pramin", "pramin-all", "bar1"):
-      raise ValueError(
-          f"invalid KEPLER_MIRROR_COPY={mode!r}; "
-          "expected pramin|pramin-all|bar1")
+      raise ValueError(f"invalid KEPLER_MIRROR_COPY={mode!r}; expected pramin|pramin-all|bar1")
     data = memoryview(data).cast("B").tobytes()
     _pramin_max = int(os.environ.get("KEPLER_MIRROR_PRAMIN_MAX", "0x10000"), 0)
-    use_pramin = (
-        mode == "pramin-all" or
-        (mode == "pramin" and len(data) <= _pramin_max))
+    use_pramin = (mode == "pramin-all" or (mode == "pramin" and len(data) <= _pramin_max))
     if not use_pramin:
       bar1_write(pa, data)
       return "bar1"
@@ -9970,15 +9562,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   def vram_load(pa, n):
     mode = os.environ.get("KEPLER_MIRROR_COPY", "pramin").strip().lower()
     _pramin_max = int(os.environ.get("KEPLER_MIRROR_PRAMIN_MAX", "0x10000"), 0)
-    use_pramin = (
-        mode == "pramin-all" or
-        (mode == "pramin" and n <= _pramin_max))
+    use_pramin = (mode == "pramin-all" or (mode == "pramin" and n <= _pramin_max))
     if not use_pramin:
       return bytes(dev.dev_impl.hw.mmio_read(1, pa, n))
     out = bytearray(n)
     for off in range(0, n, 4):
-      struct.pack_into("<I", out, off,
-                      _gk104_pramin_read32(dev, pa + off, force_bar0=True))
+      struct.pack_into("<I", out, off, _gk104_pramin_read32(dev, pa + off, force_bar0=True))
     return bytes(out)
   _bar1_xfer = {"chunk": 0x1000}
   ctx_alias_ptes = []
@@ -10040,9 +9629,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _chunk = int(os.environ.get("KEPLER_BAR1_CHUNK", "0x40000"), 0)
       if _chunk >= 0x1000 and (_chunk & 0xfff) == 0:
         _bar1_xfer["chunk"] = _chunk
-    # Soft PRAMIN_live can be true from PMC_BOOT_0 alone while BAR1 still
-    # returns 0xbad0**** stubs after the first store (dirty / half-POST).  Fail
-    # closed before thrashing repair_zero — needs enclosure power-cycle.
+    # Soft PRAMIN_live can be true from PMC_BOOT_0 alone while BAR1 still returns 0xbad0**** stubs after the first store (dirty / half-POST).  Fail closed before thrashing repair_zero — needs enclosure power-cycle.
     try:
       if (dev.read32(0x409800) & 0x80000000) or (dev.read32(0x409100) & 0x10):
         falcon_stop(dev, FECS_FALCON_BASE, timeout_ms=1000)
@@ -10054,14 +9641,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
                      (attrib_vram_pa, attrib_cb.size)):
       bar1_write(pa, bytes(size))
     try:
-      _bar1_word = struct.unpack(
-          "<I", bytes(dev.dev_impl.hw.mmio_read(1, grctx_vram_pa, 4)))[0]
+      _bar1_word = struct.unpack("<I", bytes(dev.dev_impl.hw.mmio_read(1, grctx_vram_pa, 4)))[0]
       if _gk104_pramin_word_is_stub(_bar1_word):
-        raise RuntimeError(
-            f"BAR1 VRAM stub at grctx pa={grctx_vram_pa:#x} "
-            f"word={_bar1_word:#x} after bulk zero: framebuffer aperture is "
-            "dead/dirty. Power-cycle the eGPU enclosure (not just USB replug), "
-            "restart TinyGPU server, then re-run add_660ti.py once.")
+        raise RuntimeError(f"BAR1 VRAM stub at grctx pa={grctx_vram_pa:#x} word={_bar1_word:#x} after bulk zero: framebuffer aperture is dead/dirty. Power-cycle the eGPU enclosure (not just USB replug), restart TinyGPU server, then re-run add_660ti.py once.")
     except RuntimeError:
       raise
     except Exception as e:
@@ -10445,8 +10027,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       off = 0
       _store_modes = set()
       for chunk_pa, chunk_sz in chunks:
-        _store_modes.add(vram_store(chunk_pa, image[off:off + chunk_sz],
-                                    label=f"mirror@{mirror.va_addr:#x}"))
+        _store_modes.add(vram_store(chunk_pa, image[off:off + chunk_sz], label=f"mirror@{mirror.va_addr:#x}"))
         off += chunk_sz
       page = 0
       for chunk_pa, chunk_sz in chunks:
@@ -10462,9 +10043,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       mirror_pa = chunks[0][0]
       mirror.meta["vram_pa"] = mirror_pa
       mirror.meta["vram_chunks"] = chunks
-      print(f"[kepler] VRAM mirror: va={mirror.va_addr:#x} pa={mirror_pa:#x} "
-            f"size={mirror.size:#x} chunks={len(chunks)} "
-            f"via={'+'.join(sorted(_store_modes))}", flush=True)
+      print(f"[kepler] VRAM mirror: va={mirror.va_addr:#x} pa={mirror_pa:#x} size={mirror.size:#x} chunks={len(chunks)} via={'+'.join(sorted(_store_modes))}", flush=True)
     if getattr(dev, "_kepler_vram_mirrors", ()):
       _gk104_bar_flush(dev)
     # The GR scratch objects are INST/VRAM memory in Nouveau but all register
@@ -10511,9 +10090,6 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     print(f"[kepler] VRAM VMM: pgd_pa={vmm_pgd_pa:#x} "
           f"spts={[(i, hex(dst)) for i, _src, dst in cloned_spts]} "
           f"join={pgd:#x} flush={'done' if vram_vmm_flushed else 'timeout'}", flush=True)
-    # Stash for post-launch channel PTE dumps (SM vs host aperture checks).
-    dev._kepler_vmm_pgd_pa = vmm_pgd_pa
-    dev._kepler_cloned_by_pgd = dict(cloned_by_pgd)
   else:
     pgd = _gk104_pgd_entry(dev, mm.root_pa)
   # gf100_vmm_join(): the channel VMM instance stores the page-directory
@@ -11027,16 +10603,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           f"GPC_TOPOLOGY={dev.read32(0x409604):#x} "
           f"CHAN_ADDR={dev.read32(0x409b00):#x} CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
     # 1. Make channel current: clear done flag, send cmd 1 (ctx_chan).
-    # ponytail: Disable all FECS interrupts except FIFO (bit 2) before
-    # ctx_chan.  The EFI overlay has interrupt vectors pointing to overlay
-    # code.  If a non-FIFO interrupt fires during ctx_chan processing, the
-    # FECS jumps to the overlay and gets stuck.  The FIFO interrupt (bit 2)
-    # is needed for the FECS to process the FIFO command.  Re-enable before
-    # CHSW — and restore the full post-firmware mask after golden save so
-    # SET_OBJECT context-load can see engine-specific lines (bits 8-15).
+    # ponytail: Disable all FECS interrupts except FIFO (bit 2) before ctx_chan — EFI overlay vectors point to overlay code, and a non-FIFO interrupt during ctx_chan makes FECS jump to the overlay and get stuck.  Restore the full post-firmware mask after golden save so SET_OBJECT context-load can see engine-specific lines (bits 8-15).
     _fecs_irqmask_before_ctx_chan = dev.read32(0x409018)
-    print(f"[kepler] FECS IRQMASK before ctx_chan CLR: {_fecs_irqmask_before_ctx_chan:#x}",
-          flush=True)
+    print(f"[kepler] FECS IRQMASK before ctx_chan CLR: {_fecs_irqmask_before_ctx_chan:#x}", flush=True)
     dev.write32(FECS_FALCON_BASE + 0x004, 0xfffffffb)  # INTR_CLR: clear all except FIFO
     dev.write32(FECS_FALCON_BASE + 0x014, 0xfffffffb)  # IRQMCLR: disable all except bit 2
     # Prove the exact PDE/PTEs used by FECS and GR at the point of use.
@@ -11193,10 +10762,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     gpc_nr = dev.read32(0x409604) & 0x1f
     tpc_nr = _gk104_read_tpc_nr(dev, gpc_nr)
     tpc_total = sum(tpc_nr)
-    print(f"[kepler] grctx_main: gpc_nr={gpc_nr} tpc_total={tpc_total} "
-          f"tpc_nr={tpc_nr} "
-          f"PGRAPH_STATUS={dev.read32(0x400000):#x} "
-          f"PGRAPH_CTRL={dev.read32(0x400500):#x}", flush=True)
+    print(f"[kepler] grctx_main: gpc_nr={gpc_nr} tpc_total={tpc_total} tpc_nr={tpc_nr} PGRAPH_STATUS={dev.read32(0x400000):#x} PGRAPH_CTRL={dev.read32(0x400500):#x}", flush=True)
     # Nouveau programs the mapped VMA, not the physical INST-memory address.
     pagepool_gpu_pa = pagepool.va_addr
     bundle_gpu_pa = bundle_cb.va_addr
@@ -11210,8 +10776,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       raise
     # Verify GR is still accessible after grctx_main.
     _gr_post = dev.read32(0x400000)
-    print(f"[kepler] post-grctx_main: PGRAPH_STATUS={_gr_post:#x} "
-          f"PGRAPH_CTRL={dev.read32(0x400500):#x}", flush=True)
+    print(f"[kepler] post-grctx_main: PGRAPH_STATUS={_gr_post:#x} PGRAPH_CTRL={dev.read32(0x400500):#x}", flush=True)
     if _gr_post & 0xffff0000 == 0xbadf0000:
       print(f"[kepler] WARNING: GR inaccessible after grctx_main (false positive: 0xbadf1000 is normal idle)", flush=True)
     # Wait for GR to be truly idle before triggering context switch.
@@ -11282,40 +10847,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
                     for i in range(0, 16, 4)]
     else:
       saved_head = list(struct.unpack_from("<4I", vram, grctx_pa + 0x80000))
-    print(f"[kepler] FECS golden save done: CHAN_ADDR={dev.read32(0x409b00):#x} "
-          f"CHAN_NEXT={dev.read32(0x409b04):#x} "
-          f"IRQMASK={dev.read32(0x409018):#x} head={[hex(x) for x in saved_head]}", flush=True)
-    # Restore FECS interrupt enables wiped before ctx_chan.  Only bits 2/5/8
-    # (0x124) were re-enabled for golden CHSW; that left IRQMASK=0x124 and
-    # dropped engine-specific lines from the post-start mask (observed
-    # 0x8704: bits 9/10/15).  Without those, SET_OBJECT's eng-ctx load
-    # parks FECS (CPUCTL=SLEEPING@0x567) with GPC1+2 sticky-busy and
-    # GPC TPC_NR cleared on the hung GPCs.
+    print(f"[kepler] FECS golden save done: CHAN_ADDR={dev.read32(0x409b00):#x} CHAN_NEXT={dev.read32(0x409b04):#x} IRQMASK={dev.read32(0x409018):#x} head={[hex(x) for x in saved_head]}", flush=True)
+    # Restore FECS interrupt enables wiped before ctx_chan.  Golden CHSW only re-enabled bits 2/5/8 (0x124), dropping engine-specific lines (bits 9/10/15 = 0x8700).  Without those, SET_OBJECT's eng-ctx load parks FECS (CPUCTL=SLEEPING@0x567) with GPC1+2 sticky-busy and GPC TPC_NR cleared.
     _fecs_irq_restore = (_fecs_irqmask_before_ctx_chan | 0x00000124) & 0xffff
     if _fecs_irq_restore:
       dev.write32(0x409010, _fecs_irq_restore)  # INTR_EN_SET
-    print(f"[kepler] FECS IRQMASK restored after golden: "
-          f"want={_fecs_irq_restore:#x} actual={dev.read32(0x409018):#x}",
-          flush=True)
-    # Discriminator: did FECS actually write context bytes?
-    if use_vram_inst:
-      _nz = 0
-      _sample = []
-      _scan = min(ctx_size if "ctx_size" in dir() else 0x29b00, 0x8000)
-      # ctx_size is on NVDevice; use discovered size from mailbox stash if present
-      _scan_sz = getattr(dev, "gr_ctx_size", 0x29b00) or 0x29b00
-      _scan_sz = min(_scan_sz, 0x10000)
-      for _off in range(0, _scan_sz, 4):
-        _w = _gk104_pramin_read32(dev, grctx_golden_vram_pa + _off)
-        if _w:
-          _nz += 1
-          if len(_sample) < 8:
-            _sample.append((_off, _w))
-      print(f"[kepler] golden buf scan: size={_scan_sz:#x} nonzero_dwords={_nz} "
-            f"first_hits={[ (hex(o), hex(v)) for o,v in _sample ]} "
-            f"FECS_PC={dev.read32(0x409ff0):#x} CPUCTL={dev.read32(0x409100):#x} "
-            f"INTR={dev.read32(0x409008):#x} IRQMASK={dev.read32(0x409018):#x}",
-            flush=True)
+    print(f"[kepler] FECS IRQMASK restored after golden: want={_fecs_irq_restore:#x} actual={dev.read32(0x409018):#x}", flush=True)
     # Stop the golden-save keep-alive thread.
     _ka_stop2.set()
     if _ka_thread2 is not None:
@@ -11418,21 +10955,11 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       if hw is not None:
         hw.set_phase("golden-context-ctx-copy")
       _copy_start = time.time()
-      # H21: BAR1 golden→runtime eng-ctx copy false-passes the BAR1 sample
-      # verify (both sides read the same corrupt image) and leaves sticky
-      # GPC_STATUS=0x6 / FE_BUSY=1 after SET_OBJECT.  PRAMIN copy idles
-      # (GPC_STATUS=0) with a correct mmio-list header.  Opt into BAR1 with
-      # KEPLER_CTX_COPY=bar1; KEPLER_ENG_CTX=golden skips the copy entirely.
+      # H21: BAR1 eng-ctx copy false-passes sample verify (sticky GPC_STATUS=0x6); PRAMIN copy idles correctly.  Opt into BAR1 with KEPLER_CTX_COPY=bar1.
       _ctx_copy = os.environ.get("KEPLER_CTX_COPY", "pramin").strip().lower()
       if _ctx_copy not in ("pramin", "bar1"):
-        raise ValueError(
-            f"invalid KEPLER_CTX_COPY={_ctx_copy!r}; expected pramin|bar1")
-      fast_ctx = (
-          _ctx_copy == "bar1" and
-          os.environ.get("KEPLER_FAST_ZERO", "1") != "0" and
-          bool(getattr(dev, "_bar1_classic_posted", False) or
-               getattr(dev, "_bar1_identity_ready", False) or
-               bar1_identity_ready))
+        raise ValueError(f"invalid KEPLER_CTX_COPY={_ctx_copy!r}; expected pramin|bar1")
+      fast_ctx = (_ctx_copy == "bar1" and os.environ.get("KEPLER_FAST_ZERO", "1") != "0" and bool(getattr(dev, "_bar1_classic_posted", False) or getattr(dev, "_bar1_identity_ready", False) or bar1_identity_ready))
       runtime_ctx_expected = bytearray(ctx_size)
       if fast_ctx:
         _rd = _bar1_xfer["chunk"]
@@ -11456,28 +10983,21 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           fast_ctx = False
       if not fast_ctx:
         # BAR1 readback on some cold attaches returns complemented dwords.
-        # Capture the FECS-saved image through authoritative BAR0 PRAMIN
-        # (force_bar0: identity BAR1 substitute left sticky bit flips — H22).
+        # Capture the FECS-saved image through authoritative BAR0 PRAMIN (identity BAR1 substitute left sticky bit flips).
         for off in range(0, ctx_size, 4):
           if not (off & 0xfff):
             dev.read32(0x409100)
-          struct.pack_into(
-              "<I", runtime_ctx_expected, off,
-              _gk104_pramin_read32(dev, grctx_golden_vram_pa + off,
-                                   force_bar0=True))
+          struct.pack_into("<I", runtime_ctx_expected, off, _gk104_pramin_read32(dev, grctx_golden_vram_pa + off, force_bar0=True))
       if fast_ctx:
         bar1_write(grctx_vram_pa, runtime_ctx_expected)
       else:
-        _gk104_pramin_write(dev, grctx_vram_pa, runtime_ctx_expected,
-                            force_bar0=True)
+        _gk104_pramin_write(dev, grctx_vram_pa, runtime_ctx_expected, force_bar0=True)
       _gk104_bar_flush(dev)
       if not _gk104_ltc_invalidate(dev):
         raise TimeoutError("GK104 LTC invalidate after runtime context copy failed")
       _copy_elapsed = time.time() - _copy_start
       _fecs_after_copy = dev.read32(0x409100)
-      print(f"[kepler] ctx copy via {'BAR1' if fast_ctx else 'PRAMIN'}: "
-            f"{_copy_elapsed:.3f}s FECS={_fecs_after_copy:#x}",
-            flush=True)
+      print(f"[kepler] ctx copy via {'BAR1' if fast_ctx else 'PRAMIN'}: {_copy_elapsed:.3f}s FECS={_fecs_after_copy:#x}", flush=True)
       # Track FECS state through each subsequent step
       _fecs_check_points = []
       _fecs_check_points.append(("after_bar_flush", dev.read32(0x409100),
@@ -11552,38 +11072,16 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       # the !gr->firmware path (commands 1/2, not proprietary commands 3/9).
       # gf100_gr_chan_bind() therefore replaces the first two golden-image
       # words with the MMIO pair count and patch-list VA shifted by eight.
-      #
-      # H21 discriminator: KEPLER_ENG_CTX=golden points RAMIN 0x0210 at the
-      # FECS-saved CB_RESERVED image (VA+0x80000) and skips the mmio-list
-      # header rewrite.  Golden SAVE leaves GPC_STATUS=0; if SET_OBJECT then
-      # also idles, the hang is in the runtime copy/header path, not a
-      # phantom FE/GPC latch.
-      _eng_ctx_mode = os.environ.get("KEPLER_ENG_CTX", "runtime").strip().lower()
-      if _eng_ctx_mode not in ("runtime", "golden", "runtime-nohdr"):
-        raise ValueError(
-            f"invalid KEPLER_ENG_CTX={_eng_ctx_mode!r}; "
-            "expected runtime|golden|runtime-nohdr")
       dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
-      if _eng_ctx_mode == "golden":
-        print(f"[kepler] ENG_CTX=golden: skip mmio-list header rewrite; "
-              f"RAMIN→CB_RESERVED va={gr_ctx.va_addr + 0x80000:#x}",
-              flush=True)
-        runtime_ctx_va = (gr_ctx.va_addr + 0x80000) | 4
-      else:
-        if _eng_ctx_mode == "runtime":
-          _runtime_header = struct.pack(
-              "<II", len(runtime_mmio_entries), mmio_list.va_addr >> 8)
-          for _off in (0x00, 0x04):
-            runtime_ctx_expected[_off:_off + 4] = \
-                _runtime_header[_off:_off + 4]
-            _gk104_pramin_write(
-                dev, grctx_vram_pa + _off, _runtime_header[_off:_off + 4])
-          _gk104_bar_flush(dev)
-        else:
-          print(f"[kepler] ENG_CTX=runtime-nohdr: keep golden head on "
-                f"runtime copy; mmio_entries={len(runtime_mmio_entries)}",
-                flush=True)
-        runtime_ctx_va = gr_ctx.va_addr | 4
+      _runtime_header = struct.pack(
+          "<II", len(runtime_mmio_entries), mmio_list.va_addr >> 8)
+      for _off in (0x00, 0x04):
+        runtime_ctx_expected[_off:_off + 4] = \
+            _runtime_header[_off:_off + 4]
+        _gk104_pramin_write(
+            dev, grctx_vram_pa + _off, _runtime_header[_off:_off + 4])
+      _gk104_bar_flush(dev)
+      runtime_ctx_va = gr_ctx.va_addr | 4
       _fecs_check_points.append(("after_mmio_list_write", dev.read32(0x409100),
                                  dev.read32(0x400000), dev.read32(0x020004)))
       dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
@@ -11593,9 +11091,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _fecs_check_points.append(("after_ramin_ctx_write", dev.read32(0x409100),
                                  dev.read32(0x400000), dev.read32(0x020004)))
       dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
-      _head_pa = (grctx_golden_vram_pa if _eng_ctx_mode == "golden"
-                  else grctx_vram_pa)
-      runtime_head = [_gk104_pramin_read32(dev, _head_pa + i)
+      runtime_head = [_gk104_pramin_read32(dev, grctx_vram_pa + i)
                       for i in range(0, 0x30, 4)]
       _fecs_check_points.append(("after_head_read", dev.read32(0x409100),
                                  dev.read32(0x400000), dev.read32(0x020004)))
@@ -11614,8 +11110,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       runtime_ctx_va = gr_ctx.va_addr | 4
       struct.pack_into("<Q", vram, ramin_pa + 0x210, runtime_ctx_va)
       runtime_head = list(struct.unpack_from("<4I", vram, grctx_pa))
-    print(f"[kepler] runtime GR ctx: size={ctx_size:#x} va={runtime_ctx_va:#x} "
-          f"head={[hex(x) for x in runtime_head]}", flush=True)
+    print(f"[kepler] runtime GR ctx: size={ctx_size:#x} va={runtime_ctx_va:#x} head={[hex(x) for x in runtime_head]}", flush=True)
     dev.read32(0x409100)  # FECS keep-alive (read, not write, to preserve SCRATCH0)
     _fecs_check_points2 = [("after_runtime_ctx_print", dev.read32(0x409100))]
 
@@ -11882,8 +11377,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       _page = _entry_addr & ~0xfff
       _off = _entry_addr & 0xfff
       _page_updates.setdefault(_page, {})[_off] = _entry_wanted
-    print(f"[kepler] PTE stabilize: entries={len(_live_entries)} "
-          f"pages={len(_page_updates)} fast_pte={_fast_pte}", flush=True)
+    print(f"[kepler] PTE stabilize: entries={len(_live_entries)} pages={len(_page_updates)} fast_pte={_fast_pte}", flush=True)
     for _attempt in range(4):
       if _fast_pte:
         for _page, _updates in _page_updates.items():
@@ -11944,9 +11438,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"pramin={_signal_pramin:#x}")
     if hw is not None:
       hw.set_phase("golden-context-mirror-stabilize")
-    # H23: flush stale dirty L2 lines ONCE before all mirror writes, not per-
-    # mirror.  A per-mirror flush writes back stale L2 lines that can alias
-    # over earlier mirrors' PRAMIN-written data (L2 set aliasing at >64 KiB).
+    # Flush stale dirty L2 lines ONCE before all mirror writes (per-mirror flush would alias stale L2 over earlier PRAMIN data).
     _gk104_ltc_invalidate(dev, flush=True)
     for _mirror in getattr(dev, "_kepler_vram_mirrors", ()):
       _chunks = _mirror.meta.get("vram_chunks")
@@ -11987,24 +11479,17 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             _take = min(_chunk_sz, len(_mirror_wanted) - _off)
             if _take <= 0:
               break
-            _via.add(vram_store(_chunk_pa, _mirror_wanted[_off:_off + _take],
-                                label="mirror-stabilize"))
+            _via.add(vram_store(_chunk_pa, _mirror_wanted[_off:_off + _take], label="mirror-stabilize"))
             _off += _take
           _gk104_bar_flush(dev)
-          # H23: flush=True if any chunk was stored via BAR1 (BAR1 writes go
-          # through L2 and need a flush to commit dirty lines to VRAM).
-          # flush=False if all chunks were PRAMIN (PRAMIN bypasses L2; a flush
-          # would write back stale dirty L2 lines over fresh VRAM data).
+          # flush=True if BAR1 was used (BAR1 goes through L2); False if all PRAMIN (bypasses L2; flush would write back stale lines).
           _need_flush = "bar1" in _via
           if not _gk104_ltc_invalidate(dev, flush=_need_flush):
             raise TimeoutError("GK104 LTC invalidate for VRAM mirror failed")
           time.sleep(0.005)
-          # H22/H23: sample offsets (0, mid, end) missed bit15 flips.  Always
-          # full-verify compute mirrors up to 64 KiB; sample only for TLS/heap.
+          # Full-verify compute mirrors up to 64 KiB; sample only for TLS/heap.
           _mirror_ok = True
-          _sample_mode = (
-              os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full" and
-              len(_mirror_wanted) > 0x10000)
+          _sample_mode = (os.environ.get("KEPLER_ZERO_VERIFY", "sample") != "full" and len(_mirror_wanted) > 0x10000)
           if _sample_mode and len(_mirror_wanted) >= 16:
             for _poff in (0, len(_mirror_wanted) // 2,
                           max(0, len(_mirror_wanted) - 4)):
@@ -12061,8 +11546,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     for _attempt in range(4):
       _gk104_pramin_write(dev, ramin_vram_pa, _ramin_expected)
       _gk104_bar_flush(dev)
-      # H23: flush=False — RAMFC PRAMIN write must not be overwritten by a
-      # stale dirty L2 writeback from the flush step.
+      # flush=False — RAMFC PRAMIN write must not be overwritten by stale dirty L2 writeback.
       if not _gk104_ltc_invalidate(dev, flush=False):
         raise TimeoutError("GK104 LTC invalidate for RAMFC did not complete")
       time.sleep(0.005)
@@ -13034,53 +12518,24 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"actual={_guard_after_vmm:#x}", flush=True)
     print(f"[kepler] runtime context armed: CHAN_ADDR={dev.read32(0x409b00):#x} "
           f"CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
-    # H22/H23: read every read-only compute mirror before GP_PUT to warm L2.
-    # The LTC invalidate register (0x070004) is not effective on this post-bit0
-    # card, but read-through populates L2 with correct VRAM lines, which the SM
-    # then hits.  Without this, N>1024 scattered ~14% of lanes read stale L2
-    # data (bit 13/15 flips on b/cbuf).  Use BAR1 bulk reads for large mirrors
-    # (fast, also goes through L2); per-dword PRAMIN for small mirrors (≤64 KiB)
-    # to also verify bit-level correctness.  Skip write-only/scratch mirrors
-    # (out, TLS, heap) — the SM doesn't read them as data.
-    _warm_ro_only = os.environ.get("KEPLER_L2_WARM_RO_ONLY", "1") != "0"
+    # L2 warming: read every read-only compute mirror before GP_PUT so SMs hit correct L2 lines.  Without this, N>1024 scattered ~14% of lanes with stale L2 data.  Skip write-only/scratch mirrors (out=2, temp=3, txc=4) — SMs don't read them as data.
     _all_mirrors = getattr(dev, "_kepler_vram_mirrors", ()) or ()
-    # Mirrors list order: [a, b, out, temp, txc, code, *cbufs, *cwds].
-    # out (index 2) is write-only; temp (index 3) and txc (index 4) are scratch.
-    _skip_indices = {2, 3, 4} if _warm_ro_only else set()
-    if (use_vram_inst and
-        os.environ.get("KEPLER_DUMP_MIRROR_AB", "1") != "0"):
+    _skip_indices = {2, 3, 4}
+    if use_vram_inst:
       for _mi, _m in enumerate(_all_mirrors):
         _mpa = _m.meta.get("vram_pa")
         if _mpa is None or _m.size > 0x100000:
           continue
-        # Skip write-only output and scratch (TLS/heap) — SM doesn't read them.
         if _mi in _skip_indices:
           continue
         try:
           _want = bytes(_m.cpu_view()[:_m.size])
         except Exception:
           continue
-        # H23: per-dword PRAMIN reads warm L2 with correct data for the SM
-        # to hit.  Cap at 128 KiB per mirror (= L2 size): warming more is
-        # pointless since L2 can't hold it, and the SM fetches the rest
-        # from VRAM on L2 miss (VRAM is correct via PRAMIN writes).
-        # Full verify for ≤128 KiB; head-only for larger mirrors.
-        # H23g: KEPLER_L2_WARM_VIA_BAR1=1 uses a single BAR1 bulk read
-        # instead of per-dword PRAMIN reads (1 RPC vs 16384).  BAR1 reads
-        # go through L2 and warm it with correct VRAM data.  BAR1 bulk
-        # reads are reliable up to 128 KiB; 256 KiB corrupts (H23b/OQ2).
-        # H26: LTC invalidate (0x70004) is not the desktop coherency
-        # mechanism (Nouveau only calls it on GK20a); BAR1 read-through
-        # is the correct L2 warming approach for this platform.
+        # Cap at 128 KiB per mirror (= L2 size); BAR1 bulk reads are reliable up to 128 KiB, 256 KiB corrupts.
         _warm_n = min(_m.size, 0x20000)
         _got = bytearray(_m.size)
-        if os.environ.get("KEPLER_L2_WARM_VIA_BAR1", "1") == "1" and _warm_n <= 0x20000:
-          _got[:_warm_n] = dev.dev_impl.hw.mmio_read(1, _mpa, _warm_n)
-        else:
-          for _off in range(0, _warm_n, 4):
-            struct.pack_into("<I", _got, _off,
-                            _gk104_pramin_read32(dev, _mpa + _off,
-                                                 force_bar0=True))
+        _got[:_warm_n] = dev.dev_impl.hw.mmio_read(1, _mpa, _warm_n)
         _xors = []
         for _off in range(0, _warm_n, 4):
           _w = struct.unpack_from("<I", _want, _off)[0]
@@ -13088,10 +12543,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           if _w != _g:
             _xors.append((_off, _w, _g, _w ^ _g))
         if _xors:
-          # H22 settle: rewrite drifted dwords through BAR0 PRAMIN and recheck.
+          # Settle: rewrite drifted dwords through BAR0 PRAMIN and recheck.
           for _off, _w, _g, _x in _xors:
-            _gk104_pramin_write(dev, _mpa + _off, struct.pack("<I", _w),
-                                force_bar0=True)
+            _gk104_pramin_write(dev, _mpa + _off, struct.pack("<I", _w), force_bar0=True)
           _gk104_bar_flush(dev)
           time.sleep(0.002)
           _xors2 = []
@@ -13102,20 +12556,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             if _w != _g:
               _xors2.append((_off, _w, _g, _w ^ _g))
           _xors = _xors2
-        print(f"[kepler] pre-GP_PUT mirror va={_m.va_addr:#x} pa={_mpa:#x} "
-              f"size={_m.size:#x} mismatches={len(_xors)} "
-              f"xors={[ (hex(o), hex(w), hex(g), hex(x)) for o,w,g,x in _xors[:8] ]} "
-              f"head_want={_want[:16].hex()} head_got={bytes(_got[:16]).hex()}",
-              flush=True)
         if _xors:
-          raise RuntimeError(
-              f"GK104 compute mirror unsettled before GP_PUT: "
-              f"va={_m.va_addr:#x} xors={[(hex(o), hex(x)) for o,_,_,x in _xors]}")
+          raise RuntimeError(f"GK104 compute mirror unsettled before GP_PUT: va={_m.va_addr:#x} xors={[(hex(o), hex(x)) for o,_,_,x in _xors]}")
     if use_vram_inst:
-      # Make the observed GR guard leaf the final framebuffer store before the
-      # USERD notification.  The complete hierarchy was already invalidated
-      # above; this last literal publication closes the window in which the
-      # cold PRAMIN path can settle a dword to its complemented write payload.
+      # Make the observed GR guard leaf the final framebuffer store before the USERD notification.  The complete hierarchy was already invalidated above; this last literal publication closes the window in which the cold PRAMIN path can settle a dword to its complemented write payload.
       _gk104_pramin_write_literal(
           dev, fault_guard_pte_addr,
           struct.pack("<Q", fault_guard_pte_wanted))
@@ -13141,16 +12585,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         # BAR1 precisely so GP_PUT can be written through the CPU aperture.
         if os.environ.get("KEPLER_SUBMIT_FE_PWR", "1") != "0":
           _gk104_fe_pwr_force_on(dev)
-        # H23: final L2 invalidate (drop, no writeback) right before GP_PUT so
-        # the SM loads fresh VRAM, not stale L2 lines re-cached by PTE/RAMFC
-        # BAR1 traffic between mirror-stabilize and launch.
-        # H23f: skip if KEPLER_SKIP_FINAL_LTC_INV=1 to test whether the
-        # invalidate drops the warmed L2 lines (making pre-GP_PUT warming
-        # appear necessary when it's actually the invalidate causing the
-        # re-pollution).
-        if os.environ.get("KEPLER_SKIP_FINAL_LTC_INV", "0") != "1":
-          if not _gk104_ltc_invalidate(dev, flush=False):
-            print("[kepler] WARN: pre-GP_PUT LTC invalidate timed out", flush=True)
+        # Final L2 invalidate (drop, no writeback) right before GP_PUT so SMs load fresh VRAM, not stale L2 lines re-cached by PTE/RAMFC BAR1 traffic.
+        if not _gk104_ltc_invalidate(dev, flush=False):
+          print("[kepler] WARN: pre-GP_PUT LTC invalidate timed out", flush=True)
         dev.dev_impl.hw.mmio_write(
             1, _userd_mmio_base + USERD_GP_PUT, struct.pack("<I", _gp_put_initial))
         _gk104_bar_flush(dev)
@@ -13385,8 +12822,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         _gk104_bar_flush(dev)
     _gp_get_snapshot_taken = False
     for _ in range(2000):
-      # H18: eng-ctx auto-load on SET_OBJECT races FE power-gate; keep FE alive
-      # in the same RPC thread (works with KEPLER_SINGLE_THREAD_RPC=1).
+      # H18: eng-ctx auto-load on SET_OBJECT races FE power-gate; keep FE alive in the same RPC thread.
       if (dev.dev_impl.hw is not None and
           os.environ.get("KEPLER_SUBMIT_FE_PWR", "1") != "0"):
         _gk104_fe_pwr_force_on(dev)
@@ -13412,28 +12848,15 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           _trap = dev.read32(0x400108)
           _gpc_trap = dev.read32(0x400118)
           _sked_status = dev.read32(0x407020) & 0x3fffffff
-          # Service SKED even when GP_GET is still 0 — on 7-TPC boards the
-          # entry can trap before USERD advances, and waiting for GET leaves
-          # the channel wedged forever.
-          _empty_sked_trap = bool(
-              (_intr & 0x00200000) and _trap == 0x00000100 and
-              _gpc_trap == 0 and _sked_status == 0)
+          # Service SKED even when GP_GET is still 0 — on 7-TPC boards the entry can trap before USERD advances, and waiting for GET leaves the channel wedged forever.
+          _empty_sked_trap = bool((_intr & 0x00200000) and _trap == 0x00000100 and _gpc_trap == 0 and _sked_status == 0)
           _any_sked = bool(_sked_status) or bool(_trap & 0x100)
           if _empty_sked_trap or (_any_sked and not _gp_get_snapshot_taken):
             if _empty_sked_trap:
               dev.write32(0x400108, 0x00000100)
               dev.write32(0x400100, 0x00200000)
               dev.write32(0x400500, 0x00010001)
-              print(f"[kepler-trap] serviced empty SKED: "
-                    f"INTR={dev.read32(0x400100):#x} "
-                    f"TRAP={dev.read32(0x400108):#x} "
-                    f"GP_GET={_gp_get_now}", flush=True)
-            elif _any_sked:
-              print(f"[kepler-trap] SKED live during poll: "
-                    f"INTR={_intr:#x} TRAP={_trap:#x} "
-                    f"SKED={_sked_status:#x}[{','.join(_decode_bits(_sked_status, _GK104_SKED_ERRORS)) or '-'}] "
-                    f"GPC_TRAP={_gpc_trap:#x} GP_GET={_gp_get_now}",
-                    flush=True)
+              print(f"[kepler-trap] serviced empty SKED: INTR={dev.read32(0x400100):#x} TRAP={dev.read32(0x400108):#x} GP_GET={_gp_get_now}", flush=True)
             _gp_get_snapshot_taken = True
         except Exception:
           pass
@@ -13443,34 +12866,6 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       break
   else:
     return
-  # Do not quiesce and then continue issuing diagnostic BAR reads.  The caller's
-  # finally block owns teardown, and a timeout path must fail without hundreds
-  # of extra endpoint transactions against a potentially wedged channel.
-  if use_vram_inst and dev.dev_impl.hw is not None:
-    try:
-      _intr = dev.read32(0x400100)
-      _trap = dev.read32(0x400108)
-      _sked = dev.read32(0x407020) & 0x3fffffff
-      _stat = dev.read32(0x400700)
-      _taddr = dev.read32(0x400704)
-      _tdata = dev.read32(0x400708)
-      _subch = [dev.read32(0x404200 + i * 4) for i in range(8)]
-      print(f"[kepler] timeout GR: INTR={_intr:#x} TRAP={_trap:#x}"
-            f"[{','.join(_decode_bits(_trap, _GK104_PGRAPH_TRAP_BITS)) or '-'}] "
-            f"STATUS={_stat:#x} TRAPPED={_taddr:#x}/{_tdata:#x} "
-            f"SKED={_sked:#x}[{','.join(_decode_bits(_sked, _GK104_SKED_ERRORS)) or '-'}] "
-            f"SUBCH={[hex(x) for x in _subch]} "
-            f"FECS={dev.read32(0x409100):#x}@{dev.read32(0x409ff0):#x} "
-            f"CHAN={dev.read32(0x409b00):#x}",
-            flush=True)
-      _gs = [_gk104_pramin_read32(dev, grctx_golden_vram_pa + o)
-             for o in (0, 0x100, 0x200, 0x1000, 0x2000)]
-      _rs = [_gk104_pramin_read32(dev, grctx_vram_pa + o)
-             for o in (0, 0x100, 0x200, 0x1000, 0x2000)]
-      print(f"[kepler] timeout ctx sample golden={[hex(x) for x in _gs]} "
-            f"runtime={[hex(x) for x in _rs]}", flush=True)
-    except Exception as _trap_e:
-      print(f"[kepler] timeout GR dump failed: {_trap_e}", flush=True)
   if use_vram_inst:
     _timeout_fault_source = dev.read32(0x259c)
     _timeout_faults = []
@@ -13728,15 +13123,13 @@ def _run_hardware_demo_windows(dev, cubin, a_host, b_host, chunk, window_chunks)
   try:
     while offset < N:
       n_win = min(win, N - offset)
-      print(f"[kepler] channel window offset={offset} n={n_win} "
-            f"(≤{window_chunks} LAUNCHes/channel)", flush=True)
+      print(f"[kepler] channel window offset={offset} n={n_win} (≤{window_chunks} LAUNCHes/channel)", flush=True)
       if not first:
         try:
           cur.close()
         except Exception as e:
           print(f"[kepler] window close: {e}", flush=True)
-        # H25: sleep between windows to let USB4 transport recover.
-        # 64+ rapid device open/close cycles crashed macOS.
+        # Sleep between windows to let USB4 transport recover.
         _inter_win_sleep = float(
             os.environ.get("KEPLER_INTER_WINDOW_SLEEP", "0.5"))
         if _inter_win_sleep > 0:
@@ -13797,18 +13190,14 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   if chunk <= 0 or chunk > 1024:
     raise ValueError(f"invalid KEPLER_BLOCK={chunk}; expected 1..1024")
   n_chunks = (N + chunk - 1) // chunk
-  # H23: GK104 L2 is 128 KiB.  a+b = N*8 bytes must fit in L2 for the PRAMIN
-  # read-through L2 warming to cover all elements.  Max N for multi-CTA =
-  # 128 KiB / 8 = 16384.  Max chunks per window = 16384 / chunk = 16.
+  # GK104 L2 is 128 KiB; a+b = N*8 bytes must fit in L2 for read-through warming.  Max N for multi-CTA = 128 KiB / 8 = 16384.
   _l2_max_elements = int(os.environ.get("KEPLER_L2_MAX_ELEMENTS", "16384"), 0)
   _l2_max_chunks = max(1, _l2_max_elements // chunk)
-  _one_ib_max = int(os.environ.get("KEPLER_LAUNCH_ONE_IB_MAX",
-                                    str(_l2_max_chunks)), 0)
+  _one_ib_max = int(os.environ.get("KEPLER_LAUNCH_ONE_IB_MAX", str(_l2_max_chunks)), 0)
   _ib_max = int(os.environ.get("KEPLER_LAUNCH_IB_MAX", "16"), 0)
   if _ib_max <= 0:
     _ib_max = max(_one_ib_max, 1)
-  _mcta_auto_max = int(os.environ.get("KEPLER_MULTI_CTA_AUTO_MAX",
-                                      str(_l2_max_elements)), 0)
+  _mcta_auto_max = int(os.environ.get("KEPLER_MULTI_CTA_AUTO_MAX", str(_l2_max_elements)), 0)
   _mcta = os.environ.get("KEPLER_MULTI_CTA", "auto").lower()
   if _mcta in ("1", "true", "yes", "on"):
     use_multi_cta = True
@@ -13828,13 +13217,10 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     random.seed(int(_seed, 0))
     print(f"[kepler] RNG seed={int(_seed, 0)}", flush=True)
   if use_multi_cta:
-    print(f"[kepler] launch N={N} multi-CTA grid=({n_chunks},1,1) "
-          f"block=({chunk},1,1)", flush=True)
+    print(f"[kepler] launch N={N} multi-CTA grid=({n_chunks},1,1) block=({chunk},1,1)", flush=True)
   else:
     _n_wins = (n_chunks + _one_ib_max - 1) // _one_ib_max
-    print(f"[kepler] launch N={N} chunks={n_chunks} chunk={chunk} "
-          f"channel_windows={_n_wins} window_chunks={_one_ib_max} "
-          f"(single-CTA each)", flush=True)
+    print(f"[kepler] launch N={N} chunks={n_chunks} chunk={chunk} channel_windows={_n_wins} window_chunks={_one_ib_max} (single-CTA each)", flush=True)
   test_stage = os.environ.get("KEPLER_TEST_STAGE", "full-add")
   if (not _no_window and not use_multi_cta and n_chunks > _one_ib_max
       and test_stage == "full-add"):
@@ -13843,11 +13229,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     _n_wins_check = (n_chunks + _one_ib_max - 1) // _one_ib_max
     _max_wins = int(os.environ.get("KEPLER_MAX_WINDOWS", "32"), 0)
     if _n_wins_check > _max_wins:
-      raise ValueError(
-          f"N={N} requires {_n_wins_check} channel windows but "
-          f"KEPLER_MAX_WINDOWS={_max_wins} (64+ windows crash macOS via "
-          f"TinyGPU USB4 transport exhaustion). Reduce N or raise "
-          f"KEPLER_MAX_WINDOWS.")
+      raise ValueError(f"N={N} requires {_n_wins_check} channel windows but KEPLER_MAX_WINDOWS={_max_wins} (64+ windows crash macOS via TinyGPU USB4 transport exhaustion). Reduce N or raise KEPLER_MAX_WINDOWS.")
     if _hosts is not None:
       a_host, b_host = _hosts
     else:
@@ -13887,14 +13269,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   # Mesa TLS: CRS for 64 warps × live MP count (GTX 770=8, this 660 Ti=7).
   _mp_count = _gk104_mp_count_for(dev)
   _temp_size = _mp_count * GK104_TEMP_PER_MP
-  print(f"[kepler] compute TLS: mp_count={_mp_count} temp_size={_temp_size:#x}",
-        flush=True)
-  # SET_OBJECT's firmware probe reads channel VA 0x100000.  A dedicated guard
-  # PTE backs that leaf; if TLS lands at 0x80000 with size 0xe0000 it covers
-  # 0x100000, live_pte_map fights the guard (wanted=guard actual=temp-mirror),
-  # and pre-GP_PUT guard restore punches a hole in TLS — GPC1+GPC2 then stick
-  # busy forever with NaN output.  Do not trust small-pad freelist cursor alone:
-  # keep allocating TLS-sized buffers until the chosen VA is past 0x200000.
+  print(f"[kepler] compute TLS: mp_count={_mp_count} temp_size={_temp_size:#x}", flush=True)
+  # SET_OBJECT's firmware probe reads channel VA 0x100000; if TLS covers that leaf, live_pte_map fights the guard PTE and pre-GP_PUT restore punches a hole in TLS (GPC1+GPC2 stick busy, NaN output).  Keep allocating until VA is past 0x200000.
   _tls_pads = []
   _probe_lo, _probe_hi = 0x100000, 0x101000
   _tls_floor = 0x200000
@@ -13906,14 +13282,9 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
       break
     _tls_pads.append(temp_dev)
     if len(_tls_pads) > 32:
-      raise RuntimeError(
-          f"failed to place TLS past SET_OBJECT probe: "
-          f"last={_t0:#x}+{_temp_size:#x} pads={len(_tls_pads)}")
-  print(f"[kepler] TLS va={temp_dev.va_addr:#x} "
-        f"(discarded {len(_tls_pads)} overlapping/low TLS allocs)", flush=True)
-  # Mesa txc heap: 2048 TIC + 2048 TSC entries = 128 KiB.  Must NOT land in the
-  # GR scratch hole (pagepool @0x20000, bundle @0x28000) — a low hole alloc
-  # would stomp those PTEs when mirrors are applied.
+      raise RuntimeError(f"failed to place TLS past SET_OBJECT probe: last={_t0:#x}+{_temp_size:#x} pads={len(_tls_pads)}")
+  print(f"[kepler] TLS va={temp_dev.va_addr:#x} (discarded {len(_tls_pads)} overlapping/low TLS allocs)", flush=True)
+  # Mesa txc heap (128 KiB) must not land in the GR scratch hole (pagepool @0x20000, bundle @0x28000) — low allocs stomp those PTEs when mirrors are applied.
   _txc_spacers = []
   while True:
     txc_dev = allocator.alloc(0x20000, align=0x10000)
@@ -13921,15 +13292,12 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
       break
     _txc_spacers.append(txc_dev)
   allocator._copyin(txc_dev, bytes(0x20000))
-  print(f"[kepler] TIC/TSC heap va={txc_dev.va_addr:#x} "
-        f"(skipped {len(_txc_spacers)} low hole allocs)", flush=True)
+  print(f"[kepler] TIC/TSC heap va={txc_dev.va_addr:#x} (skipped {len(_txc_spacers)} low hole allocs)", flush=True)
   # Code + constant (param) buffers for the launch descriptor.
   sass = elf_section_bytes(cubin, ".text.E_4")
   code_dev = allocator.alloc(round_up(len(sass), 0x100))
   allocator._copyin(code_dev, sass)
   regs = cubin_register_count(cubin, "E_4")
-  if os.environ.get("KEPLER_FORCE_REGS"):
-    regs = int(os.environ["KEPLER_FORCE_REGS"], 0)
   cwd_devs = []
   cbuf_devs = []
   if use_multi_cta:
@@ -13938,9 +13306,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
         grid=(n_chunks, 1, 1), block=(chunk, 1, 1))
     cbuf_dev = allocator.alloc(len(cbuf))
     allocator._copyin(cbuf_dev, cbuf)
-    cwd = build_cwd(code_addr=0, grid=(n_chunks, 1, 1), block=(chunk, 1, 1),
-                    cbuf_addr=cbuf_dev.va_addr, regs=regs,
-                    cb7_addr=txc_dev.va_addr, cb7_size=0x800)
+    cwd = build_cwd(code_addr=0, grid=(n_chunks, 1, 1), block=(chunk, 1, 1), cbuf_addr=cbuf_dev.va_addr, regs=regs, cb7_addr=txc_dev.va_addr, cb7_size=0x800)
     cwd_dev = allocator.alloc(len(cwd))
     allocator._copyin(cwd_dev, cwd)
     cbuf_devs.append(cbuf_dev)
@@ -13954,9 +13320,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
           grid=(1, 1, 1), block=(n, 1, 1))
       cbuf_dev = allocator.alloc(len(cbuf))
       allocator._copyin(cbuf_dev, cbuf)
-      cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(n, 1, 1),
-                      cbuf_addr=cbuf_dev.va_addr, regs=regs,
-                      cb7_addr=txc_dev.va_addr, cb7_size=0x800)
+      cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(n, 1, 1), cbuf_addr=cbuf_dev.va_addr, regs=regs, cb7_addr=txc_dev.va_addr, cb7_size=0x800)
       cwd_dev = allocator.alloc(len(cwd))
       allocator._copyin(cwd_dev, cwd)
       cbuf_devs.append(cbuf_dev)
@@ -13979,12 +13343,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   # multi-IB does not lift the ~19 LAUNCH/channel ceiling.
   cwd_addrs = [c.va_addr for c in cwd_devs]
   if set_object_only:
-    # SET_OBJECT leaves PGRAPH sticky-busy on this card; completion must use
-    # RELEASE_WFI=DIS (bit20 → 0x00100002), not RELEASE_SIZE_4BYTE (bit24 →
-    # 0x01000002) which was mislabeled as WFI=DIS and hung forever.
-    words = [*nvm(1, 0x0000, KEPLER_COMPUTE_A),
-             *gk104_semaphore(signal.va_addr, 2, GK104_SEM_RELEASE_NO_WFI),
-             *nvm(0, 0x0020, 0)]
+    # SET_OBJECT leaves PGRAPH sticky-busy; completion must use RELEASE_WFI=DIS (bit20 → 0x00100002), not RELEASE_SIZE_4BYTE (bit24 → 0x01000002) which was mislabeled as WFI=DIS and hung forever.
+    words = [*nvm(1, 0x0000, KEPLER_COMPUTE_A), *gk104_semaphore(signal.va_addr, 2, GK104_SEM_RELEASE_NO_WFI), *nvm(0, 0x0020, 0)]
     launch_batches = [(words, 2)]
   else:
     # Channel-windowed path guarantees ≤_one_ib_max CWDs per submit.
@@ -13992,10 +13352,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
       raise ValueError(
           f"internal: {len(cwd_addrs)} CWDs exceeds one-channel ceiling "
           f"{_one_ib_max}")
-    words, launch_done = build_multi_launch_words(
-        signal.va_addr, 2, cwd_addrs,
-        code_dev.va_addr, temp_dev.va_addr, _temp_size,
-        mp_count=_mp_count, tic_va=txc_dev.va_addr)
+    words, launch_done = build_multi_launch_words(signal.va_addr, 2, cwd_addrs, code_dev.va_addr, temp_dev.va_addr, _temp_size, mp_count=_mp_count, tic_va=txc_dev.va_addr)
     launch_batches = [(words, launch_done)]
   # Verify compute buffers are mapped in the channel's VMM
   if dev.dev_impl.hw is not None:
@@ -14023,27 +13380,17 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
           f"RED_SWITCH={dev.read32(0x409614):#x} "
           f"PGRAPH_STATUS={_pgraph_status_pre:#x} "
           f"FECS_CTRL={dev.read32(0x409100):#x}", flush=True)
-    # H2 guard: SET_OBJECT hang clears GPC1/2 TPC_NR (c08→0) while sticky
-    # GPC_STATUS=0x6.  Re-arm floorsweep TPC_NR from silicon 0x2608 right
-    # before the push so eng-ctx load does not start with all-ones counts.
-    # Disable with KEPLER_PRE_LAUNCH_FLOORSWEEP=0.
+    # H2 guard: SET_OBJECT hang clears GPC1/2 TPC_NR (c08→0) with sticky GPC_STATUS=0x6; re-arm from silicon 0x2608 right before the push.  Disable with KEPLER_PRE_LAUNCH_FLOORSWEEP=0.
     if os.environ.get("KEPLER_PRE_LAUNCH_FLOORSWEEP", "1") != "0":
       _gpc_nr = dev.read32(0x409604) & 0x1f
       _fuse_tpc = _gk104_read_tpc_nr(dev, _gpc_nr)
-      _ppc_masks = [
-          ((1 << _fuse_tpc[g]) - 1) if _fuse_tpc[g] else 0
-          for g in range(_gpc_nr)]
-      # Prefer live PPC mask when forcing is off and silicon reports one.
-      if not os.environ.get("KEPLER_FORCE_TPC_NR", "").strip():
-        _ppc_masks = [(dev.read32(0x500c30 + g * 0x8000) & 0xff) or
-                      _ppc_masks[g] for g in range(_gpc_nr)]
+      _ppc_masks = [((1 << _fuse_tpc[g]) - 1) if _fuse_tpc[g] else 0 for g in range(_gpc_nr)]
+      # Prefer live PPC mask when silicon reports one.
+      _ppc_masks = [(dev.read32(0x500c30 + g * 0x8000) & 0xff) or _ppc_masks[g] for g in range(_gpc_nr)]
       _gk104_grctx_floorsweep(dev, _fuse_tpc, _ppc_masks)
-      print(f"[kepler] pre-launch floorsweep re-armed: tpc={_fuse_tpc} "
-            f"ppc={[hex(m) for m in _ppc_masks]}", flush=True)
+      print(f"[kepler] pre-launch floorsweep re-armed: tpc={_fuse_tpc} ppc={[hex(m) for m in _ppc_masks]}", flush=True)
     _pre_c08 = [dev.read32(0x500c08 + g * 0x8000) for g in range(4)]
-    print(f"[kepler] pre-launch GPC TPC_NR: c08={[hex(x) for x in _pre_c08]} "
-          f"405b00={dev.read32(0x405b00):#x} "
-          f"GPC_STATUS={dev.read32(0x400604):#x}", flush=True)
+    print(f"[kepler] pre-launch GPC TPC_NR: c08={[hex(x) for x in _pre_c08]} 405b00={dev.read32(0x405b00):#x} GPC_STATUS={dev.read32(0x400604):#x}", flush=True)
   if DEBUG:
     pgd_idx = (signal.va_addr >> 27) & 0x1fff
     spt_idx = (signal.va_addr >> 12) & 0x7fff
@@ -14077,231 +13424,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
                   ib_batches=ib_batches)
 
   if sem_only or set_object_only:
-    # Prefix [kepler] so quiet-stdout filtering in main() keeps the line.
-    print(f"[kepler] hardware_{test_stage}=ok value=2", flush=True)
-    if dev.dev_impl.hw is not None:
-      _s=dev.read32(0x400700); _b=dev.read32(0x40060c); _k=dev.read32(0x407020)
-      _eng=dev.read32(0x2640); _mthd=dev.read32(0x409808); _tr=dev.read32(0x40981c)
-      _ctxctl=dev.read32(0x409c00)
-      _pgd=getattr(dev, "_kepler_cloned_by_pgd", None) or {}
-      _pte100=0
-      if 0 in _pgd:
-        _pte100=_gk104_pramin_read32(dev, _pgd[0]+0x100*8)|(
-            _gk104_pramin_read32(dev, _pgd[0]+0x100*8+4)<<32)
-      print(f"[kepler] post-{test_stage}: STATUS2={_s:#x} ALL={bool(_s&1)} "
-            f"GPC={bool(_s&0x1000000)} FE_BUSY={_b:#x} SKED={_k:#x} "
-            f"GPC_STATUS={dev.read32(0x400604):#x} "
-            f"FECS_EXC={dev.read32(0x409c18):#x} "
-            f"INTR={dev.read32(0x400100):#x} TRAP={dev.read32(0x400108):#x}",
-            flush=True)
-      print(f"[kepler] post-{test_stage}-ctxsw: ENG={_eng:#x} "
-            f"busy={bool(_eng&0x80000000)} chsw={bool(_eng&0x8000)} "
-            f"FECS_MTHD={_mthd:#x} chsw_load={bool(_mthd&0x80000)} "
-            f"TRACE={_tr:#x} CTXCTL={_ctxctl:#x} "
-            f"CHAN={dev.read32(0x409b00):#x}/{dev.read32(0x409b04):#x} "
-            f"PC={dev.read32(0x409ff0):#x} subch1={dev.read32(0x404204):#x} "
-            f"PTE100000={_pte100:#x}", flush=True)
-      # Discriminator: does GPC_STATUS ever drop after SET_OBJECT?
-      _gpc_samples=[]
-      for _i in range(20):
-        _gpc_samples.append(dev.read32(0x400604))
-        if _gpc_samples[-1]==0 and not (dev.read32(0x40060c)&1):
-          break
-        time.sleep(0.05)
-      print(f"[kepler] post-{test_stage}-gpc-poll: samples={[hex(x) for x in _gpc_samples]} "
-            f"FECS={dev.read32(0x409100):#x}@{dev.read32(0x409ff0):#x} "
-            f"GPCCS={dev.read32(0x41a100):#x} MMIO_CTRL={dev.read32(0x409728):#x} "
-            f"STATUS2={dev.read32(0x400700):#x}", flush=True)
-      # H1 dump: decode FECS hub MMIO window + strand/mmctx while stuck.
-      _mc = dev.read32(0x409728)
-      _mmio_addr = _mc & 0x03fffffc
-      _tgt = dev.read32(_mmio_addr) if _mmio_addr else 0
-      print(f"[kepler] post-{test_stage}-mmio-strand: "
-            f"CTRL={_mc:#x} ADDR={_mmio_addr:#x} "
-            f"WR={'Y' if _mc & 0x40000000 else 'N'} "
-            f"TRIG={'Y' if _mc & 0x80000000 else 'N'} "
-            f"RDVAL={dev.read32(0x40972c):#x} "
-            f"WRVAL={dev.read32(0x409730):#x} "
-            f"BASE={dev.read32(0x409724):#x} "
-            f"STRAND_STAT={dev.read32(0x409924):#x} "
-            f"STRAND_CMD={dev.read32(0x409928):#x} "
-            f"STRAND_WORDS={dev.read32(0x409910):#x} "
-            f"STRAND_SEL={dev.read32(0x40991c):#x} "
-            f"MMCTX={dev.read32(0x409710):#x} "
-            f"MMCTX_Q={dev.read32(0x409720):#x} "
-            f"LOAD_CNT={dev.read32(0x40974c):#x} "
-            f"HUBSTAT={dev.read32(0x409c00):#x} "
-            f"XFER_BIT={bool(dev.read32(0x409c00) & 0x2000)} "
-            f"SIGNAL={dev.read32(0x409400):#x} "
-            f"FE_PWR={dev.read32(0x404170):#x} "
-            f"target_live={_tgt:#x}", flush=True)
-      # H21: falcons idle but FE_BUSY/GPC_STATUS sticky — dump FE/BAR/RED and
-      # try a host GO_IDLE ICMD.  If GPC drops, FE method pipeline was stuck.
-      _bar_mask0 = dev.read32(0x40940c)
-      _bar_mask1 = dev.read32(0x409410)
-      _bar = dev.read32(0x409414)
-      _hub_red = dev.read32(0x409614)
-      print(f"[kepler] post-{test_stage}-fe-bar: "
-            f"FE_BUSY={dev.read32(0x40060c):#x} "
-            f"STATUS2={dev.read32(0x400700):#x} "
-            f"PGRAPH_CTRL={dev.read32(0x400500):#x} "
-            f"BAR_MASK0={_bar_mask0:#x} BAR_MASK1={_bar_mask1:#x} "
-            f"BAR={_bar:#x} "
-            f"HUB_RED={_hub_red:#x} "
-            f"(EN_MAIN={bool(_hub_red & 0x100)} EN_GPC={bool(_hub_red & 0x200)} "
-            f"EN_ROP={bool(_hub_red & 0x400)} "
-            f"PWR_MAIN={bool(_hub_red & 0x10)} PWR_GPC={bool(_hub_red & 0x20)} "
-            f"PWR_ROP={bool(_hub_red & 0x40)}) "
-            f"UNK86C={dev.read32(0x40986c):#x} "
-            f"408a14={dev.read32(0x408a14):#x}", flush=True)
-      if (os.environ.get("KEPLER_MID_HANG_GO_IDLE", "1") != "0" and
-          (_gpc_samples[-1] if _gpc_samples else 0) != 0):
-        _gpc_before_gi = dev.read32(0x400604)
-        _fe_before_gi = dev.read32(0x40060c)
-        try:
-          # Nouveau gf100_gr_icmd GO_IDLE bundle address ends in 0xe100.
-          _gk104_gr_icmd(dev, [(0x400e100, 0)])
-          _gi_err = None
-        except Exception as _gie:
-          _gi_err = f"{type(_gie).__name__}:{_gie}"
-        _gpc_after_gi = []
-        for _i in range(10):
-          _gpc_after_gi.append(dev.read32(0x400604))
-          if _gpc_after_gi[-1] == 0 and not (dev.read32(0x40060c) & 1):
-            break
-          time.sleep(0.05)
-        print(f"[kepler] post-{test_stage}-go-idle: "
-              f"GPC={_gpc_before_gi:#x}->{_gpc_after_gi[-1]:#x} "
-              f"FE_BUSY={_fe_before_gi:#x}->{dev.read32(0x40060c):#x} "
-              f"STATUS2={dev.read32(0x400700):#x} "
-              f"ENG={dev.read32(0x2640):#x} "
-              f"err={_gi_err} samples={[hex(x) for x in _gpc_after_gi]}",
-              flush=True)
-      # H2 mid-hang: eng-ctx load clears GPC1/2 TPC_NR (unk→0) while FECS parks
-      # at SLEEPING@0x567 with MMIO_CTRL pending (LTC or GPC3+0x30e4).  Attempt
-      # host floorsweep re-arm + FECS method nudge; if GPC_STATUS drops, H2 is
-      # causal.  KEPLER_MID_HANG_GPC_REPAIR=0 disables.
-      if (os.environ.get("KEPLER_MID_HANG_GPC_REPAIR", "1") != "0" and
-          (_gpc_samples[-1] if _gpc_samples else 0) != 0):
-        _gpc_nr = dev.read32(0x409604) & 0x1f
-        _fuse = _gk104_read_tpc_nr(dev, _gpc_nr)
-        _ppc = [
-            ((1 << _fuse[g]) - 1) if _fuse[g] else 0
-            for g in range(_gpc_nr)]
-        if not os.environ.get("KEPLER_FORCE_TPC_NR", "").strip():
-          _ppc = [(dev.read32(0x500c30 + g * 0x8000) & 0xff) or _ppc[g]
-                  for g in range(_gpc_nr)]
-        _mmio_before = dev.read32(0x409728)
-        _fe_before = dev.read32(0x404170)
-        # H17: eng-ctx can leave FE_PWR=0 (empty-mmio hang saw WRVAL=0x10 to
-        # 0x404170 with live=0).  Re-assert FORCE_ON before floorsweep nudge.
-        dev.write32(0x404170, 0x00000012)
-        _gk104_grctx_floorsweep(dev, _fuse, _ppc)
-        # Host-restore v0 only on GPCs that remain in the forced map.
-        for _g in range(_gpc_nr):
-          if not _fuse[_g]:
-            continue
-          _gb = 0x500000 + _g * 0x8000
-          if (dev.read32(_gb + 0xc80) == 0 and
-              (dev.read32(0x400604) & (1 << _g))):
-            dev.write32(_gb + 0xc80, 0x20200004)
-        _post_c08 = [dev.read32(0x500c08 + g * 0x8000) for g in range(4)]
-        _gpc_after = []
-        for _i in range(20):
-          _gpc_after.append(dev.read32(0x400604))
-          if _gpc_after[-1] == 0:
-            break
-          time.sleep(0.05)
-        print(f"[kepler] post-{test_stage}-tpcnr-repair: "
-              f"GPC_STATUS={_gpc_after[-1]:#x} c08={[hex(x) for x in _post_c08]} "
-              f"ENG={dev.read32(0x2640):#x} "
-              f"FECS={dev.read32(0x409100):#x}@{dev.read32(0x409ff0):#x} "
-              f"CHAN={dev.read32(0x409b00):#x} "
-              f"FE_PWR={_fe_before:#x}->{dev.read32(0x404170):#x} "
-              f"MMIO_before={_mmio_before:#x} "
-              f"MMIO_after={dev.read32(0x409728):#x} "
-              f"samples={[hex(x) for x in _gpc_after]}", flush=True)
-      _gpc_detail=[]
-      for _g in range(4):
-        _gb=0x500000+_g*0x8000
-        _gpc_detail.append(
-          f"GPC{_g}:fs={dev.read32(_gb+0xc30):#x} "
-          f"unk={dev.read32(_gb+0xc08):#x} "
-          f"red={dev.read32(0x502614+_g*0x8000):#x} "
-          f"v0={dev.read32(_gb+0xc80):#x} "
-          f"ctrl={dev.read32(0x502100+_g*0x8000):#x} "
-          f"sc0={dev.read32(0x502800+_g*0x8000):#x}")
-      print(f"[kepler] post-{test_stage}-gpc-detail: {' | '.join(_gpc_detail)} "
-            f"HUB_RED={dev.read32(0x409614):#x} 405b00={dev.read32(0x405b00):#x} "
-            f"ENG={dev.read32(0x2640):#x} IRQMASK={dev.read32(0x409018):#x} "
-            f"ACCESS_EN={dev.read32(0x409048):#x}", flush=True)
-      # H19: per-GPC GPCCS falcon state (0x502000+g*0x8000).  FECS is already
-      # back in main wait@0x567; if GPC1/2 GPCCS are wedged mid-ctx_xfer while
-      # GPC0/3 are idle, that is the sticky-GPC cause.
-      _gpccs_lines = []
-      for _g in range(4):
-        _gb = 0x502000 + _g * 0x8000
-        _gpccs_lines.append(
-            f"GPC{_g}:CTRL={dev.read32(_gb+0x100):#x} "
-            f"PC={dev.read32(_gb+0xff0):#x} "
-            f"CPUSTAT={dev.read32(_gb+0x128):#x} "
-            f"SCR0={dev.read32(_gb+0x800):#x} "
-            f"SCR1={dev.read32(_gb+0x804):#x} "
-            f"ENGSTAT={dev.read32(_gb+0xc00):#x} "
-            f"MMIO={dev.read32(_gb+0x728):#x} "
-            f"SIGNAL={dev.read32(_gb+0x400):#x} "
-            f"INTR={dev.read32(_gb+0x008):#x} "
-            f"RED={dev.read32(0x502614+_g*0x8000):#x}")
-      print(f"[kepler] post-{test_stage}-gpccs: "
-            f"HUB_GPCCS={dev.read32(0x41a100):#x}@{dev.read32(0x41aff0):#x} "
-            f"{' || '.join(_gpccs_lines)}", flush=True)
-      # H19b: TPC unit VSTATUS on busy GPCs (falcons were idle@0x50b).
-      _tpc_lines = []
-      for _g in range(4):
-        if not (dev.read32(0x400604) & (1 << _g)):
-          continue
-        _nr = dev.read32(0x500000 + _g * 0x8000 + 0x2608) & 0x1f
-        for _t in range(max(_nr, 1)):
-          _tb = 0x504000 + _g * 0x8000 + _t * 0x800
-          _tpc_lines.append(
-              f"GPC{_g}.TPC{_t}:V0={dev.read32(_tb+0x600):#x} "
-              f"V1={dev.read32(_tb+0x638):#x} "
-              f"TRAP={dev.read32(_tb+0x648):#x}/"
-              f"{dev.read32(_tb+0x650):#x}")
-      if _tpc_lines:
-        print(f"[kepler] post-{test_stage}-tpc-vstatus: "
-              f"{' | '.join(_tpc_lines)}", flush=True)
-      # H20: FECS/GPCCS idle but GPC_STATUS sticky — try channel preempt +
-      # ctxctl IDLE trigger; if GPC_STATUS drops, eng-load latch is clearable.
-      # Default OFF: live shot wedged FECS into ctx_xfer_idle (HUBSTAT IDLE_BUSY)
-      # with KICK_CHID timeout; enable KEPLER_MID_HANG_PREEMPT=1 to retest.
-      if (os.environ.get("KEPLER_MID_HANG_PREEMPT", "0") == "1" and
-          (_gpc_samples[-1] if _gpc_samples else 0) != 0):
-        _eng_before = dev.read32(0x2640)
-        _gpc_before = dev.read32(0x400604)
-        try:
-          _chan = int(os.environ.get("KEPLER_CHAN_ID", "1"))
-          _gk104_stop_preempt_channel(dev, _chan, timeout_s=0.5,
-                                      label="set-object hang preempt")
-          _preempt_err = None
-        except Exception as _pe:
-          _preempt_err = f"{type(_pe).__name__}:{_pe}"
-        # ctxctl ENGINE_TRIGGER.IDLE (bit2)
-        dev.write32(0x409c08, 0x00000004)
-        time.sleep(0.05)
-        _gpc_after_p = []
-        for _i in range(10):
-          _gpc_after_p.append(dev.read32(0x400604))
-          if _gpc_after_p[-1] == 0:
-            break
-          time.sleep(0.05)
-        print(f"[kepler] post-{test_stage}-preempt: "
-              f"GPC={_gpc_before:#x}->{_gpc_after_p[-1]:#x} "
-              f"ENG={_eng_before:#x}->{dev.read32(0x2640):#x} "
-              f"HUBSTAT={dev.read32(0x409c00):#x} "
-              f"FECS={dev.read32(0x409100):#x}@{dev.read32(0x409ff0):#x} "
-              f"err={_preempt_err} samples={[hex(x) for x in _gpc_after_p]}",
-              flush=True)
+    print(f"hardware_{test_stage}=ok value=2")
     _freeze_stop_and_hold(dev, f"{test_stage}-complete")
     return
 
@@ -14435,24 +13558,18 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     dev.dev_impl.hw.freeze("missing-output-vram-mapping")
     raise RuntimeError("full-add output has no VRAM BAR1 mapping")
   if dev.dev_impl.hw is not None:
-    # Host RELEASE is WFI=DIS (sticky PGRAPH busy after SET_OBJECT).  Poll the
-    # VRAM output until the NaN sentinel clears or a settle budget expires so
-    # we do not declare failure while SMs are still in flight.
+    # Host RELEASE is WFI=DIS (sticky PGRAPH busy after SET_OBJECT).  Poll VRAM output until the NaN sentinel clears or settle budget expires, so we don't declare failure while SMs are still in flight.
     _out_pa = out_dev.meta["vram_pa"]
     _sent = struct.pack("<I", 0x7fc00001) * min(N, 8)
     _t0 = time.perf_counter()
     _settle_ms = float(os.environ.get("KEPLER_OUT_SETTLE_MS", "500"))
     _mirror_mode = os.environ.get("KEPLER_MIRROR_COPY", "pramin").strip().lower()
     def _vram_rd(pa, n):
-      # Match mirror store path: real BAR0 PRAMIN for small buffers (H22).
-      if (_mirror_mode == "pramin-all" or
-          (_mirror_mode == "pramin" and
-           n <= int(os.environ.get("KEPLER_MIRROR_PRAMIN_MAX", "0x10000"), 0))):
+      # Match mirror store path: real BAR0 PRAMIN for small buffers.
+      if (_mirror_mode == "pramin-all" or (_mirror_mode == "pramin" and n <= int(os.environ.get("KEPLER_MIRROR_PRAMIN_MAX", "0x10000"), 0))):
         buf = bytearray(n)
         for off in range(0, n, 4):
-          struct.pack_into(
-              "<I", buf, off,
-              _gk104_pramin_read32(dev, pa + off, force_bar0=True))
+          struct.pack_into("<I", buf, off, _gk104_pramin_read32(dev, pa + off, force_bar0=True))
         return bytes(buf)
       return bytes(dev.dev_impl.hw.mmio_read(1, pa, n))
     while True:
@@ -14462,92 +13579,17 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
       if (time.perf_counter() - _t0) * 1000.0 >= _settle_ms:
         break
       time.sleep(0.001)
-    print(f"[kepler] output settle: waited_ms={(time.perf_counter()-_t0)*1000:.1f} "
-          f"head={_chunk[:16].hex()} via={_mirror_mode}", flush=True)
-    # Pre-freeze mirror/SKED dump (arm_final_output_read rejects further BAR1).
-    try:
-      def _b1(pa, n=32):
-        return _vram_rd(pa, n)
-      _code_pa = code_dev.meta.get("vram_pa")
-      _cwd_pa = cwd_devs[0].meta.get("vram_pa")
-      _a_pa = a_dev.meta.get("vram_pa")
-      _cbuf_pa = cbuf_devs[0].meta.get("vram_pa")
-      _sass = elf_section_bytes(cubin if cubin is not None else get_kepler_cubin(), ".text.E_4")[:16]
-      _code_h = _b1(_code_pa)
-      print(f"[kepler] mirror verify code_pa={_code_pa:#x} head={_code_h.hex()} "
-            f"sass_match={_code_h[:16]==_sass}", flush=True)
-      _cwd = _b1(_cwd_pa, 0x40)
-      print(f"[kepler] mirror verify cwd_pa={_cwd_pa:#x} "
-            f"w7={struct.unpack_from('<I', _cwd, 0x1c)[0]:#x} "
-            f"w8={struct.unpack_from('<I', _cwd, 0x20)[0]:#x} "
-            f"gridxy={struct.unpack_from('<II', _cwd, 0x30)}", flush=True)
-      _b_pa = b_dev.meta.get("vram_pa")
-      print(f"[kepler] mirror verify a_pa={_a_pa:#x} head={_b1(_a_pa).hex()}",
-            flush=True)
-      print(f"[kepler] mirror verify b_pa={_b_pa:#x} head={_b1(_b_pa).hex()}",
-            flush=True)
-      print(f"[kepler] mirror verify cbuf_pa={_cbuf_pa:#x} "
-            f"params140={_b1(_cbuf_pa, 0x160)[0x140:0x158].hex()}", flush=True)
-      print(f"[kepler] SKED=0x{dev.read32(0x407020):08x} "
-            f"STATUS2=0x{dev.read32(0x400700):08x} "
-            f"BUSY=0x{dev.read32(0x40060c):08x} "
-            f"CTXCTL=0x{dev.read32(0x409c00):08x}", flush=True)
-      # Channel PTE vs mirror PA: if SM used a stale SYS PTE, mirror stays sentinel.
-      _pgd = getattr(dev, "_kepler_cloned_by_pgd", None) or {}
-      for _nm, _buf in (("a", a_dev), ("b", b_dev), ("out", out_dev),
-                        ("code", code_dev), ("cbuf", cbuf_devs[0]),
-                        ("cwd", cwd_devs[0])):
-        _va = _buf.va_addr
-        _spt = _pgd.get((_va >> 27) & 0x1fff)
-        if _spt is None:
-          print(f"[kepler] PTE {_nm}: no SPT", flush=True)
-          continue
-        _pte = struct.unpack_from("<Q", bytes(dev.dev_impl.hw.mmio_read(
-            1, _spt + ((_va >> 12) & 0x7fff) * 8, 8)))[0]
-        # GK104 leaf: ((pa >> 8) | valid|priv|...). Recover PA from bits 31:3.
-        _pa = ((_pte & ~0x7) << 8) if (_pte & 1) else 0
-        print(f"[kepler] PTE {_nm}: va={_va:#x} pte={_pte:#x} pa={_pa:#x} "
-              f"mirror={_buf.meta.get('vram_pa'):#x} "
-              f"match={_pa == (_buf.meta.get('vram_pa') or -1)}", flush=True)
-      try:
-        _sys = bytes(out_dev.cpu_view()[:32])
-      except Exception:
-        _sys = b""
-      print(f"[kepler] out sysmem head={_sys[:16].hex() if _sys else 'n/a'} "
-            f"mirror={_chunk[:16].hex()} same={_sys[:16]==_chunk[:16] if _sys else None}",
-            flush=True)
-      _mp=[]
-      for _g in range(4):
-        _tn=dev.read32(0x500000+_g*0x8000+0x2608)&0x1f
-        if _tn > 8: continue
-        for _ti in range(_tn):
-          _wa,_ga=gk104_mp_trap_addrs(_g,_ti)
-          _w,_gl=dev.read32(_wa),dev.read32(_ga)
-          if _w or _gl:
-            _mp.append(f"GPC{_g}.TPC{_ti}:w={_w:#x}/g={_gl:#x}")
-      print(f"[kepler] MP traps: {_mp or 'none'}", flush=True)
-    except Exception as _e:
-      print(f"[kepler] mirror verify failed: {_e}", flush=True)
-    # LAUNCH is followed by GRAPH_SERIALIZE; final host RELEASE is WFI=DIS.
-    # QMD requests FE_SYSMEMBAR release ordering.  Prefer PRAMIN for the
-    # output blob when mirrors used PRAMIN (H22); BAR1 path keeps TinyGPU's
-    # arm_final_output_read one-shot.
+    print(f"[kepler] output settle: waited_ms={(time.perf_counter()-_t0)*1000:.1f} head={_chunk[:16].hex()} via={_mirror_mode}", flush=True)
+    # LAUNCH is followed by GRAPH_SERIALIZE; final host RELEASE is WFI=DIS.  Prefer PRAMIN for the output blob when mirrors used PRAMIN; BAR1 path keeps TinyGPU's arm_final_output_read one-shot.
     _out_n = len(out_host)
-    _use_pramin_out = (
-        _mirror_mode == "pramin-all" or
-        (_mirror_mode == "pramin" and
-         _out_n <= int(os.environ.get("KEPLER_MIRROR_PRAMIN_MAX", "0x10000"), 0)))
+    _use_pramin_out = (_mirror_mode == "pramin-all" or (_mirror_mode == "pramin" and _out_n <= int(os.environ.get("KEPLER_MIRROR_PRAMIN_MAX", "0x10000"), 0)))
     if _use_pramin_out:
       out_host[:] = _vram_rd(out_dev.meta["vram_pa"], _out_n)
-      print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x} "
-            f"via=pramin", flush=True)
+      print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x} via=pramin", flush=True)
     else:
-      dev.dev_impl.hw.arm_final_output_read(
-          1, out_dev.meta["vram_pa"], len(out_host))
-      out_host[:] = dev.dev_impl.hw.mmio_read(
-          1, out_dev.meta["vram_pa"], len(out_host))
-      print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x} "
-            f"via=bar1", flush=True)
+      dev.dev_impl.hw.arm_final_output_read(1, out_dev.meta["vram_pa"], len(out_host))
+      out_host[:] = dev.dev_impl.hw.mmio_read(1, out_dev.meta["vram_pa"], len(out_host))
+      print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x} via=bar1", flush=True)
   else:
     allocator._copyout(out_host, out_dev)
   out_arr = array.array('f'); out_arr.frombytes(bytes(out_host))
@@ -14873,9 +13915,7 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
         # Cold unread strap would select the wrong M0205/M0209 tables;
         # pin Palit golden strap 6 only for the RAMMAP phase.
         os.environ["KEPLER_RAMCFG_STRAP"] = "5"
-        print("probe-nouveau-base-lifecycle: pinned "
-              "KEPLER_RAMCFG_STRAP=5 for RAMMAP (0x101000 unread; 660 Ti)",
-              flush=True)
+        print("probe-nouveau-base-lifecycle: pinned KEPLER_RAMCFG_STRAP=5 for RAMMAP (0x101000 unread; 660 Ti)", flush=True)
     nvbios_init.run_vbios_ram_init(bar0, image, debug=False)
     after_ram = _gk104_pramin_stage_snapshot(
         bar0, "nouveau-measure after RAM", pa=0xfffe0000)
@@ -15124,21 +14164,13 @@ def main():
       _probe_option_rom_vga_preamble(); return
     if "--probe-nouveau-init-io" in sys.argv:
       _probe_nouveau_init_io(); return
-  # Offline goldens still pin Palit GTX770 strap-6 RAMMAP tables.  Live 660 Ti
-  # on this enclosure reads 0x101000=0x80405096 → RAMCFG group 5; pinning strap
-  # 6 there trains the wrong M0205/M0209 tables and shows up as GP_PUT-consumed
-  # / semaphore-never-done timeouts (same signature as wrong mp_count TEMP).
-  _offline = ("--middle-selftest" in sys.argv or
-              "--mmiotrace-selftest" in sys.argv)
+  # Offline goldens pin Palit strap-6; live 660 Ti reads 0x101000=0x80405096 → RAMCFG group 5.  Pinning strap 6 on live trains wrong M0205/M0209 tables → GP_PUT-consumed / semaphore-never-done timeouts (same signature as wrong mp_count TEMP).
+  _offline = ("--middle-selftest" in sys.argv or "--mmiotrace-selftest" in sys.argv)
   if _offline:
-    # Offline goldens are Palit strap-6; ignore any live strap leftover in env.
     os.environ["KEPLER_RAMCFG_STRAP"] = "6"
   else:
     os.environ.setdefault("KEPLER_RAMCFG_STRAP", "5")
-    print("[kepler] add_660ti: KEPLER_RAMCFG_STRAP="
-          f"{os.environ.get('KEPLER_RAMCFG_STRAP')} "
-          "(660 Ti live group; override if your 0x101000 differs)",
-          flush=True)
+    print(f"[kepler] add_660ti: KEPLER_RAMCFG_STRAP={os.environ.get('KEPLER_RAMCFG_STRAP')} (660 Ti live group; override if your 0x101000 differs)", flush=True)
   # MEMX INFO+WR32 work.  Shared default skips pause (golden mmiotrace / Linux).
   # macOS TinyGPU wrapper overrides to bit0-only host pause.
   os.environ.setdefault("KEPLER_PMU_MEMX", "1")
@@ -15238,8 +14270,7 @@ def main():
     os.environ.setdefault("KEPLER_LIVE_ACK", "completion-abort-risk")
     os.environ.setdefault("KEPLER_RPC_TRACE",
                           os.path.join(REPO_ROOT, "logs", "kepler_rpc.jsonl"))
-    # Do NOT setdefault KEPLER_VBIOS to Palit — cold path must dump/select
-    # onboard PROM via _gk104_resolve_vbios_path.
+    # Do NOT setdefault KEPLER_VBIOS to Palit — cold path must dump/select onboard PROM via _gk104_resolve_vbios_path.
     os.environ.setdefault("KEPLER_N", "8")
     os.environ.setdefault("KEPLER_SEED", "42")
     if os.environ.get("KEPLER_RAM_PROGRAM") == "bit0-only":
@@ -15488,19 +14519,14 @@ def main():
   # Night41ay/bc: cold first demo often returns NaN after FECS is already
   # ready; a second open with ALLOW_DIRTY finishes add. One user-visible shot.
   # Do NOT warm-continue after BAR1 aperture death — that needs a power cycle.
-  if (run_err is not None and backend != "software" and
-      os.environ.get("KEPLER_AUTO_WARM_CONTINUE", "1") != "0"):
+  if (run_err is not None and backend != "software" and os.environ.get("KEPLER_AUTO_WARM_CONTINUE", "1") != "0"):
     _err_s = str(run_err)
-    _bar1_dead = any(s in _err_s for s in (
-        "BAR1 VRAM stub", "BAR1 top mismatch", "framebuffer aperture is dead",
-        "refuses Palit GTX770 VBIOS"))
+    _bar1_dead = any(s in _err_s for s in ("BAR1 VRAM stub", "BAR1 top mismatch", "framebuffer aperture is dead", "refuses Palit GTX770 VBIOS"))
     if _bar1_dead:
-      print("[kepler] skipping warm-continue after BAR1/VBIOS failure "
-            f"({type(run_err).__name__}: {run_err})", flush=True)
+      print(f"[kepler] skipping warm-continue after BAR1/VBIOS failure ({type(run_err).__name__}: {run_err})", flush=True)
     else:
       _emit_quiet_diagnostics()
-      print("[kepler] cold demo failed; auto warm-continue once "
-            f"({type(run_err).__name__}: {run_err})", flush=True)
+      print(f"[kepler] cold demo failed; auto warm-continue once ({type(run_err).__name__}: {run_err})", flush=True)
       os.environ["KEPLER_ALLOW_DIRTY"] = "1"
       os.environ.pop("KEPLER_FORCE_RELOAD", None)
       _one_live_pass()
@@ -15518,83 +14544,19 @@ def main():
     raise run_err
   if quiet_buf is not None:
     _keep = (
-        "[kepler] output:",
-        "hardware_demo=",
-        "hardware_sem=",
-        "hardware_set-object=",
-        "[kepler] GR ctx runtime physical-zero",
-        "[kepler] GR ctx golden physical-zero",
-        "[kepler] attrib physical-zero",
-        "[kepler] BAR1 top R/W",
-        "[kepler] Nouveau-order BAR1",
-        "[kepler] reclock-after-ok",
-        "[kepler] experimental pstate",
-        "[kepler] gk104_clk_prog",
-        "[kepler] clk before experimental",
-        "[kepler] clk after experimental",
-        "[kepler] BAR1 after POST",
-        "[kepler] BAR1 identity clamped",
-        "[kepler] ctx copy via",
-        "[kepler] PTE stabilize:",
-        "[kepler] launch N=",
-        "[kepler] channel window",
-        "[kepler] kernel_time_ms=",
-        "[kepler] kernel_time_total_ms=",
-        "[kepler] hardware_sem=",
-        "[kepler] hardware_set-object=",
-        "[kepler] post-sem:",
-        "[kepler] post-set-object:",
-        "[kepler] post-set-object-ctxsw:",
-        "[kepler] post-set-object-gpc-poll:",
-        "[kepler] post-set-object-gpc-detail:",
-        "[kepler] post-sem-ctxsw:",
-        "[kepler] post-sem-gpc-poll:",
-        "[kepler] post-sem-gpc-detail:",
-        "[kepler] output settle:",
-        "[kepler] mirror verify",
-        "[kepler] PTE ",
-        "[kepler] out sysmem",
-        "[kepler] MP traps:",
-        "[kepler] SKED=",
-        "[kepler] raw output hex:",
-        "[kepler] compute TLS:",
-        "[kepler] TLS va=",
-        "[kepler] TIC/TSC heap",
-        "[kepler] VRAM mirror:",
-        "[kepler] live MP/TPC",
-        "[kepler] GPCCS started",
-        "[kepler] FECS not ready",
-        "[kepler] FECS warm-keep",
-        "[kepler] FECS_MMIO_CTRL",
-        "[kepler] FECS discover_image_size",
-        "[kepler] GR ctx image size",
-        "[kepler] after FECS start",
-        "[kepler] loading+starting",
-        "[kepler] FECS golden save done",
-        "[kepler] FECS IRQMASK",
-        "[kepler] golden buf scan:",
-        "[kepler] runtime GR ctx:",
-        "[kepler] grctx topology:",
-        "[kepler] grctx GPC TPC_NR:",
-        "[kepler] LTC ctx preserve",
-        "[kepler] bit19-safe attrib shrink:",
-        "[kepler] grctx attrib consts:",
-        "[kepler] grctx PPC+0xe4:",
-        "[kepler] PPC mmio-list:",
-        "[kepler] MMIO list emptied",
-        "[kepler] LTC mmio-list:",
-        "[kepler] FECS discover_image_size",
-        "[kepler] GR ctx size override:",
-        "[kepler] pre-launch floorsweep re-armed:",
-        "[kepler] FORCE_TPC_NR:",
-        "[kepler] pre-launch GPC TPC_NR:",
-        "[kepler] post-set-object-tpcnr-repair:",
-        "[kepler] post-set-object-mmio-strand:",
-        "[kepler] post-set-object-gpccs:",
-        "[kepler] post-set-object-tpc-vstatus:",
-        "[kepler] post-set-object-preempt:",
-        "[kepler] grctx_main GPC/TPC:",
-        "[kepler] grctx_main:",
+        "[kepler] output:", "hardware_demo=",
+        "[kepler] GR ctx runtime physical-zero", "[kepler] GR ctx golden physical-zero", "[kepler] attrib physical-zero",
+        "[kepler] BAR1 top R/W", "[kepler] Nouveau-order BAR1", "[kepler] reclock-after-ok", "[kepler] experimental pstate",
+        "[kepler] gk104_clk_prog", "[kepler] clk before experimental", "[kepler] clk after experimental",
+        "[kepler] BAR1 after POST", "[kepler] BAR1 identity clamped", "[kepler] ctx copy via", "[kepler] PTE stabilize:",
+        "[kepler] launch N=", "[kepler] channel window", "[kepler] kernel_time_ms=", "[kepler] kernel_time_total_ms=",
+        "[kepler] output settle:", "[kepler] raw output hex:", "[kepler] compute TLS:", "[kepler] TLS va=",
+        "[kepler] TIC/TSC heap", "[kepler] VRAM mirror:", "[kepler] live MP/TPC", "[kepler] FECS not ready",
+        "[kepler] FECS warm-keep", "[kepler] FECS_MMIO_CTRL", "[kepler] FECS discover_image_size", "[kepler] GR ctx image size",
+        "[kepler] after FECS start", "[kepler] FECS golden save done", "[kepler] FECS IRQMASK", "[kepler] runtime GR ctx:",
+        "[kepler] grctx topology:", "[kepler] grctx GPC TPC_NR:", "[kepler] LTC ctx preserve", "[kepler] bit19-safe attrib shrink:",
+        "[kepler] grctx attrib consts:", "[kepler] grctx PPC+0xe4:", "[kepler] GR ctx size override:",
+        "[kepler] pre-launch floorsweep re-armed:", "[kepler] pre-launch GPC TPC_NR:", "[kepler] grctx_main GPC/TPC:", "[kepler] grctx_main:",
     )
     for line in quiet_buf.getvalue().splitlines():
       if any(line.startswith(p) for p in _keep):

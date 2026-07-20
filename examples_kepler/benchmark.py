@@ -74,13 +74,15 @@ BOOST_ENV = {
 
 def _ensure_sock() -> None:
   sock = os.environ.get("KEPLER_TINYGPU_SOCK", "/tmp/tinygpu.sock")
+  import socket
   try:
-    import socket
     s = socket.socket(socket.AF_UNIX)
-    s.settimeout(0.5)
-    s.connect(sock)
-    s.close()
-    return
+    try:
+      s.settimeout(0.5)
+      s.connect(sock)
+      return
+    finally:
+      s.close()
   except OSError:
     pass
   app = "/Applications/TinyGPU.app/Contents/MacOS/TinyGPU"
@@ -92,19 +94,20 @@ def _ensure_sock() -> None:
     os.unlink(sock)
   except FileNotFoundError:
     pass
-  log = open("/tmp/tinygpu-server.log", "ab")
-  subprocess.Popen([app, "server", sock], stdout=log, stderr=log)
-  for _ in range(20):
-    time.sleep(0.25)
-    try:
-      import socket
-      s = socket.socket(socket.AF_UNIX)
-      s.settimeout(0.5)
-      s.connect(sock)
-      s.close()
-      return
-    except OSError:
-      continue
+  with open("/tmp/tinygpu-server.log", "ab") as log:
+    subprocess.Popen([app, "server", sock], stdout=log, stderr=log)
+    for _ in range(20):
+      time.sleep(0.25)
+      try:
+        s = socket.socket(socket.AF_UNIX)
+        try:
+          s.settimeout(0.5)
+          s.connect(sock)
+          return
+        finally:
+          s.close()
+      except OSError:
+        continue
   raise SystemExit(f"TinyGPU server did not create {sock}")
 
 
