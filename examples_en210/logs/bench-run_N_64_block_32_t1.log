@@ -1,0 +1,149 @@
+PMC_ENABLE = 0xdff3f113
+[nvbios] INIT_GPIO reset count=5 changed=['0x4', '0x5', '0x23']
+Devinit complete.
+VRAM test: PASS (0xdeadbeef)
+[fifo] Init...
+[fifo] PFIFO_ENABLE=0x00000011
+[gr] ctxprog: 124 instrs, ctxvals: 309760 bytes
+[gr] Init...
+[gr] Units bitmap: 0xf3010001
+[gr] Uploading ctxprog (124 instructions)...
+[gr] Ctxprog uploaded, ctxvals_size=309760
+[gr] Init complete
+[kernel] Hand-assembled 88 bytes of SASS (22 words)
+[kernel] Uploading 88 bytes to 0x00240000...
+[kernel] Upload verified
+[data] N=64, block=32, grid=2
+[data] expected out = [0.0, 11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0]...
+[data] a@0x250000, b@0x260000, out@0x270000
+[compute] Push buffer: 186 words
+
+=== Compute Launch ===
+[chan] Channel 1, inst=0x00100000
+[chan] push=0x00110000, gpfifo=0x00120000
+[chan] Zeroing instance block...
+[gmmu] Setting up page table...
+[gmmu] PGT at 0x00130000, PDE=0x00130003
+[gmmu] Mapped VA 0x100000-0x12FFFF -> phys (identity)
+[gmmu] PDE readback: 0x0000000000130003
+[gmmu] PTE[0x100] (VA 0x100000): 0x0000000000100001
+[gmmu] PTE[0x110] (VA 0x110000): 0x0000000000110001
+[gmmu] PTE[0x120] (VA 0x120000): 0x0000000000120001
+[gmmu] TLB flushed
+[chan] Push DMA at inst+0xffe0
+[chan] RAMFC:
+  [0x3c] = 0x403f6078
+  [0x44] = 0x01003fff
+  [0x48] = 0x00000ffe
+  [0x50] = 0x00120000
+  [0x54] = 0x00090000
+  [0x60] = 0x7fffffff
+  [0x78] = 0x00000000
+  [0x7c] = 0x30000fff
+  [0x80] = 0x1c000550
+  [0x88] = 0x00000411
+  [0x98] = 0x00000100
+[chan] Push buffer: 186 words (744 bytes)
+[chan] GPFIFO entry: GET=0x110000 len=186 dwords
+[gmmu] Extended mapping: 0x240000-0x2a0000
+[chan] VRAM DMA at inst+0xd500
+[ramht] handle=0xbeef0201 idx=0xc4f ctx=0x00000d50
+[ramht] handle=0x000085c0 idx=0x5c8 ctx=0x00100004
+[gr] Binding GR context to channel 1...
+[gr] GR context: addr=0x290000 size=309760 limit=0x2db9ff
+[gr-ctx] Uploading ctxvals (309760 bytes) to 0x00290000...
+[chan] Bind: chan_reg = 0x00001054
+[chan] Runlist committed, 0x0032ec=0x00000001
+[chan] Started: chan_reg = 0x80001054
+[chan] USERD at BAR0+0xc02000
+[chan] Initial USERD:
+  Put    [0x40] = 0x00000000
+  Get    [0x44] = 0x00000000
+  Ref    [0x48] = 0x00000000
+  GPGet  [0x88] = 0x00000000
+  GPPut  [0x8c] = 0x00000000
+[chan] Wrote GPPut=1 (entry index)
+[chan] After poll (1 iterations):
+  GPGet=0x00000001 GPPut=0x00000001
+  PFIFO_INTR=0x00000000
+[chan] Final USERD:
+  Put        [0x40] = 0x001102e8
+  Get        [0x44] = 0x001102e8
+  Ref        [0x48] = 0x00000000
+  PutHi      [0x4c] = 0x00000000
+  SetRef     [0x50] = 0x00000000
+  TopGet     [0x58] = 0x001102e8
+  TopGetHi   [0x5c] = 0x80000000
+  GetHi      [0x60] = 0x00000000
+  GPGet      [0x88] = 0x00000001
+  GPPut      [0x8c] = 0x00000001
+[en210] kernel_time_ms=236.646 N=64 block=32 grid=2
+
+=== Result Readback ===
+  out[0] = 0.0 (expected 0.0)  PASS
+  out[1] = 11.0 (expected 11.0)  PASS
+  out[2] = 22.0 (expected 22.0)  PASS
+  out[3] = 33.0 (expected 33.0)  PASS
+  out[4] = 44.0 (expected 44.0)  PASS
+  out[5] = 55.0 (expected 55.0)  PASS
+  out[6] = 66.0 (expected 66.0)  PASS
+  out[7] = 77.0 (expected 77.0)  PASS
+  out[8] = 88.0 (expected 88.0)  PASS
+  out[9] = 99.0 (expected 99.0)  PASS
+  out[10] = 110.0 (expected 110.0)  PASS
+  out[11] = 121.0 (expected 121.0)  PASS
+  out[12] = 132.0 (expected 132.0)  PASS
+  out[13] = 143.0 (expected 143.0)  PASS
+  out[14] = 154.0 (expected 154.0)  PASS
+  out[15] = 165.0 (expected 165.0)  PASS
+  out[16] = 176.0 (expected 176.0)  PASS
+  out[17] = 187.0 (expected 187.0)  PASS
+  out[18] = 198.0 (expected 198.0)  PASS
+  out[19] = 209.0 (expected 209.0)  PASS
+  out[20] = 220.0 (expected 220.0)  PASS
+  out[21] = 231.0 (expected 231.0)  PASS
+  out[22] = 242.0 (expected 242.0)  PASS
+  out[23] = 253.0 (expected 253.0)  PASS
+  out[24] = 264.0 (expected 264.0)  PASS
+  out[25] = 275.0 (expected 275.0)  PASS
+  out[26] = 286.0 (expected 286.0)  PASS
+  out[27] = 297.0 (expected 297.0)  PASS
+  out[28] = 308.0 (expected 308.0)  PASS
+  out[29] = 319.0 (expected 319.0)  PASS
+  out[30] = 330.0 (expected 330.0)  PASS
+  out[31] = 341.0 (expected 341.0)  PASS
+  out[32] = 352.0 (expected 352.0)  PASS
+  out[33] = 363.0 (expected 363.0)  PASS
+  out[34] = 374.0 (expected 374.0)  PASS
+  out[35] = 385.0 (expected 385.0)  PASS
+  out[36] = 396.0 (expected 396.0)  PASS
+  out[37] = 407.0 (expected 407.0)  PASS
+  out[38] = 418.0 (expected 418.0)  PASS
+  out[39] = 429.0 (expected 429.0)  PASS
+  out[40] = 440.0 (expected 440.0)  PASS
+  out[41] = 451.0 (expected 451.0)  PASS
+  out[42] = 462.0 (expected 462.0)  PASS
+  out[43] = 473.0 (expected 473.0)  PASS
+  out[44] = 484.0 (expected 484.0)  PASS
+  out[45] = 495.0 (expected 495.0)  PASS
+  out[46] = 506.0 (expected 506.0)  PASS
+  out[47] = 517.0 (expected 517.0)  PASS
+  out[48] = 528.0 (expected 528.0)  PASS
+  out[49] = 539.0 (expected 539.0)  PASS
+  out[50] = 550.0 (expected 550.0)  PASS
+  out[51] = 561.0 (expected 561.0)  PASS
+  out[52] = 572.0 (expected 572.0)  PASS
+  out[53] = 583.0 (expected 583.0)  PASS
+  out[54] = 594.0 (expected 594.0)  PASS
+  out[55] = 605.0 (expected 605.0)  PASS
+  out[56] = 616.0 (expected 616.0)  PASS
+  out[57] = 627.0 (expected 627.0)  PASS
+  out[58] = 638.0 (expected 638.0)  PASS
+  out[59] = 649.0 (expected 649.0)  PASS
+  out[60] = 660.0 (expected 660.0)  PASS
+  out[61] = 671.0 (expected 671.0)  PASS
+  out[62] = 682.0 (expected 682.0)  PASS
+  out[63] = 693.0 (expected 693.0)  PASS
+
+=== Summary: N=64 mismatches=0/64 ===
+hardware_demo=ok N=64 block=32 grid=2
