@@ -1,0 +1,49 @@
+.version 4.1
+.target sm_12
+.address_size 32
+
+.visible .entry add(
+    .param .u32 __cudap_a,
+    .param .u32 __cudap_b,
+    .param .u32 __cudap_out,
+    .param .u32 __cudap_N
+)
+{
+    .reg .u32 %r<10>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<2>;
+
+    // Load parameters: a, b, out pointers (32-bit), N
+    ld.param.u32 %r1, [__cudap_a];     // a base address
+    ld.param.u32 %r2, [__cudap_b];     // b base address
+    ld.param.u32 %r3, [__cudap_out];   // out base address
+    ld.param.u32 %r4, [__cudap_N];     // N
+
+    // Compute thread index: i = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %ctaid.x;
+    mad.lo.u32 %r8, %r7, %r6, %r5;     // i
+
+    // if (i >= N) return
+    setp.ge.u32 %p1, %r8, %r4;
+    @%p1 ret;
+
+    // Byte offset: i * 4
+    shl.b32 %r0, %r8, 2;
+
+    // a[i]
+    add.u32 %r5, %r1, %r0;
+    ld.global.f32 %f1, [%r5];
+
+    // b[i]
+    add.u32 %r7, %r2, %r0;
+    ld.global.f32 %f2, [%r7];
+
+    // out[i] = a[i] + b[i]
+    add.f32 %f3, %f1, %f2;
+    add.u32 %r8, %r3, %r0;
+    st.global.f32 [%r8], %f3;
+
+    ret;
+}
