@@ -1,0 +1,3 @@
+// Test NV50 compute kernel assembly
+// Simple: exit immediately
+exit
