@@ -1,89 +1,30 @@
 # nvgpu
 
 Running a simple add CUDA kernel on RTX 3080 eGPU (ADT-ut3g ASM2464PD) with
-hand-written Python — no `tinygrad` runtime import on the live path.
+hand-written Python — no `tinygrad` runtime import but with some autogen stuffs
 
-## What "not even tinygrad" means
-
-| Layer | Source |
-|-------|--------|
-| GSP boot, RM RPC, channels, GPFIFO, cubin launch | **`examples/middle_nv.py`** = `examples/add.py` (userspace stack reimplemented in Python, ~2 k lines, fully vendored) |
-| PCIe config, BAR map, MMIO, sysmem FD (macOS) | **TinyGPU.app** — Apple-signed helper; required unless you disable SIP and provide another driver path |
-| GSP RM, FECS, PMU, compute firmware | **NVIDIA** (on-GPU; unchanged) |
-
-The live path (`main()`) imports only `from tinygrad.runtime.autogen import
-nv, nv_570, pci, nv_regs, libc` — ctypes constants only. `Device["NV"]`,
-`_load_tinygrad`, and `from tinygrad.device/runtime/ops` are gone from the
-live path. The cubin is hand-assembled SM86 SASS (4× FADD, 2× LDG, 1× STG),
-embedded in `middle_nv.py` and shipped with the file.
-
-On Linux the hardware boundary is the open NVIDIA KMD (`/dev/nvidiactl`,
-BAR mmap) instead of TinyGPU. We are **not** porting the Linux kernel
-driver to macOS.
-
-## Quick start
+## Quick start 
+### USB4/PCIE
+On macOS, install tinyGPU from https://docs.tinygrad.org/tinygpu/
 
 ```bash
-# Tier 1 (offline, no eGPU required) — verifies the cubin and the
-# launch-words builder without touching the GPU.
-python3 examples/middle_nv.py --middle-selftest
-#   middle_selftest=ok cubin_sha=54f9606... launch_words=20 rpc_checksum=0xc040404
-
-# Tier 2 (eGPU required) — boots the GSP, runs the kernel, prints the result.
 python3 examples/add.py
-#   cubin_bytes=2856 expected_result=[11.0, 22.0, 33.0, 44.0]
-#   user compute_gpfifo ring_size=65536 token=0x1
-#   device=NV iface=PCIIface
-#   submit #manual: NVComputeQueue words=12
-#   ...
+#   tested with adt ut3g 3080
 #   result=[11.0, 22.0, 33.0, 44.0]
 ```
 
-`examples/add.py` and `examples/middle_nv.py` are byte-identical
-(`diff -q` returns no output). The `add.py` name is kept for compatibility
-with the original tinygrad-based example that lived at that path; the
-canonical standalone file is `middle_nv.py`.
-
-## Stage timing (real-time)
-
-```
-NV_ADD_TRACE_STAGES=1 python3 examples/middle_nv.py
-#   stage t= 0.000s  cubin built
-#   stage t= 3.873s  device ready (boot+GSP+golden+user-channel+gpfifo)
-#   stage t= 3.877s  3 input buffers allocated (sysmem via BAR1 mmap)
-#   stage t= 3.877s  3 copyin done (H2D)
-#   stage t= 3.888s  program built (cubin uploaded to VRAM, NVProgram ready)
-#   stage t= 3.890s  manual_launch done (kernel executed on eGPU)
-#   stage t= 3.890s  copyout done (D2H)
-#   stage t= 3.890s  final result decoded: [11.0, 22.0, 33.0, 44.0]
-#   ~4 s wall time total; 3.87 s in GSP boot, ~2 ms in the add kernel.
-```
-
-## Health test
+### USB3.1
+On macOS, tinyGPU not required, but ensure the usb cable is at least usb3.1 10G speed
 
 ```bash
-python3 examples/add_tiny.py   # tinygrad path — always green; if not, the eGPU is broken
+python3 examples/add_usb3.py
+#   tested with chestnut USB3 tinygrad/asm2464pd-firmware@ed4e39b7e0794e19ba193477067c48757a5cf9ef
+#   works on m1 mac usb3.1, failed on orangepi5 usb3.0, because of speed assuming the gsp firmware uploading, could be solved by firmware phased upload time matching
+#   result=[11.0, 22.0, 33.0, 44.0]
 ```
 
-## Files
-
-```
-nvgpu/
-├── AGENT.md                 # agent context, status, verify recipe
-├── README.md                # this file
-├── TODO.md                  # milestone log (now closed)
-├── add.cu                   # (removed — cubin is embedded in middle_nv.py)
-├── add.cubin                # (removed — see above)
-├── dump/                    # (removed)
-├── experimental/            # (removed)
-├── examples/
-│   ├── add.py              # the standalone live path (== middle_nv.py)
-│   ├── middle_nv.py        # vendored NV stack + cubin builder + live driver
-│   ├── add_tiny.py         # frozen tinygrad health reference
-│   └── mul.py              # multiply kernel (separate; same NV stack)
-├── firmware/ga102           # GSP firmware blobs (loaded by middle_nv)
-└── ref/                    # tinygrad source for reference
-```
+## Todo
+[] merge add.py and add_usb3.py
 
 ## cuda tools on macos
 
@@ -99,8 +40,28 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work nvidia/cuda:12.4
   nvdisasm add.cubin
 ```
 
-## tinygrad llm (reference only)
+## llm
 
 ```bash
 echo "1+1=" | DEV=NV python3 -m tinygrad.llm
 ```
+
+# Kepler
+examples_kepler_pcie/add.py
+- Linux port of examples_kepler/add.py: macOS TinyGPU.app socket transport
+  replaced by LinuxPCIDevice (raw MMIO via sysfs resourceN mmap). Reuses
+  nvbios_init / pgraph_mmio_gk104 from examples_kepler/ via sys.path insert.
+- live path WORKING: hardware_demo=ok N=256 mismatches=0/256 (2026-07-15).
+  KEPLER_LIVE_ACK gating is macOS-only; Linux only needs root (auto-sudo).
+- `--middle-selftest` and `NV_BACKEND=software` pass offline (no hardware/root).
+- live `--probe` works: reads PMC_BOOT_0=0x0e4040a2 (GK104) from 09:00.0.
+- live add op needs: root (sudo), KEPLER_CUBIN=../examples_kepler/add_kepler.cubin,
+  KEPLER_VBIOS=../examples_kepler/Palit.GTX770.4096.131216.rom, and
+  ref/linux/ (torvalds/linux v7.2-rc2 sparse-checkout of
+  drivers/gpu/drm/nouveau/nvkm/engine/gr) for grctx_gk104.py to parse csdata.
+- VBIOS devinit executes, GPC PLL locks, FECS posts ready, ctx_chan works,
+  golden context saves, full add kernel runs with correct results.
+- KEPLER_SKIP_LTC=1 skips hot-path LTC invalidate calls (H26: Nouveau never
+  calls them on desktop GK104). Safe up to N=524288 (32 windows) but hangs
+  at N=1048576 (64 windows) due to cache state accumulation.
+- See examples_kepler_pcie/progress.md for Linux-specific bring-up history.
