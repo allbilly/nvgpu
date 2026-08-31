@@ -122,7 +122,7 @@ def cli_arg_value(flag):
     raise SystemExit(2)
   return sys.argv[index + 1]
 
-def recommended_tiny_trace_command(script="examples/add_tiny.py"):
+def recommended_tiny_trace_command(script="examples_pcie/add_tiny.py"):
   flags = ["NV_ADD_TINY_TRACE=1", "NV_ADD_TINY_TRACE_STACK=1", "NV_ADD_TINY_BOOT_VALUES=1"]
   return " ".join(flags + ["python3", script])
 
@@ -143,7 +143,7 @@ def recommended_standalone_stack_command(script="examples/add.py"):
   ]
   return " ".join(flags + [recommended_standalone_golden_command(script)])
 
-def tiny_live_log_workflow_lines(script="examples/add_tiny.py", standalone_script="examples/add.py",
+def tiny_live_log_workflow_lines(script="examples_pcie/add_tiny.py", standalone_script="examples/add.py",
                                  tiny_log="tiny-golden.log", standalone_log="standalone-golden.log"):
   return [
     f"live_log_workflow script={script} standalone_script={standalone_script} standalone_log={standalone_log} tiny_log={tiny_log}",
@@ -157,7 +157,7 @@ def tiny_live_log_workflow_lines(script="examples/add_tiny.py", standalone_scrip
     "workflow_rule run tiny_log_command in the same eGPU session if standalone stalls or times out",
   ]
 
-def tiny_live_stack_log_workflow_lines(script="examples/add_tiny.py", standalone_script="examples/add.py",
+def tiny_live_stack_log_workflow_lines(script="examples_pcie/add_tiny.py", standalone_script="examples/add.py",
                                        tiny_log="tiny-stack.log", standalone_log="standalone-stack.log"):
   return [
     f"live_stack_log_workflow script={script} standalone_script={standalone_script} standalone_log={standalone_log} tiny_log={tiny_log}",
@@ -173,20 +173,20 @@ def tiny_live_stack_log_workflow_lines(script="examples/add_tiny.py", standalone
     "workflow_rule run tiny_log_command in the same eGPU session if standalone stalls or times out",
   ]
 
-def print_tiny_trace_command(script="examples/add_tiny.py"):
+def print_tiny_trace_command(script="examples_pcie/add_tiny.py"):
   print(f"tiny_trace_command {recommended_tiny_trace_command(script)}")
 
-def print_tiny_live_log_workflow(script="examples/add_tiny.py", standalone_script="examples/add.py",
+def print_tiny_live_log_workflow(script="examples_pcie/add_tiny.py", standalone_script="examples/add.py",
                                  tiny_log="tiny-golden.log", standalone_log="standalone-golden.log"):
   for line in tiny_live_log_workflow_lines(script, standalone_script, tiny_log, standalone_log):
     print(line)
 
-def print_tiny_live_stack_log_workflow(script="examples/add_tiny.py", standalone_script="examples/add.py",
+def print_tiny_live_stack_log_workflow(script="examples_pcie/add_tiny.py", standalone_script="examples/add.py",
                                        tiny_log="tiny-stack.log", standalone_log="standalone-stack.log"):
   for line in tiny_live_stack_log_workflow_lines(script, standalone_script, tiny_log, standalone_log):
     print(line)
 
-def print_tiny_debug_help(script="examples/add_tiny.py", standalone_script="examples/add.py"):
+def print_tiny_debug_help(script="examples_pcie/add_tiny.py", standalone_script="examples/add.py"):
   print(f"tiny_debug_help script={script}")
   print(f"bar_info python3 {script} --bar-info")
   print(f"trace_command python3 {script} --trace-command")
@@ -764,9 +764,9 @@ def trace_selftest():
       NV_GSP.init_golden_image(fake)
       print_tiny_trace_command()
       print_tiny_live_log_workflow()
-      print_tiny_live_log_workflow(standalone_script="examples/mul.py", standalone_log="mul-standalone.log", tiny_log="mul-tiny.log")
+      print_tiny_live_log_workflow(standalone_script="examples_pcie/mul.py", standalone_log="mul-standalone.log", tiny_log="mul-tiny.log")
       print_tiny_debug_help()
-      print_tiny_debug_help(standalone_script="examples/mul.py")
+      print_tiny_debug_help(standalone_script="examples_pcie/mul.py")
     text = buf.getvalue()
     assert "tiny rm_alloc pre" in text and "tiny rm_alloc post" in text
     assert "tiny rm_alloc pre_state parent=0x80 class=0xc56f class_name=AMPERE_CHANNEL_GPFIFO_A" in text
@@ -798,54 +798,54 @@ def trace_selftest():
     assert "cmd_slot1: checksum=0x0 seq=1 elem_count=1 func=4128 func_name=EVENT_GSP_POST_NOCAT_RECORD" in text
     assert "tiny golden_start priv_root=0xc1e00000 gpfifo_class=0xc56f compute_class=0xc6c0 dma_class=0xc7b5" in text
     assert "golden_start_stack" in text and "tiny golden_done grctx_ids=[0, 2, 9, 10, 11]" in text
-    assert "tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py" in text
-    assert "live_log_workflow script=examples/add_tiny.py standalone_script=examples/add.py standalone_log=standalone-golden.log tiny_log=tiny-golden.log" in text
-    assert "tiny_bar_info_command python3 examples/add_tiny.py --bar-info" in text
+    assert "tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples_pcie/add_tiny.py" in text
+    assert "live_log_workflow script=examples_pcie/add_tiny.py standalone_script=examples/add.py standalone_log=standalone-golden.log tiny_log=tiny-golden.log" in text
+    assert "tiny_bar_info_command python3 examples_pcie/add_tiny.py --bar-info" in text
     assert "gate_command NV_ADD_TRANSPORT=mac-egpu python3 examples/add.py --transport-preflight-plan --require-ready" in text
     assert "standalone_log_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1 NV_ADD_BOOT_GSP=1 NV_ADD_SUMMARY=1 NV_ADD_CHECK_FRTS_BAR1=1" in text
     assert "NV_ADD_TRACE_RPC=1 NV_ADD_TRACE_RPC_READ=1" in text
-    assert "tiny_log_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py 2>&1 | tee tiny-golden.log" in text
+    assert "tiny_log_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples_pcie/add_tiny.py 2>&1 | tee tiny-golden.log" in text
     assert "compare_command python3 examples/add.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in text
     assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence" in text
-    assert "bar_info python3 examples/add_tiny.py --bar-info" in text
+    assert "bar_info python3 examples_pcie/add_tiny.py --bar-info" in text
     stack_text = "\n".join(tiny_live_stack_log_workflow_lines())
-    assert "live_stack_log_workflow script=examples/add_tiny.py standalone_script=examples/add.py standalone_log=standalone-stack.log tiny_log=tiny-stack.log" in stack_text
-    assert "tiny_bar_info_command python3 examples/add_tiny.py --bar-info" in stack_text
+    assert "live_stack_log_workflow script=examples_pcie/add_tiny.py standalone_script=examples/add.py standalone_log=standalone-stack.log tiny_log=tiny-stack.log" in stack_text
+    assert "tiny_bar_info_command python3 examples_pcie/add_tiny.py --bar-info" in stack_text
     assert "standalone_log_command NV_ADD_TRACE_RM_STACK=1 NV_ADD_TRACE_CHANNEL_STACK=1 NV_ADD_TRACE_LAUNCH_STACK=1 NV_ADD_TRACE_FALCON=1 NV_ADD_TRANSPORT=mac-egpu" in stack_text
-    assert "tiny_log_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py 2>&1 | tee tiny-stack.log" in stack_text
+    assert "tiny_log_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples_pcie/add_tiny.py 2>&1 | tee tiny-stack.log" in stack_text
     assert "compare_command python3 examples/add.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log" in stack_text
     assert "workflow_check stack inspect trace_log_compare_stack, trace_log_compare_falcon" in stack_text
-    assert "live_log_workflow script=examples/add_tiny.py standalone_script=examples/mul.py standalone_log=mul-standalone.log tiny_log=mul-tiny.log" in text
-    assert "compare_command python3 examples/mul.py --compare-trace-logs --standalone-log mul-standalone.log --tiny-log mul-tiny.log" in text
+    assert "live_log_workflow script=examples_pcie/add_tiny.py standalone_script=examples_pcie/mul.py standalone_log=mul-standalone.log tiny_log=mul-tiny.log" in text
+    assert "compare_command python3 examples_pcie/mul.py --compare-trace-logs --standalone-log mul-standalone.log --tiny-log mul-tiny.log" in text
     assert "workflow_rule run standalone_log_command only after gate result is ready-for-gsp" in text
     assert "workflow_rule run tiny_log_command in the same eGPU session if standalone stalls or times out" in text
-    assert "tiny_debug_help script=examples/add_tiny.py" in text
-    assert "trace_command python3 examples/add_tiny.py --trace-command" in text
-    assert "trace_selftest python3 examples/add_tiny.py --trace-selftest" in text
-    assert "live_log_workflow python3 examples/add_tiny.py --live-log-workflow --standalone-script examples/add.py" in text
-    assert "live_stack_log_workflow python3 examples/add_tiny.py --live-stack-log-workflow --standalone-script examples/add.py" in text
+    assert "tiny_debug_help script=examples_pcie/add_tiny.py" in text
+    assert "trace_command python3 examples_pcie/add_tiny.py --trace-command" in text
+    assert "trace_selftest python3 examples_pcie/add_tiny.py --trace-selftest" in text
+    assert "live_log_workflow python3 examples_pcie/add_tiny.py --live-log-workflow --standalone-script examples/add.py" in text
+    assert "live_stack_log_workflow python3 examples_pcie/add_tiny.py --live-stack-log-workflow --standalone-script examples/add.py" in text
     assert "compare_trace_logs python3 examples/add.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in text
     assert "compare_stack_trace_logs python3 examples/add.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log" in text
-    assert "live_log_workflow python3 examples/add_tiny.py --live-log-workflow --standalone-script examples/mul.py" in text
-    assert "live_stack_log_workflow python3 examples/add_tiny.py --live-stack-log-workflow --standalone-script examples/mul.py" in text
-    assert "compare_trace_logs python3 examples/mul.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in text
-    assert "compare_stack_trace_logs python3 examples/mul.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log" in text
+    assert "live_log_workflow python3 examples_pcie/add_tiny.py --live-log-workflow --standalone-script examples_pcie/mul.py" in text
+    assert "live_stack_log_workflow python3 examples_pcie/add_tiny.py --live-stack-log-workflow --standalone-script examples_pcie/mul.py" in text
+    assert "compare_trace_logs python3 examples_pcie/mul.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in text
+    assert "compare_stack_trace_logs python3 examples_pcie/mul.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log" in text
     old_argv = sys.argv[:]
     try:
-      sys.argv = ["examples/add_tiny.py", "--live-log-workflow", "--standalone-script"]
+      sys.argv = ["examples_pcie/add_tiny.py", "--live-log-workflow", "--standalone-script"]
       try:
         main()
         raise AssertionError("missing standalone script argument was accepted")
       except SystemExit as exc:
         assert str(exc) == "--standalone-script requires a value"
-      sys.argv = ["examples/add_tiny.py", "--live-stack-log-workflow", "--standalone-log", "custom-standalone.log", "--tiny-log", "custom-tiny.log"]
+      sys.argv = ["examples_pcie/add_tiny.py", "--live-stack-log-workflow", "--standalone-log", "custom-standalone.log", "--tiny-log", "custom-tiny.log"]
       custom_workflow = io.StringIO()
       with contextlib.redirect_stdout(custom_workflow): main()
       custom_text = custom_workflow.getvalue()
       assert "standalone_log=custom-standalone.log tiny_log=custom-tiny.log" in custom_text
       assert "tee custom-standalone.log" in custom_text and "tee custom-tiny.log" in custom_text
       assert "compare_command python3 examples/add.py --compare-trace-logs --standalone-log custom-standalone.log --tiny-log custom-tiny.log" in custom_text
-      sys.argv = ["examples/add_tiny.py", "--live-log-workflow", "--standalone-log"]
+      sys.argv = ["examples_pcie/add_tiny.py", "--live-log-workflow", "--standalone-log"]
       missing_value = io.StringIO()
       with contextlib.redirect_stdout(missing_value):
         try:
@@ -854,7 +854,7 @@ def trace_selftest():
         except SystemExit as exc:
           assert exc.code == 2
       assert missing_value.getvalue().strip() == "cli_arg_error kind=missing-value flag=--standalone-log"
-      sys.argv = ["examples/add_tiny.py", "--live-stack-log-workflow", "--tiny-log"]
+      sys.argv = ["examples_pcie/add_tiny.py", "--live-stack-log-workflow", "--tiny-log"]
       missing_value = io.StringIO()
       with contextlib.redirect_stdout(missing_value):
         try:

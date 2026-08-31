@@ -1,6 +1,4 @@
 ref/*
-*/__pycache__/*
-__pycache__/*
-**.pyc
-examples_kepler_pcie/logs/*
-logs/*
+__pycache__/
+*.py[cod]
+logs/

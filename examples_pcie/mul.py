@@ -9,7 +9,7 @@ def main():
     print_import_guard()
     return
   if "--debug-help" in sys.argv:
-    print_debug_help("examples/mul.py", "mul")
+    print_debug_help("examples_pcie/mul.py", "mul")
     return
   if "--transport-preflight" in sys.argv:
     print_transport_preflight()
@@ -18,7 +18,7 @@ def main():
     print_transport_preflight_gate(require_ready="--require-ready" in sys.argv)
     return
   if "--transport-preflight-plan" in sys.argv:
-    print_transport_preflight_plan(require_ready="--require-ready" in sys.argv, script="examples/mul.py")
+    print_transport_preflight_plan(require_ready="--require-ready" in sys.argv, script="examples_pcie/mul.py")
     return
   if "--classify-transport-preflight" in sys.argv:
     print_transport_preflight_classification()
@@ -45,37 +45,37 @@ def main():
     print_contract_suite()
     return
   if "--validation-suite" in sys.argv:
-    print_validation_suite("mul", "examples/mul.py")
+    print_validation_suite("mul", "examples_pcie/mul.py")
     return
   if "--reconnect-commands" in sys.argv:
-    print_reconnect_commands("examples/mul.py")
+    print_reconnect_commands("examples_pcie/mul.py")
     return
   if "--live-debug-commands" in sys.argv:
-    print_live_debug_commands("examples/mul.py")
+    print_live_debug_commands("examples_pcie/mul.py")
     return
   if "--fecs-reset-scenarios" in sys.argv:
-    print_fecs_reset_scenarios("examples/mul.py")
+    print_fecs_reset_scenarios("examples_pcie/mul.py")
     return
   if "--fecs-fence-diagnostic" in sys.argv:
-    print_fecs_fence_diagnostic("examples/mul.py")
+    print_fecs_fence_diagnostic("examples_pcie/mul.py")
     return
   if "--bar0-fence-status" in sys.argv:
     print_bar0_fence_status()
     return
   if "--stall-trace" in sys.argv:
-    print_stall_trace_diagnostic("examples/mul.py")
+    print_stall_trace_diagnostic("examples_pcie/mul.py")
     return
   if "--logbuf-dump" in sys.argv:
-    print_logbuf_dump_diagnostic("examples/mul.py")
+    print_logbuf_dump_diagnostic("examples_pcie/mul.py")
     return
   if "--live-log-workflow" in sys.argv:
-    print_live_log_workflow("examples/mul.py")
+    print_live_log_workflow("examples_pcie/mul.py")
     return
   if "--live-stack-log-workflow" in sys.argv:
-    print_live_stack_log_workflow("examples/mul.py")
+    print_live_stack_log_workflow("examples_pcie/mul.py")
     return
   if "--comparison-checklist" in sys.argv:
-    print_comparison_checklist("examples/mul.py")
+    print_comparison_checklist("examples_pcie/mul.py")
     return
   if "--compare-trace-logs" in sys.argv:
     print_trace_log_comparison(cli_arg_value("--standalone-log"), cli_arg_value("--tiny-log"))
@@ -84,7 +84,7 @@ def main():
     print_offline_debug_suite("mul")
     return
   if "--reconnect-command" in sys.argv:
-    print_reconnect_command("examples/mul.py")
+    print_reconnect_command("examples_pcie/mul.py")
     return
   if "--summary" in sys.argv:
     print_runtime_summary()
@@ -126,50 +126,50 @@ def main():
     assert static_import_guard_state() == {"tinygrad_static_imports": []}
     assert static_external_import_guard_state() == {"external_static_imports": []}
     live_debug_buf = io.StringIO()
-    with contextlib.redirect_stdout(live_debug_buf): print_live_debug_commands("examples/mul.py")
+    with contextlib.redirect_stdout(live_debug_buf): print_live_debug_commands("examples_pcie/mul.py")
     live_debug_text = live_debug_buf.getvalue()
-    assert "preflight_plan_command NV_ADD_TRANSPORT=mac-egpu python3 examples/mul.py --transport-preflight-plan --require-ready" in live_debug_text
-    assert "reconnect_command fixed-gpfifo" in live_debug_text and "python3 examples/mul.py" in live_debug_text
+    assert "preflight_plan_command NV_ADD_TRANSPORT=mac-egpu python3 examples_pcie/mul.py --transport-preflight-plan --require-ready" in live_debug_text
+    assert "reconnect_command fixed-gpfifo" in live_debug_text and "python3 examples_pcie/mul.py" in live_debug_text
     assert "reconnect_command golden-context" in live_debug_text and "NV_ADD_PREPARE_GOLDEN_CTX=1" in live_debug_text
-    assert "live_log_workflow_command python3 examples/mul.py --live-log-workflow" in live_debug_text
-    assert "live_stack_log_workflow_command python3 examples/mul.py --live-stack-log-workflow" in live_debug_text
-    assert "tiny_live_stack_log_workflow_command python3 examples/add_tiny.py --live-stack-log-workflow --standalone-script examples/mul.py" in live_debug_text
-    assert "tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py" in live_debug_text
+    assert "live_log_workflow_command python3 examples_pcie/mul.py --live-log-workflow" in live_debug_text
+    assert "live_stack_log_workflow_command python3 examples_pcie/mul.py --live-stack-log-workflow" in live_debug_text
+    assert "tiny_live_stack_log_workflow_command python3 examples_pcie/add_tiny.py --live-stack-log-workflow --standalone-script examples_pcie/mul.py" in live_debug_text
+    assert "tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples_pcie/add_tiny.py" in live_debug_text
     live_log_buf = io.StringIO()
-    with contextlib.redirect_stdout(live_log_buf): print_live_log_workflow("examples/mul.py")
+    with contextlib.redirect_stdout(live_log_buf): print_live_log_workflow("examples_pcie/mul.py")
     live_log_text = live_log_buf.getvalue()
-    assert "live_log_workflow script=examples/mul.py tiny_script=examples/add_tiny.py" in live_log_text
-    assert "gate_command NV_ADD_TRANSPORT=mac-egpu python3 examples/mul.py --transport-preflight-plan --require-ready" in live_log_text
+    assert "live_log_workflow script=examples_pcie/mul.py tiny_script=examples_pcie/add_tiny.py" in live_log_text
+    assert "gate_command NV_ADD_TRANSPORT=mac-egpu python3 examples_pcie/mul.py --transport-preflight-plan --require-ready" in live_log_text
     assert "standalone_log_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1" in live_log_text
-    assert "python3 examples/mul.py 2>&1 | tee standalone-golden.log" in live_log_text
-    assert "compare_command python3 examples/mul.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in live_log_text
+    assert "python3 examples_pcie/mul.py 2>&1 | tee standalone-golden.log" in live_log_text
+    assert "compare_command python3 examples_pcie/mul.py --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log" in live_log_text
     assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence" in live_log_text
     live_stack_log_buf = io.StringIO()
-    with contextlib.redirect_stdout(live_stack_log_buf): print_live_stack_log_workflow("examples/mul.py")
+    with contextlib.redirect_stdout(live_stack_log_buf): print_live_stack_log_workflow("examples_pcie/mul.py")
     live_stack_log_text = live_stack_log_buf.getvalue()
-    assert "live_stack_log_workflow script=examples/mul.py tiny_script=examples/add_tiny.py" in live_stack_log_text
-    assert "gate_command NV_ADD_TRANSPORT=mac-egpu python3 examples/mul.py --transport-preflight-plan --require-ready" in live_stack_log_text
+    assert "live_stack_log_workflow script=examples_pcie/mul.py tiny_script=examples_pcie/add_tiny.py" in live_stack_log_text
+    assert "gate_command NV_ADD_TRANSPORT=mac-egpu python3 examples_pcie/mul.py --transport-preflight-plan --require-ready" in live_stack_log_text
     assert "standalone_log_command NV_ADD_TRACE_RM_STACK=1 NV_ADD_TRACE_CHANNEL_STACK=1 NV_ADD_TRACE_LAUNCH_STACK=1 NV_ADD_TRACE_FALCON=1" in live_stack_log_text
-    assert "python3 examples/mul.py 2>&1 | tee standalone-stack.log" in live_stack_log_text
-    assert "compare_command python3 examples/mul.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log" in live_stack_log_text
+    assert "python3 examples_pcie/mul.py 2>&1 | tee standalone-stack.log" in live_stack_log_text
+    assert "compare_command python3 examples_pcie/mul.py --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log" in live_stack_log_text
     assert "workflow_check first inspect trace_log_compare result, trace_log_compare_failure, trace_log_compare_progress, trace_log_compare_rm_sequence, trace_log_compare_gsp_rpc_sequence, trace_log_compare_gsp_post_nocat_sequence, trace_log_compare_gsp_rpc_response_sequence" in live_stack_log_text
     assert "workflow_check stack inspect trace_log_compare_stack, trace_log_compare_falcon" in live_stack_log_text
     old_argv = sys.argv[:]
     try:
-      sys.argv = ["examples/mul.py", "--live-log-workflow", "--standalone-log"]
+      sys.argv = ["examples_pcie/mul.py", "--live-log-workflow", "--standalone-log"]
       missing_value_buf = io.StringIO()
       with contextlib.redirect_stdout(missing_value_buf):
         try:
-          print_live_log_workflow("examples/mul.py")
+          print_live_log_workflow("examples_pcie/mul.py")
           raise AssertionError("missing standalone log value was accepted")
         except SystemExit as exc:
           assert exc.code == 2
       assert missing_value_buf.getvalue().strip() == "cli_arg_error kind=missing-value flag=--standalone-log"
-      sys.argv = ["examples/mul.py", "--live-stack-log-workflow", "--tiny-log"]
+      sys.argv = ["examples_pcie/mul.py", "--live-stack-log-workflow", "--tiny-log"]
       missing_value_buf = io.StringIO()
       with contextlib.redirect_stdout(missing_value_buf):
         try:
-          print_live_stack_log_workflow("examples/mul.py")
+          print_live_stack_log_workflow("examples_pcie/mul.py")
           raise AssertionError("missing tiny log value was accepted")
         except SystemExit as exc:
           assert exc.code == 2
@@ -177,13 +177,13 @@ def main():
     finally:
       sys.argv = old_argv
     comparison_buf = io.StringIO()
-    with contextlib.redirect_stdout(comparison_buf): print_comparison_checklist("examples/mul.py")
+    with contextlib.redirect_stdout(comparison_buf): print_comparison_checklist("examples_pcie/mul.py")
     comparison_text = comparison_buf.getvalue()
-    assert "comparison_checklist script=examples/mul.py tiny_script=examples/add_tiny.py" in comparison_text
-    assert "gate_command NV_ADD_TRANSPORT=mac-egpu python3 examples/mul.py --transport-preflight-plan --require-ready" in comparison_text
+    assert "comparison_checklist script=examples_pcie/mul.py tiny_script=examples_pcie/add_tiny.py" in comparison_text
+    assert "gate_command NV_ADD_TRANSPORT=mac-egpu python3 examples_pcie/mul.py --transport-preflight-plan --require-ready" in comparison_text
     assert "standalone_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1" in comparison_text
-    assert "python3 examples/mul.py" in comparison_text
-    assert "tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py" in comparison_text
+    assert "python3 examples_pcie/mul.py" in comparison_text
+    assert "tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples_pcie/add_tiny.py" in comparison_text
     assert "compare_line token_control standalone='standalone runtime_token_control' tiny='tiny token_control'" in comparison_text
     assert "compare_line dma_alloc standalone='channel golden_dma_alloc|standalone golden_dma_alloc' tiny='tiny dma_alloc'" in comparison_text
     assert "compare_value hashes gpfifo_params,promote_entries,compute_rpc,dma_rpc,token_rpc,schedule_rpc" in comparison_text
@@ -254,23 +254,23 @@ def main():
     assert "standalone gpfifo_constructor parent=0x80 object=0xcf000000 gpfifo_class=0xc56f" in offline_debug_text
     assert "standalone launch arithmetic=mul result=[10.0, 40.0, 90.0, 160.0]" in offline_debug_text
     debug_help_buf = io.StringIO()
-    with contextlib.redirect_stdout(debug_help_buf): print_debug_help("examples/mul.py", "mul")
+    with contextlib.redirect_stdout(debug_help_buf): print_debug_help("examples_pcie/mul.py", "mul")
     debug_help_text = debug_help_buf.getvalue()
-    assert "debug_help script=examples/mul.py arithmetic=mul" in debug_help_text
-    assert "transport_preflight_gate python3 examples/mul.py --transport-preflight-gate" in debug_help_text
-    assert "transport_preflight_require_ready python3 examples/mul.py --transport-preflight-gate --require-ready" in debug_help_text
-    assert "transport_preflight_plan python3 examples/mul.py --transport-preflight-plan --require-ready" in debug_help_text
-    assert "transport_preflight_classify echo '<transport_preflight line>' | python3 examples/mul.py --classify-transport-preflight" in debug_help_text
-    assert "offline_debug python3 examples/mul.py --offline-debug-suite" in debug_help_text
-    assert "contract_suite python3 examples/mul.py --contract-suite" in debug_help_text
-    assert "validation_suite python3 examples/mul.py --validation-suite" in debug_help_text
-    assert "live_debug python3 examples/mul.py --live-debug-commands" in debug_help_text
-    assert "live_log_workflow python3 examples/mul.py --live-log-workflow" in debug_help_text
-    assert "live_stack_log_workflow python3 examples/mul.py --live-stack-log-workflow" in debug_help_text
-    assert "comparison_checklist python3 examples/mul.py --comparison-checklist" in debug_help_text
-    assert "compare_trace_logs python3 examples/mul.py --compare-trace-logs --standalone-log standalone.log --tiny-log tiny.log" in debug_help_text
-    assert "context_promote_fingerprint python3 examples/mul.py --context-promote-fingerprint" in debug_help_text
-    assert "gpfifo_constructor_fingerprint python3 examples/mul.py --gpfifo-constructor-fingerprint" in debug_help_text
+    assert "debug_help script=examples_pcie/mul.py arithmetic=mul" in debug_help_text
+    assert "transport_preflight_gate python3 examples_pcie/mul.py --transport-preflight-gate" in debug_help_text
+    assert "transport_preflight_require_ready python3 examples_pcie/mul.py --transport-preflight-gate --require-ready" in debug_help_text
+    assert "transport_preflight_plan python3 examples_pcie/mul.py --transport-preflight-plan --require-ready" in debug_help_text
+    assert "transport_preflight_classify echo '<transport_preflight line>' | python3 examples_pcie/mul.py --classify-transport-preflight" in debug_help_text
+    assert "offline_debug python3 examples_pcie/mul.py --offline-debug-suite" in debug_help_text
+    assert "contract_suite python3 examples_pcie/mul.py --contract-suite" in debug_help_text
+    assert "validation_suite python3 examples_pcie/mul.py --validation-suite" in debug_help_text
+    assert "live_debug python3 examples_pcie/mul.py --live-debug-commands" in debug_help_text
+    assert "live_log_workflow python3 examples_pcie/mul.py --live-log-workflow" in debug_help_text
+    assert "live_stack_log_workflow python3 examples_pcie/mul.py --live-stack-log-workflow" in debug_help_text
+    assert "comparison_checklist python3 examples_pcie/mul.py --comparison-checklist" in debug_help_text
+    assert "compare_trace_logs python3 examples_pcie/mul.py --compare-trace-logs --standalone-log standalone.log --tiny-log tiny.log" in debug_help_text
+    assert "context_promote_fingerprint python3 examples_pcie/mul.py --context-promote-fingerprint" in debug_help_text
+    assert "gpfifo_constructor_fingerprint python3 examples_pcie/mul.py --gpfifo-constructor-fingerprint" in debug_help_text
     contract_suite_buf = io.StringIO()
     with contextlib.redirect_stdout(contract_suite_buf): print_contract_suite()
     assert contract_suite_buf.getvalue().strip().splitlines() == [
@@ -286,7 +286,7 @@ def main():
     validation_suite_text = validation_suite_buf.getvalue()
     assert validation_suite_text.startswith("transport_contract=ok\nregister_contract=ok\n")
     assert "standalone launch arithmetic=mul result=[10.0, 40.0, 90.0, 160.0]" in validation_suite_text
-    assert "comparison_checklist script=examples/mul.py tiny_script=examples/add_tiny.py" in validation_suite_text
+    assert "comparison_checklist script=examples_pcie/mul.py tiny_script=examples_pcie/add_tiny.py" in validation_suite_text
     assert "compare_value promote_metadata client,subdevice,object,entries,ids,entry_text" in validation_suite_text
     assert "compare_value stack_locations file:line:function for golden_start/rm_alloc/compute_alloc/dma_alloc/token_control/schedule_control" in validation_suite_text
     print("selftest=ok")
@@ -417,13 +417,13 @@ def print_live_debug_commands(script):
   print(f"reconnect_command golden-context NV_ADD_PREPARE_GOLDEN_CTX=1 python3 {script}")
   print(f"live_log_workflow_command python3 {script} --live-log-workflow")
   print(f"live_stack_log_workflow_command python3 {script} --live-stack-log-workflow")
-  print(f"tiny_live_stack_log_workflow_command python3 examples/add_tiny.py --live-stack-log-workflow --standalone-script {script}")
-  print(f"tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py")
+  print(f"tiny_live_stack_log_workflow_command python3 examples_pcie/add_tiny.py --live-stack-log-workflow --standalone-script {script}")
+  print(f"tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples_pcie/add_tiny.py")
 
 def print_live_log_workflow(script, standalone_log=None, tiny_log=None):
   if standalone_log is None and "--standalone-log" in sys.argv:
     cli_arg_value("--standalone-log"); return
-  print(f"live_log_workflow script={script} tiny_script=examples/add_tiny.py")
+  print(f"live_log_workflow script={script} tiny_script=examples_pcie/add_tiny.py")
   print(f"gate_command NV_ADD_TRANSPORT=mac-egpu python3 {script} --transport-preflight-plan --require-ready")
   print(f"standalone_log_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1 python3 {script} 2>&1 | tee standalone-golden.log")
   print(f"compare_command python3 {script} --compare-trace-logs --standalone-log standalone-golden.log --tiny-log tiny-golden.log")
@@ -432,7 +432,7 @@ def print_live_log_workflow(script, standalone_log=None, tiny_log=None):
 def print_live_stack_log_workflow(script, standalone_log=None, tiny_log=None):
   if tiny_log is None and "--tiny-log" in sys.argv:
     cli_arg_value("--tiny-log"); return
-  print(f"live_stack_log_workflow script={script} tiny_script=examples/add_tiny.py")
+  print(f"live_stack_log_workflow script={script} tiny_script=examples_pcie/add_tiny.py")
   print(f"gate_command NV_ADD_TRANSPORT=mac-egpu python3 {script} --transport-preflight-plan --require-ready")
   print(f"standalone_log_command NV_ADD_TRACE_RM_STACK=1 NV_ADD_TRACE_CHANNEL_STACK=1 NV_ADD_TRACE_LAUNCH_STACK=1 NV_ADD_TRACE_FALCON=1 python3 {script} 2>&1 | tee standalone-stack.log")
   print(f"compare_command python3 {script} --compare-trace-logs --standalone-log standalone-stack.log --tiny-log tiny-stack.log")
@@ -440,10 +440,10 @@ def print_live_stack_log_workflow(script, standalone_log=None, tiny_log=None):
   print("workflow_check stack inspect trace_log_compare_stack, trace_log_compare_falcon")
 
 def print_comparison_checklist(script):
-  print(f"comparison_checklist script={script} tiny_script=examples/add_tiny.py")
+  print(f"comparison_checklist script={script} tiny_script=examples_pcie/add_tiny.py")
   print(f"gate_command NV_ADD_TRANSPORT=mac-egpu python3 {script} --transport-preflight-plan --require-ready")
   print(f"standalone_command NV_ADD_TRANSPORT=mac-egpu NV_ADD_PREPARE_GOLDEN_CTX=1 python3 {script}")
-  print(f"tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples/add_tiny.py")
+  print(f"tiny_trace_command NV_ADD_TINY_TRACE=1 NV_ADD_TINY_TRACE_STACK=1 NV_ADD_TINY_BOOT_VALUES=1 python3 examples_pcie/add_tiny.py")
   print("compare_line token_control standalone='standalone runtime_token_control' tiny='tiny token_control'")
   print("compare_line dma_alloc standalone='channel golden_dma_alloc|standalone golden_dma_alloc' tiny='tiny dma_alloc'")
   print("compare_value hashes gpfifo_params,promote_entries,compute_rpc,dma_rpc,token_rpc,schedule_rpc")
@@ -487,11 +487,11 @@ def print_channel_contract(): print("channel_contract=ok")
 def print_contract_suite():
   for c in ("transport_contract","register_contract","boot_firmware_contract",
             "gsp_rpc_contract","vm_contract","channel_contract"): print(f"{c}=ok")
-def print_validation_suite(arith="mul", script="examples/mul.py"):
+def print_validation_suite(arith="mul", script="examples_pcie/mul.py"):
   for c in ("transport_contract","register_contract","boot_firmware_contract",
             "gsp_rpc_contract","vm_contract","channel_contract"): print(f"{c}=ok")
   print(f"standalone launch arithmetic={arith} result=[10.0, 40.0, 90.0, 160.0]")
-  print(f"comparison_checklist script={script} tiny_script=examples/add_tiny.py")
+  print(f"comparison_checklist script={script} tiny_script=examples_pcie/add_tiny.py")
   print("compare_value promote_metadata client,subdevice,object,entries,ids,entry_text")
   print("compare_value stack_locations file:line:function for golden_start/rm_alloc/compute_alloc/dma_alloc/token_control/schedule_control")
 def print_reconnect_commands(script): print(f"reconnect_commands script={script}")

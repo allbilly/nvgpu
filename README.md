@@ -1,30 +1,38 @@
 # nvgpu
 
-Running a simple add CUDA kernel on RTX 3080 eGPU (ADT-ut3g ASM2464PD) with
-hand-written Python — no `tinygrad` runtime import but with some autogen stuffs
+Running simple add and multiply CUDA kernels on an RTX 3080 eGPU over USB4/PCIe
+or USB 3.1 with hand-written Python — no `tinygrad` runtime import but with some
+autogen stuffs.
 
 ## Quick start 
-### USB4/PCIE
-On macOS, install tinyGPU from https://docs.tinygrad.org/tinygpu/
+
+`examples/add.py` automatically uses a supported Chestnut USB device when one
+is connected; otherwise it uses the TinyGPU/PCI transport. Set `NV_IFACE=USB`
+or `NV_IFACE=PCI` to select a transport explicitly.
+
+### USB4/PCIe
+
+On macOS, install TinyGPU from https://docs.tinygrad.org/tinygpu/
 
 ```bash
 python3 examples/add.py
 #   tested with adt ut3g 3080
 #   result=[11.0, 22.0, 33.0, 44.0]
+
+python3 examples/add.py mul
+#   result=[10.0, 40.0, 90.0, 160.0]
 ```
 
 ### USB3.1
+
 On macOS, tinyGPU not required, but ensure the usb cable is at least usb3.1 10G speed
 
 ```bash
-python3 examples/add_usb3.py
+NV_IFACE=USB python3 examples/add.py
 #   tested with chestnut USB3 tinygrad/asm2464pd-firmware@ed4e39b7e0794e19ba193477067c48757a5cf9ef
 #   works on m1 mac usb3.1, failed on orangepi5 usb3.0, because of speed assuming the gsp firmware uploading, could be solved by firmware phased upload time matching
 #   result=[11.0, 22.0, 33.0, 44.0]
 ```
-
-## Todo
-[] merge add.py and add_usb3.py
 
 ## cuda tools on macos
 
@@ -35,7 +43,7 @@ To compare our hand-built cubin against `nvcc`-generated output, dump the
 cubin from inside Python:
 
 ```bash
-python3 -c "import examples.middle_nv as a; open('add.cubin','wb').write(a.build_cubin())"
+python3 -c "import examples.add as a; open('add.cubin','wb').write(a.build_cubin())"
 docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work nvidia/cuda:12.4.1-devel-ubuntu22.04 \
   nvdisasm add.cubin
 ```

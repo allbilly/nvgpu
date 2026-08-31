@@ -1697,8 +1697,8 @@ class NVDevice:
 
 # ============================================================================
 # Demo driver: standalone NV add kernel (live path)
-# Run with: python3 examples/middle_nv.py
-# Optional:  python3 examples/middle_nv.py --middle-selftest (offline gate)
+# Run with: python3 examples_pcie/add.py
+# Optional:  python3 examples_pcie/add.py --middle-selftest (offline gate)
 # ============================================================================
 
 METHOD_NAMES = {
