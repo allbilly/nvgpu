@@ -60,6 +60,7 @@ def from_mv(mv: memoryview, to_type=ctypes.c_char):
 
 def wait_cond(cb, *args, value=True, timeout_ms=10000, msg=""):
   global IO_TAG, LAST_WAIT_SAMPLES
+  LAST_WAIT_SAMPLES = {}
   verbose = TRACE and not quiet_active()
   if TRACE: IO_TAG = "WAIT"   # aggregation tallies inside here label as WAIT_IO
   if verbose:
@@ -1370,7 +1371,7 @@ class MemoryManager:
   def identity_va(self, uncached):
     self.map_range(va := self.alloc_vaddr(self.vram_size, self.vram_size), self.vram_size, [(0, self.vram_size)], AddrSpace.PHYS, uncached=uncached)
     return va
-  def valloc(self, size, align=0x1000, uncached=False, contiguous=False):
+  def valloc(self, size, align=0x1000, uncached=False, contiguous=False, zero=False):
     if not getenv("GMMU", 1):
       paddr = self.palloc(size := round_up(size, 0x1000), align, zero=False)
       return VirtMapping(self.identity_va(uncached) + paddr, size, [(paddr, size)], aspace=AddrSpace.PHYS, uncached=uncached)
@@ -1380,7 +1381,7 @@ class MemoryManager:
       nxt_range, rem_size, paddrs = 0, size, []
       while rem_size > 0:
         while self.palloc_ranges[nxt_range][0] > rem_size: nxt_range += 1
-        try: paddrs += [(self.palloc(try_sz := self.palloc_ranges[nxt_range][0], self.palloc_ranges[nxt_range][1], zero=False), try_sz)]
+        try: paddrs += [(self.palloc(try_sz := self.palloc_ranges[nxt_range][0], self.palloc_ranges[nxt_range][1], zero=zero), try_sz)]
         except MemoryError:
           nxt_range += 1
           if nxt_range == len(self.palloc_ranges):
@@ -2876,7 +2877,7 @@ class NV_GSP(NV_IP):
   # S3: GSP-RM software init — RM cmd queue, libos args, WPR meta, system info.
   # =========================================================================
   def init_sw(self):
-    self.handle_gen = itertools.count(0xcf000000)
+    self.handle_gen, self.chan_runlists = itertools.count(0xcf000000), {}
     self.init_rm_args()
     self.init_libos_args()
     self.init_wpr_meta()
@@ -3092,6 +3093,9 @@ class NV_GSP(NV_IP):
     subdev = self.rpc_rm_alloc(hParent=dev, hClass=nv_gpu.NV20_SUBDEVICE_0, params=nv_gpu.NV2080_ALLOC_PARAMETERS())
     vaspace = self.rpc_rm_alloc(hParent=dev, hClass=nv_gpu.FERMI_VASPACE_A, params=nv_gpu.NV_VASPACE_ALLOCATION_PARAMETERS())
     self.vaspace = vaspace  # exposed for NVDevice.__init__ reuse
+    di = self.rpc_rm_control(subdev, nv_gpu.NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
+      nv_gpu.NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS())
+    self.runlists = {di.entries[i].engineData[2]: di.entries[i].engineData[3] for i in range(di.numEntries)}
     res_va = self.nvdev.mm.alloc_vaddr(res_sz := (512 << 20))
     bufs_p = nv_gpu.struct_NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS(
       pageSize=res_sz, numLevelsToCopy=3, virtAddrLo=res_va, virtAddrHi=res_va + res_sz - 1)
@@ -3177,6 +3181,9 @@ class NV_GSP(NV_IP):
         v = getattr(params, k, None) if params is not None else None
         if isinstance(v, int) and v: ex.append((k, f"{v:#x}"))
       rm_record("ALLOC", cls_nm, obj=obj, parent=hParent, extras=ex)
+    if hClass == self.gpfifo_class:
+      engine = params.engineType
+      self.chan_runlists[obj] = self.runlists.get(engine + 10 * (engine >= nv_gpu.NV2080_ENGINE_TYPE_NVDEC0), 0)
     if hClass == nv_gpu.FERMI_VASPACE_A and client != self.priv_root:
       self.rpc_set_page_directory(device=hParent, hVASpace=obj, pdir_paddr=self.nvdev.mm.root_page_table.paddr, client=client)
     if hClass == nv_gpu.NV01_DEVICE_0 and client != self.priv_root: self.device = obj
@@ -3206,8 +3213,9 @@ class NV_GSP(NV_IP):
       ex = [("params", f"{ctypes.sizeof(params):#x}")] if params is not None else []
       rm_record("CTRL", obj_cls, obj=hObject, cmd=cmd, extras=ex)
     st = type(params).from_buffer_copy(res[len(bytes(control_args)):]) if params is not None else None
-    if self.nvdev.chip_name.startswith("GB2") and cmd == nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:
-      cast(nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS, st).workSubmitToken |= (1 << 30)
+    if cmd == nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:
+      cast(nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS, st).workSubmitToken |= \
+        (self.chan_runlists[hObject] << 16) | ((1 << 30) if self.nvdev.chip_name.startswith("GB2") else 0)
     return st
 
   def rpc_set_page_directory(self, device, hVASpace, pdir_paddr, client=None, pasid=0xffffffff):
@@ -3692,8 +3700,8 @@ class NVProgram:
 class NVAllocator:
   """Buffer allocator: host/device alloc, copyin H2D, copyout D2H."""
   def __init__(self, dev): self.dev = dev
-  def alloc(self, size, host=False, uncached=False, contiguous=False, cpu_access=True):
-    return self.dev.iface.alloc(size, host=host, uncached=uncached, contiguous=contiguous, cpu_access=cpu_access)
+  def alloc(self, size, host=False, uncached=False, contiguous=False, cpu_access=True, zero=False):
+    return self.dev.iface.alloc(size, host=host, uncached=uncached, contiguous=contiguous, cpu_access=cpu_access, zero=zero)
   def free(self, b): self.dev.iface.free(b)
   def _copyin(self, dest, src: memoryview):
     if dest.view is None: raise RuntimeError("buffer has no cpu mapping")
@@ -3737,20 +3745,21 @@ class PCIIfaceBase:
   def peer_group(self): return getattr(self.pci_dev, 'peer_group', type(self.pci_dev).__name__)
   def is_local(self): return not isinstance(self.pci_dev, RemotePCIDevice)
   def is_bar_small(self): return self.pci_dev.bar_info(self.vram_bar)[1] == (256 << 20)
-  def alloc(self, size, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs):
+  def alloc(self, size, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False, **kwargs):
     should_use_sysmem = host or ((cpu_access if self.is_bar_small() else (uncached and cpu_access)) and not force_devmem)
+    size = round_up(size, PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
     if should_use_sysmem:
-      va = self.dev_impl.mm.alloc_vaddr(size := round_up(size, PAGESIZE))
+      va = self.dev_impl.mm.alloc_vaddr(size, align=PAGESIZE)
       memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=va, contiguous=contiguous)
       mapping = self.dev_impl.mm.map_range(va, size, [(p, 0x1000) for p in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
       return HCQBuffer(va, size, meta=PCIAllocationMeta(mapping, True, paddrs[0]), view=memview, owner=self.dev)
-    size = round_up(size, (2 << 20) if size >= (8 << 20) else (4 << 10))
-    mapping = self.dev_impl.mm.valloc(size, uncached=uncached, contiguous=cpu_access)
+    mapping = self.dev_impl.mm.valloc(size, uncached=uncached, contiguous=cpu_access, zero=zero)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
     return HCQBuffer(mapping.va_addr, size, view=barview, meta=PCIAllocationMeta(mapping, cpu_access, mapping.paddrs[0][0]), owner=self.dev)
   def free(self, b):
-    if b.owner != self.dev and self.is_local() and b.meta.has_cpu_mapping: FileIOInterface.munmap(b.va_addr, b.size)
+    if b.owner != self.dev: self.dev.iface.dev_impl.mm.unmap_range(b.va_addr, round_up(b.size, 0x1000))
     if b.owner == self.dev and b.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(b.meta.mapping)
+    if b.owner == self.dev and self.is_local() and b.meta.has_cpu_mapping: FileIOInterface.munmap(b.va_addr, b.size)
   def map(self, b):
     # Mirrors tinygrad PCIIfaceBase.map: re-map an existing buffer (e.g. host/sysmem signal page)
     # into this device's vaspace page table. Required for the user channel's GPU to write to a
@@ -3821,7 +3830,7 @@ class USBIface(PCIIface):
             force_devmem=False, zero=False, **kwargs):
     if not host and not cpu_access:
       return super().alloc(size, host=False, uncached=uncached, cpu_access=False,
-                           contiguous=contiguous, force_devmem=True, **kwargs)
+                           contiguous=contiguous, force_devmem=True, zero=zero, **kwargs)
     mapping = self.dev_impl.mm.valloc_cpu_visible(size := round_up(size, 0x1000), uncached=uncached, zero=zero)
     barview = self.pci_dev.map_bar(self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size)
     return HCQBuffer(mapping.va_addr, size, view=barview,
@@ -4472,9 +4481,8 @@ def main():
     dev.allocator._copyout(memoryview(result_bytes), out_buf)
     _ts("copyout done (D2H)")
   finally:
-    # PCIIface retains its proven process lifecycle; USB must unload WPR so
-    # another process can initialize the GPU without a physical replug.
-    if isinstance(dev.iface, USBIface): dev.iface.device_fini()
+    # Gracefully unload GSP on PCI and perform the additional SEC2 teardown on USB.
+    dev.iface.device_fini()
   print(f"raw_result={bytes(result_bytes).hex(' ')}")
   result = list(struct.unpack("4f", result_bytes))
   stage_set(10, f"validate {operation} output")
