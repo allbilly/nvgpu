@@ -4,10 +4,6 @@
 Vendored from ref/tinygrad/tinygrad/runtime/support/{nv,system,hcq,memory,elf}.py
 and ref/tinygrad/tinygrad/runtime/ops_nv.py (slimmed to the PCIe path only).
 
-The only external dependencies this module has are:
-  - tinygrad.runtime.autogen.{nv, nv_570, nv_regs, pci, libc, libusb}  (ctypes constants only)
-  - Python standard library
-
 PCIe/GSP tracing is vendored inline and remains disabled unless NV_TRACE or
 NV_TRACE_TLP requests instrumentation.
 
@@ -16,14 +12,15 @@ tinygrad.renderer, tinygrad.uop, tinygrad.helpers are permitted in this module â
 those have been vendored inline below.
 """
 from __future__ import annotations
-import os, sys, ctypes, ctypes.util, time, mmap, struct, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, threading, urllib.request, hashlib, tempfile, gzip, pathlib, types
+import os, sys, ctypes, ctypes.util, time, mmap, struct, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, threading, urllib.request, hashlib, tempfile, gzip, pathlib, types, importlib
 from typing import cast, Any, ClassVar, Generic, TypeVar
 from dataclasses import dataclass, replace
 
-# --- autogen ctypes (allowed by goal: "ctypes constants only") ---
-from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
-from tinygrad.runtime.autogen import nv_regs
-from tinygrad.runtime.autogen import libc, libusb
+# --- repository-local autogen ctypes ("ctypes constants only") ---
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path: sys.path.insert(0, str(REPO_ROOT))
+from autogen import nv, nv_570 as nv_gpu, pci
+from autogen import libc, libusb
 
 import traceback
 
@@ -2484,7 +2481,7 @@ class NVDev:
   # =========================================================================
   def include(self, name, arch):
     # nv_ref.regs and dev_*.regs are dicts of {reg_name: (base, off_lambda)} tuples in tinygrad.
-    src_mod = getattr(nv_regs, name)
+    src_mod = importlib.import_module(f"autogen.nv_regs.{name}")
     regs = getattr(src_mod, arch or "regs")
     for k, v in regs.items():
       self.__dict__[k] = NVReg(self, *v) if isinstance(v, tuple) else v
