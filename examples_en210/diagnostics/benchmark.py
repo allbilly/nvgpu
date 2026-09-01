@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live GT218 add launch matrix (TinyGPU socket path).
+"""Live GT218 add launch matrix (direct USB3 or TinyGPU socket path).
 
 Reports process wall time and host-measured kernel time (submit to
 GPPut poll).  Wall time is dominated by cold bring-up (~10s);
@@ -7,11 +7,11 @@ kernel_time_ms is what to compare across N/block configurations.
 
 Examples::
 
-  python3 benchmark.py --quick
-  python3 benchmark.py --quick --repeat 5
-  python3 benchmark.py
+  python3 diagnostics/benchmark.py --quick
+  python3 diagnostics/benchmark.py --quick --repeat 5
+  python3 diagnostics/benchmark.py
 
-Requires TinyGPU at /tmp/tinygpu.sock.
+Direct USB3 is selected automatically. TinyGPU is started when USB is not forced.
 """
 from __future__ import annotations
 
@@ -19,14 +19,16 @@ import argparse
 import math
 import os
 import re
+import runpy
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+DIAGNOSTICS_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = DIAGNOSTICS_DIR.parent
 ADD_PY = SCRIPT_DIR / "add.py"
-LOG_DIR = SCRIPT_DIR / "logs"
+LOG_DIR = DIAGNOSTICS_DIR / "logs"
 
 # (label, env overrides).  EN210_BLOCK defaults to N (single-CTA) unless set.
 CASES = [
@@ -91,6 +93,16 @@ def _ensure_sock() -> None:
       except OSError:
         continue
   raise SystemExit(f"TinyGPU server did not create {sock}")
+
+
+def _needs_socket() -> bool:
+  iface = os.environ.get("EN210_IFACE", "AUTO").upper()
+  if iface == "USB":
+    return False
+  if iface == "SOCKET":
+    return True
+  add_globals = runpy.run_path(str(ADD_PY), run_name="en210_add_transport_check")
+  return not add_globals["USB3Iface"].available()
 
 
 def _slug(label: str, tag: str = "") -> str:
@@ -189,7 +201,7 @@ def main() -> int:
     want = set(QUICK_CASES)
     cases = [(lab, env) for lab, env in CASES if lab in want]
 
-  if not args.no_sock_start:
+  if not args.no_sock_start and _needs_socket():
     _ensure_sock()
 
   agg: dict[str, dict] = {}

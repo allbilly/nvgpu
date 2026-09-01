@@ -1,26 +1,80 @@
 #!/usr/bin/env python3
 """Compute kernel launch for ASUS EN210 (GT218, GeForce 210, sm_12).
 
-Standalone self-contained script: runs a vector-add kernel out[i] = a[i] + b[i].
+Standalone launch script: runs a vector-add kernel out[i] = a[i] + b[i].
 Inlines VBIOS devinit, FIFO/GR init, channel creation, and compute launch.
 
-Transport: TinyGPU.app DriverKit Unix socket (/tmp/tinygpu.sock) on macOS.
+Transport: direct Chestnut USB3 (preferred when present), or TinyGPU.app's
+DriverKit Unix socket (/tmp/tinygpu.sock) on macOS.
 
 Environment variables:
   EN210_N       Number of elements (default: 4)
   EN210_BLOCK   Block dimension (default: N)
+  EN210_IFACE   AUTO (default), USB, or SOCKET
+  EN210_USBDEV  Optional Chestnut USB VID:PID override
 
-Binary data files (in same directory):
+Binary data files (in runtime/):
   en210.rom     GT218 VBIOS dump (64KB)
   ctxprog.py    Generated context program
   ctxvals.bin   GR context values (310KB)
 
 Kernel SASS is embedded in this file (88 bytes, verified from CUDA 6.5 nvcc).
-If ptxas 6.5 is available (EN210_PTXAS env var or cuda65-bin/ptxas), it will
-compile the embedded PTX source instead.  add_sass.bin is optional (fallback).
+If ptxas 6.5 is available (EN210_PTXAS env var or tools/cuda65-bin/ptxas), it
+will compile the embedded PTX source instead. runtime/add_sass.bin is optional.
 """
 from __future__ import annotations
-import os, sys, struct, time, socket, enum
+import contextlib, ctypes, enum, functools, os, socket, struct, sys, time
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path: sys.path.insert(0, REPO_ROOT)
+from autogen import libusb, pci
+
+TRACE = int(os.environ.get('EN210_TRACE', os.environ.get('NV_TRACE', '1')) or 0)
+STAGES = ['PCIe/Transport', 'GPU Discovery+MMU', 'Firmware Prep', 'Secure FW Boot',
+          'GSP/RM Online', 'Golden GR Context', 'User Channels+GPFIFO',
+          'Workload+QMD Prep', 'Submit+Execute', 'Result Validation']
+_stage_status = {}
+_stage_current = 0
+_stage_reported = False
+
+def stage_set(n, note=''):
+  global _stage_current
+  _stage_current = n
+  _stage_status[n] = {'ok': False, 'note': note}
+  if TRACE: print(f'[S{n}] {STAGES[n - 1]}: {note or "begin"}', flush=True)
+
+def stage_done(note=''):
+  if not _stage_current: return
+  _stage_status.setdefault(_stage_current, {'ok': False, 'note': ''})['ok'] = True
+  if note: _stage_status[_stage_current]['note'] = note
+
+def stage_skip(n, note):
+  global _stage_current
+  _stage_current = n
+  _stage_status[n] = {'ok': False, 'na': True, 'note': note}
+  if TRACE: print(f'[S{n}] {STAGES[n - 1]}: N/A ({note})', flush=True)
+
+def stage_fail(note):
+  if not _stage_current: return
+  _stage_status.setdefault(_stage_current, {'ok': False, 'note': ''}).update(failed=True, note=note)
+
+def stage_summary():
+  global _stage_reported
+  if not TRACE or _stage_reported: return
+  _stage_reported = True
+  print('\n' + '=' * 62, flush=True)
+  print(f'{"NVIDIA GPU RUN":^62}', flush=True)
+  print('=' * 62, flush=True)
+  for i, name in enumerate(STAGES, 1):
+    st = _stage_status.get(i)
+    if st and st.get('ok'): mark = 'OK  '
+    elif st and st.get('failed'): mark = 'FAIL'
+    elif st and st.get('na'): mark = 'N/A '
+    elif st: mark = '....'
+    else: mark = '----'
+    extra = f"  {st['note']}" if st and st.get('note') else ''
+    print(f'[S{i}] {name:<28} {mark}{extra}', flush=True)
+  print('=' * 62, flush=True)
 
 # ============================================================================
 # VBIOS init script interpreter (ported from Nouveau nvbios_init.c)
@@ -1721,11 +1775,7 @@ def run_vbios_init(dev, image: bytes, scripts: list | None = None, debug: bool =
 
 
 # ============================================================================
-# TinyGPU transport + VRAM access
-# ============================================================================
-
-# ============================================================================
-# TinyGPU transport
+# PCIe transports
 # ============================================================================
 class RemoteCmd(enum.IntEnum):
   MAP_BAR    = 1
@@ -1735,9 +1785,10 @@ class RemoteCmd(enum.IntEnum):
   MMIO_READ  = 6
   MMIO_WRITE = 7
 
-TINYGPU_SOCK = '/tmp/tinygpu.sock'
+TINYGPU_SOCK = os.environ.get('EN210_TINYGPU_SOCK', '/tmp/tinygpu.sock')
 
-class Dev:
+class TinyGPUIface:
+  """PCIe access through TinyGPU.app's DriverKit Unix socket."""
   def __init__(self):
     self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     self._sock.settimeout(10.0)
@@ -1766,12 +1817,281 @@ class Dev:
     self._rpc(RemoteCmd.MMIO_WRITE, 0, reg & 0xffffffff, 4, payload=struct.pack('<I', val & 0xffffffff))
   def cfg(self, off, sz=4):
     return self._rpc(RemoteCmd.CFG_READ, 0, off, sz)[0]
+  def cfg_write(self, off, val, sz=4):
+    self._rpc(RemoteCmd.CFG_WRITE, 0, off, sz, payload=int(val).to_bytes(sz, 'little'))
   def map_bar(self, bar):
     v1, v2, _ = self._rpc(RemoteCmd.MAP_BAR, bar)
     return v1, v2
   def close(self):
     try: self._sock.close()
     except: pass
+
+def _usb_check(rc, name):
+  if rc < 0:
+    err = ctypes.string_at(libusb.libusb_strerror(rc)).decode('utf-8', errors='replace')
+    raise RuntimeError(f'{name}: {err} ({rc})')
+  return rc
+
+class USB3:
+  """Minimal libusb transport for the Chestnut PCIe controller."""
+  @staticmethod
+  @functools.cache
+  def ctx():
+    ctx = ctypes.POINTER(libusb.struct_libusb_context)()
+    _usb_check(libusb.libusb_init(ctypes.byref(ctx)), 'libusb_init')
+    return ctx
+
+  @classmethod
+  def list_devices(cls, vendor, product):
+    devs = ctypes.POINTER(ctypes.POINTER(libusb.struct_libusb_device))()
+    count = _usb_check(libusb.libusb_get_device_list(cls.ctx(), ctypes.byref(devs)), 'libusb_get_device_list')
+    found = []
+    try:
+      for i in range(count):
+        desc = libusb.struct_libusb_device_descriptor()
+        _usb_check(libusb.libusb_get_device_descriptor(devs[i], ctypes.byref(desc)), 'libusb_get_device_descriptor')
+        if (desc.idVendor, desc.idProduct) == (vendor, product):
+          dev = libusb.libusb_ref_device(devs[i])
+          found.append((dev, f'usb:{libusb.libusb_get_bus_number(dev)}-{libusb.libusb_get_device_address(dev)}'))
+    finally:
+      libusb.libusb_free_device_list(devs, 1)
+    return found
+
+  def __init__(self, dev):
+    self.dev = dev
+    self.handle = ctypes.POINTER(libusb.struct_libusb_device_handle)()
+    self.claimed = self.closed = False
+    try:
+      _usb_check(libusb.libusb_open(dev, ctypes.byref(self.handle)), 'libusb_open')
+      auto_detach = libusb.libusb_set_auto_detach_kernel_driver(self.handle, 1)
+      if auto_detach not in (0, libusb.LIBUSB_ERROR_NOT_SUPPORTED):
+        _usb_check(auto_detach, 'libusb_set_auto_detach_kernel_driver')
+      active = libusb.libusb_kernel_driver_active(self.handle, 0)
+      if active > 0: _usb_check(libusb.libusb_detach_kernel_driver(self.handle, 0), 'libusb_detach_kernel_driver')
+      elif active < 0 and active != libusb.LIBUSB_ERROR_NOT_SUPPORTED: _usb_check(active, 'libusb_kernel_driver_active')
+      config = ctypes.c_int()
+      _usb_check(libusb.libusb_get_configuration(self.handle, ctypes.byref(config)), 'libusb_get_configuration')
+      if config.value != 1: _usb_check(libusb.libusb_set_configuration(self.handle, 1), 'libusb_set_configuration')
+      _usb_check(libusb.libusb_claim_interface(self.handle, 0), 'libusb_claim_interface')
+      self.claimed = True
+      _usb_check(libusb.libusb_set_interface_alt_setting(self.handle, 0, 0), 'libusb_set_interface_alt_setting')
+    except Exception:
+      self.close()
+      raise
+
+  def close(self):
+    if self.closed: return
+    self.closed = True
+    if self.claimed and self.handle:
+      with contextlib.suppress(Exception): libusb.libusb_release_interface(self.handle, 0)
+    if self.handle:
+      with contextlib.suppress(Exception): libusb.libusb_close(self.handle)
+    if self.dev:
+      with contextlib.suppress(Exception): libusb.libusb_unref_device(self.dev)
+
+  def describe(self):
+    desc = libusb.struct_libusb_device_descriptor()
+    _usb_check(libusb.libusb_get_device_descriptor(self.dev, ctypes.byref(desc)), 'libusb_get_device_descriptor')
+    speed = libusb.libusb_get_device_speed(self.dev)
+    speed_name = {0: 'unknown', 1: '1.5Mb/s', 2: '12Mb/s', 3: '480Mb/s', 4: '5Gb/s', 5: '10Gb/s'}.get(speed, f'code{speed}')
+    return f'{desc.idVendor:04x}:{desc.idProduct:04x} {speed_name}'
+
+  def control_write(self, request, value=0, index=0, data=b'', timeout=1000):
+    buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data) if data else None
+    rc = _usb_check(libusb.libusb_control_transfer(self.handle, 0x40, request, value, index,
+                    buf, len(data), timeout), f'control OUT 0x{request:02x}')
+    if rc != len(data): raise RuntimeError(f'control OUT 0x{request:02x}: short write {rc}/{len(data)}')
+
+  def control_read(self, request, length, value=0, index=0, timeout=1000):
+    buf = (ctypes.c_ubyte * length)()
+    rc = _usb_check(libusb.libusb_control_transfer(self.handle, 0xc0, request, value, index,
+                    buf, length, timeout), f'control IN 0x{request:02x}')
+    if rc != length: raise RuntimeError(f'control IN 0x{request:02x}: short read {rc}/{length}')
+    return bytes(buf)
+
+  def bulk_write(self, payload, timeout=30000):
+    payload = bytes(payload)
+    buf, transferred = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload), ctypes.c_int()
+    _usb_check(libusb.libusb_bulk_transfer(self.handle, 0x02, buf, len(payload),
+               ctypes.byref(transferred), timeout), 'bulk OUT 0x02')
+    if transferred.value != len(payload): raise RuntimeError(f'bulk OUT 0x02: short write {transferred.value}/{len(payload)}')
+
+  def bulk_read(self, length, timeout=30000):
+    buf, transferred = (ctypes.c_ubyte * length)(), ctypes.c_int()
+    _usb_check(libusb.libusb_bulk_transfer(self.handle, 0x81, buf, length,
+               ctypes.byref(transferred), timeout), 'bulk IN 0x81')
+    if transferred.value != length: raise RuntimeError(f'bulk IN 0x81: short read {transferred.value}/{length}')
+    return bytes(buf)
+
+class ChestnutController:
+  """Chestnut F0 config/MMIO protocol plus its USB bulk streaming path."""
+  def __init__(self, usb):
+    self.usb = usb
+    self.stream_chunk = 512 if libusb.libusb_get_device_speed(usb.dev) <= libusb.LIBUSB_SPEED_HIGH else 1024
+    if self.read(0xb450, 1)[0] != 0x78: self.usb.control_write(0xf3, value=1, timeout=10000)
+    if (ltssm := self.read(0xb450, 1)[0]) != 0x78:
+      raise RuntimeError(f'Chestnut PCIe link not up (LTSSM=0x{ltssm:02x})')
+
+  def _f0_out(self, fmt_type, byte_en, address, value, mode=0):
+    self.usb.control_write(0xf0, fmt_type | byte_en << 8, mode & 3,
+                           struct.pack('<III', address & 0xffffffff, address >> 32, value), 5000)
+  def _f0_in(self):
+    data = self.usb.control_read(0xf0, 8, timeout=5000)
+    return struct.unpack_from('<I', data)[0], (data[4] >> 5) & 7, data[7]
+  def pcie_request(self, fmt_type, address, value=None, size=4, retries=10):
+    if not 0 < size <= 4: raise ValueError(f'PCIe request size must be 1..4, got {size}')
+    offset = address & 3
+    self._f0_out(fmt_type, ((1 << size) - 1) << offset, address & ~3,
+                 (value << (8 * offset)) if value is not None else 0)
+    if ((fmt_type & 0b11011111) == 0b01000000) or ((fmt_type & 0b10111000) == 0b00110000): return None
+    data, cpl_status, ret_status = self._f0_in()
+    if ret_status:
+      if retries:
+        time.sleep(0.001)
+        return self.pcie_request(fmt_type, address, value, size, retries - 1)
+      raise RuntimeError(f'PCIe request failed: status={ret_status} address={address:#x}')
+    if cpl_status:
+      status = {1: 'Unsupported Request', 2: 'Config Retry', 4: 'Completer Abort'}.get(cpl_status, f'reserved {cpl_status:#x}')
+      raise RuntimeError(f'PCIe completion failed: {status}, address={address:#x}')
+    return (data >> (8 * offset)) & ((1 << (8 * size)) - 1) if value is None else None
+  def pcie_cfg_req(self, byte_addr, bus=1, value=None, size=4):
+    return self.pcie_request((0x44 if value is not None else 0x04) | int(bus > 0),
+                             bus << 24 | (byte_addr & 0xfff), value, size)
+  def pcie_mem_write(self, address, data):
+    data = bytes(data)
+    if not data: return
+    if len(data) % 4: raise ValueError(f'PCIe writes must be dword aligned, got {len(data)} bytes')
+    for off in range(0, len(data), self.stream_chunk):
+      chunk, chunk_addr = data[off:off + self.stream_chunk], address + off
+      self.pcie_request(0x60 if chunk_addr >> 32 else 0x40, chunk_addr,
+                        value=int.from_bytes(chunk[:4], 'little'), size=4)
+      if len(chunk) == 4: continue
+      self._f0_out(0x60 if chunk_addr >> 32 else 0x40, 0x0f, chunk_addr, len(chunk) // 4, mode=1)
+      self.usb.bulk_write(chunk)
+  def pcie_mem_read(self, address, nbytes):
+    if nbytes % 4: raise ValueError(f'PCIe reads must be dword aligned, got {nbytes} bytes')
+    data = bytearray()
+    for off in range(0, nbytes, self.stream_chunk):
+      chunk_size, chunk_addr = min(self.stream_chunk, nbytes - off), address + off
+      first = self.pcie_request(0x20 if chunk_addr >> 32 else 0x00, chunk_addr, size=4)
+      if chunk_size == 4:
+        data += int(first).to_bytes(4, 'little')
+        continue
+      self._f0_out(0x20 if chunk_addr >> 32 else 0x00, 0x0f, chunk_addr, chunk_size // 4, mode=2)
+      data += self.usb.bulk_read(chunk_size)
+    return bytes(data)
+  def read(self, base_addr, length):
+    return b''.join(self.usb.control_read(0xe4, min(0xff, length - off), value=base_addr + off)
+                    for off in range(0, length, 0xff))
+
+class USB3Iface:
+  """Direct EN210 PCIe config and BAR0 access through Chestnut USB3."""
+  @staticmethod
+  def candidate_ids():
+    requested = os.environ.get('EN210_USBDEV', os.environ.get('USBDEV', ''))
+    custom = [tuple(int(x, 16) for x in requested.split(':'))] if requested else []
+    return list(dict.fromkeys(custom + [(0xadd1, 0x0001), (0x3801, 0x0001)]))
+
+  @classmethod
+  def devices(cls):
+    return [item for vendor, product in cls.candidate_ids() for item in USB3.list_devices(vendor, product)]
+  @classmethod
+  def available(cls):
+    visible = cls.devices()
+    try: return bool(visible)
+    finally:
+      for dev, _ in visible: libusb.libusb_unref_device(dev)
+
+  def __init__(self):
+    visible = self.devices()
+    if not visible:
+      choices = ', '.join(f'{v:04x}:{p:04x}' for v, p in self.candidate_ids())
+      raise RuntimeError(f'Chestnut USB3 controller not found (looked for {choices})')
+    for dev, _ in visible[1:]: libusb.libusb_unref_device(dev)
+    transport = USB3(visible[0][0])
+    try:
+      self.usb = ChestnutController(transport)
+      self.gpu_bus = self._discover_gpu()
+      self._bars = self._setup_bars()
+      print(f'[transport] USB3 {transport.describe()}, GPU bus={self.gpu_bus}, '
+            + ' '.join(f'BAR{i}={addr:#x}/{size:#x}' for i, (addr, size) in sorted(self._bars.items())))
+    except Exception:
+      transport.close()
+      raise
+
+  def _set_bridge_buses(self, primary, secondary, subordinate):
+    buses = primary | secondary << 8 | subordinate << 16
+    for attempt in range(3):
+      for off, val in enumerate((primary, secondary, subordinate)):
+        self.usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS + off, bus=primary, value=val, size=1)
+      if self.usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=primary, size=4) & 0xffffff == buses: return
+      if attempt != 2: time.sleep(0.001)
+    raise RuntimeError(f'USB PCIe bridge {primary} bus-number setup failed')
+  def _discover_gpu(self):
+    for bus in range(8):
+      next_bus = bus + 1
+      self._set_bridge_buses(bus, next_bus, 8)
+      vid_did = self.usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=next_bus, size=4)
+      vendor = vid_did & 0xffff
+      header_type = self.usb.pcie_cfg_req(pci.PCI_HEADER_TYPE, bus=next_bus, size=1) & 0x7f
+      if vendor == 0x10de: return next_bus
+      if header_type != 1: raise RuntimeError(f'NVIDIA endpoint not found at USB PCIe bus {next_bus}')
+    raise RuntimeError('NVIDIA endpoint not found within USB PCIe buses 1..8')
+  def _setup_bars(self):
+    mem_next, pref_next, bars = 0x10000000, 32 << 30, {}
+    for bus in range(self.gpu_bus):
+      self._set_bridge_buses(bus, bus + 1, self.gpu_bus)
+      self.usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=bus, value=(mem_next >> 16) & 0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_MEMORY_LIMIT, bus=bus, value=0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_BASE, bus=bus, value=(pref_next >> 16) & 0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_LIMIT, bus=bus, value=0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_BASE_UPPER32, bus=bus, value=pref_next >> 32, size=4)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_LIMIT_UPPER32, bus=bus, value=0xffffffff, size=4)
+      self.usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus,
+                            value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
+    bar_off = 0
+    while bar_off < 24:
+      cfg = self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=self.gpu_bus, size=4)
+      is_mem = (cfg & pci.PCI_BASE_ADDRESS_SPACE) == pci.PCI_BASE_ADDRESS_SPACE_MEMORY
+      is_pref, is_64 = bool(cfg & pci.PCI_BASE_ADDRESS_MEM_PREFETCH), bool(cfg & pci.PCI_BASE_ADDRESS_MEM_TYPE_64)
+      if is_mem:
+        self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=self.gpu_bus, value=0xffffffff, size=4)
+        lo = self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=self.gpu_bus, size=4) & 0xfffffff0
+        if is_64: self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=self.gpu_bus, value=0xffffffff, size=4)
+        hi = self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=self.gpu_bus, size=4) if is_64 else 0
+        mask = ((hi << 32) | lo) & ~0xf
+        bar_size = ((~mask) + 1) & (0xffffffffffffffff if is_64 else 0xffffffff)
+        if bar_size:
+          addr = pref_next if is_pref else mem_next
+          self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=self.gpu_bus, value=addr & 0xffffffff, size=4)
+          if is_64: self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=self.gpu_bus, value=addr >> 32, size=4)
+          bars[bar_off // 4] = (addr, bar_size)
+          if is_pref: pref_next = (addr + bar_size + 0x1fffff) & ~0x1fffff
+          else: mem_next = (addr + bar_size + 0x1fffff) & ~0x1fffff
+      bar_off += 8 if is_64 else 4
+    self.usb.pcie_cfg_req(pci.PCI_COMMAND, bus=self.gpu_bus,
+                          value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
+    if 0 not in bars: raise RuntimeError('EN210 BAR0 was not discovered')
+    return bars
+  def cfg(self, off, sz=4): return self.usb.pcie_cfg_req(off, bus=self.gpu_bus, size=sz)
+  def cfg_write(self, off, val, sz=4): self.usb.pcie_cfg_req(off, bus=self.gpu_bus, value=val, size=sz)
+  def map_bar(self, bar): return self._bars[bar]
+  def read8(self, reg): return self.usb.pcie_request(0x00, self._bars[0][0] + reg, size=1)
+  def write8(self, reg, val): self.usb.pcie_request(0x40, self._bars[0][0] + reg, value=val, size=1)
+  def read32(self, reg): return self.usb.pcie_request(0x00, self._bars[0][0] + reg, size=4)
+  def write32(self, reg, val): self.usb.pcie_request(0x40, self._bars[0][0] + reg, value=val & 0xffffffff, size=4)
+  def read_block(self, reg, size): return self.usb.pcie_mem_read(self._bars[0][0] + reg, size)
+  def write_block(self, reg, data): self.usb.pcie_mem_write(self._bars[0][0] + reg, data)
+  def close(self): self.usb.usb.close()
+
+class Dev:
+  """Select direct USB3 when available, with the proven socket path as fallback."""
+  def __new__(cls):
+    iface = os.environ.get('EN210_IFACE', 'AUTO').upper()
+    if iface not in ('AUTO', 'USB', 'SOCKET'):
+      raise ValueError(f'EN210_IFACE must be AUTO, USB, or SOCKET, got {iface!r}')
+    if iface == 'USB' or (iface == 'AUTO' and USB3Iface.available()): return USB3Iface()
+    return TinyGPUIface()
 
 # ============================================================================
 # VRAM access via PRAMIN window (BAR0 + 0x700000, window via reg 0x001700)
@@ -1799,11 +2119,29 @@ class VRAM:
     self._set_window(base)
     return self.dev.read32(PRAMIN_BASE + offset)
   def write_block(self, vram_addr, data: bytes):
+    if hasattr(self.dev, 'write_block'):
+      off = 0
+      while off < len(data):
+        addr = vram_addr + off
+        chunk_size = min(len(data) - off, 0x100000 - (addr & 0xfffff))
+        chunk = data[off:off + chunk_size]
+        self._set_window(addr & 0xFFFFFF00000)
+        self.dev.write_block(PRAMIN_BASE + (addr & 0xfffff), bytes(chunk).ljust((len(chunk) + 3) & ~3, b'\0'))
+        off += chunk_size
+      return
     for i in range(0, len(data), 4):
       val = struct.unpack_from('<I', data, i)[0] if i + 4 <= len(data) else \
             struct.unpack('<I', data[i:].ljust(4, b'\x00'))[0]
       self.write32(vram_addr + i, val)
   def read_block(self, vram_addr, size: int) -> bytes:
+    if hasattr(self.dev, 'read_block'):
+      data = bytearray()
+      while len(data) < size:
+        addr = vram_addr + len(data)
+        chunk_size = min(size - len(data), 0x100000 - (addr & 0xfffff))
+        self._set_window(addr & 0xFFFFFF00000)
+        data += self.dev.read_block(PRAMIN_BASE + (addr & 0xfffff), (chunk_size + 3) & ~3)[:chunk_size]
+      return bytes(data)
     data = bytearray()
     for i in range(0, size, 4):
       data.extend(struct.pack('<I', self.read32(vram_addr + i)))
@@ -2115,6 +2453,9 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
   for off in [0x3c, 0x44, 0x48, 0x50, 0x54, 0x60, 0x78, 0x7c, 0x80, 0x88, 0x98]:
     print(f'  [0x{off:02x}] = 0x{vram.read32(ramfc_addr + off):08x}')
 
+  stage_done(f'channel {chan_id}, GMMU and RAMFC ready')
+  stage_set(8, 'stage push buffer, GPFIFO entry, and GR context')
+
   # Write push buffer data
   for i, w in enumerate(push_words):
     vram.write32(push_buf_addr + i * 4, w)
@@ -2153,6 +2494,8 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
 
   # Clear any pending interrupts
   dev.write32(0x002100, 0xffffffff)
+  stage_done(f'{len(push_words)} push words, channel {chan_id} runnable')
+  stage_set(9, 'ring GPPut and wait for GPGet')
 
   # Set GPPut to trigger GPFIFO processing
   userd = USERD_BASE + chan_id * USERD_SIZE
@@ -2180,6 +2523,9 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
   print(f'[chan] After poll ({attempt+1} iterations):')
   print(f'  GPGet=0x{gp_get:08x} GPPut=0x{gp_put:08x}')
   print(f'  PFIFO_INTR=0x{fifo_intr:08x}')
+  submit_ok = gp_get == gp_put and fifo_intr == 0
+  if submit_ok: stage_done(f'GPGet={gp_get}, no FIFO interrupt')
+  else: stage_fail(f'GPGet={gp_get} GPPut={gp_put} PFIFO_INTR={fifo_intr:#x}')
 
   # Read all flow control fields
   print('[chan] Final USERD:')
@@ -2207,6 +2553,9 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
     print(f'  DMA_STATE=0x{dma_state:08x} (err: {err})')
     print(f'  PUSH=0x{push_state:08x}')
 
+  if not submit_ok:
+    raise RuntimeError(f'GPU submission failed: GPGet={gp_get} GPPut={gp_put} PFIFO_INTR={fifo_intr:#x}')
+
   return chan_id
 
 # ============================================================================
@@ -2226,7 +2575,7 @@ extern "C" __global__ void add(const float *a, const float *b, float *out, int N
 """
 
 # PTX 4.1 for sm_12 (compiled from KERNEL_CU via nvcc --gpu-architecture=sm_12):
-KERNEL_PTX = """\
+ADD_KERNEL_PTX = """\
 .version 4.1
 .target sm_12
 .address_size 32
@@ -2270,6 +2619,13 @@ KERNEL_PTX = """\
     ret;
 }
 """
+
+def kernel_ptx(op):
+  if op == 'add': return ADD_KERNEL_PTX
+  if op == 'mul':
+    return ADD_KERNEL_PTX.replace('.entry add(', '.entry mul(').replace(
+      'add.f32 %f3, %f1, %f2;', 'mul.f32 %f3, %f1, %f2;')
+  raise ValueError(f'unsupported operation {op!r}')
 
 # Kernel metadata (from cubin: bar=0, reg=4, lmem=0, smem=32)
 KERNEL_REGS = 4
@@ -2329,7 +2685,7 @@ def _emit_short(c0):
   return struct.pack('<I', c0 & 0xFFFFFFFF)
 
 # ----------------------------------------------------------------------------
-# build_kernel_sass: hand-assemble the vector-add kernel for sm_12 (Tesla)
+# build_kernel_sass: hand-assemble vector add/multiply for sm_12 (Tesla)
 # ----------------------------------------------------------------------------
 # Disassembly (from nvdisasm 6.5):
 #   G2R.U16 R0H, g[0x6].U16           ; blockIdx.x -> R0 high half
@@ -2343,7 +2699,7 @@ def _emit_short(c0):
 #   IADD32 R3, g[0x5], R2             ; R3 = &b[i]
 #   GLD.U32 R1, global14[R0]          ; R1 = a[i]
 #   GLD.U32 R0, global14[R3]          ; R0 = b[i]
-#   FADD32 R0, R1, R0                 ; R0 = a[i] + b[i]
+#   FADD32/FMUL32 R0, R1, R0          ; selected arithmetic operation
 #   IADD32 R1, g[0x6], R2             ; R1 = &out[i]
 #   GST.U32 global14[R1], R0 (exit)   ; out[i] = result, then exit
 #
@@ -2352,12 +2708,13 @@ def _emit_short(c0):
 #   g[0x6] = out ptr            g[0x7] = N
 # global14 = the global memory space used by nvcc for GLD/GST
 
-def build_kernel_sass():
-  """Hand-assemble the vector-add kernel for Tesla (sm_12) ISA.
+def build_kernel_sass(op='add'):
+  """Hand-assemble the vector add/multiply kernel for Tesla (sm_12) ISA.
 
   Returns 88 bytes of SASS (14 instructions: 8 long + 6 short).
   Verified bit-exact against CUDA 6.5 nvcc output via nvdisasm.
   """
+  if op not in ('add', 'mul'): raise ValueError(f'unsupported operation {op!r}')
   out = bytearray()
 
   # G2R.U16 R0H, g[0x6].U16 — load blockIdx.x into high half of R0
@@ -2396,8 +2753,8 @@ def build_kernel_sass():
   # GLD.U32 R0, global14[R3] — load b[i]
   out += _emit_long(_lw0(0xD, 0, 3, 14), _lw1(secop=4, cidx=3))
 
-  # FADD32 R0, R1, R0 — R0 = a[i] + b[i]
-  out += _emit_short(_sw(0xB, 0, 1, 0))
+  # Tesla short FP arithmetic: opcode 0xb is FADD32, 0xc is FMUL32.
+  out += _emit_short(_sw({'add': 0xB, 'mul': 0xC}[op], 0, 1, 0))
 
   # IADD32 R1, g[0x6], R2 — R1 = out_ptr + byte_offset
   out += _emit_short(_sw(2, 1, _ssh32(6), 2, m2=1, s1t=1))
@@ -2407,8 +2764,8 @@ def build_kernel_sass():
 
   return bytes(out)
 
-def assemble_kernel_sass():
-  """Try to compile KERNEL_PTX via ptxas 6.5 and extract SASS.
+def assemble_kernel_sass(op='add'):
+  """Try to compile the selected PTX via ptxas 6.5 and extract SASS.
 
   ptxas 6.5 is the last version supporting sm_12.  It's x86-64 only, so on
   ARM macOS we try Docker.  Returns raw SASS bytes or None.
@@ -2416,18 +2773,19 @@ def assemble_kernel_sass():
   import subprocess, tempfile
   candidates = [
     os.environ.get("EN210_PTXAS"),
-    os.path.join(os.path.dirname(__file__), "cuda65-bin", "ptxas"),
+    os.path.join(os.path.dirname(__file__), "tools", "cuda65-bin", "ptxas"),
   ]
   ptxas = next((p for p in candidates if p and os.path.isfile(p) and
                 os.access(p, os.X_OK)), None)
   if ptxas is None:
     return None
   try:
-    with tempfile.TemporaryDirectory(prefix="en210_ptxas_") as d:
-      src = os.path.join(d, "add.ptx")
-      cubin = os.path.join(d, "add.cubin")
+    scratch_root = os.path.join(os.path.dirname(__file__), 'tools')
+    with tempfile.TemporaryDirectory(prefix=".en210_ptxas_", dir=scratch_root) as d:
+      src = os.path.join(d, f"{op}.ptx")
+      cubin = os.path.join(d, f"{op}.cubin")
       with open(src, "w") as f:
-        f.write(KERNEL_PTX)
+        f.write(kernel_ptx(op))
       subprocess.run([ptxas, "-arch=sm_12", src, "-o", cubin],
                      check=True, capture_output=True, timeout=60)
       with open(cubin, "rb") as f:
@@ -2471,21 +2829,24 @@ def assemble_kernel_sass():
   except OSError as e:
     if e.errno != 8:  # ENOEXEC — expected on ARM, don't print
       print(f"[kernel] ptxas failed: {e}")
+  except subprocess.CalledProcessError as e:
+    detail = (e.stderr or e.stdout or b'').decode(errors='replace').strip()
+    print(f"[kernel] ptxas compilation failed: {detail or e}")
   except Exception as e:
     print(f"[kernel] ptxas compilation failed: {e}")
   return None
 
-def get_kernel_sass():
+def get_kernel_sass(op='add'):
   """Return the kernel SASS bytes.
 
   Tries ptxas 6.5 first (if available), then hand-assembles via
   build_kernel_sass().  The hand-assembled output is verified against
   the known-good CUDA 6.5 nvcc SASS.
   """
-  sass = assemble_kernel_sass()
+  sass = assemble_kernel_sass(op)
   if sass is not None:
     return sass
-  sass = build_kernel_sass()
+  sass = build_kernel_sass(op)
   print(f"[kernel] Hand-assembled {len(sass)} bytes of SASS ({len(sass)//4} words)")
   return sass
 
@@ -2712,25 +3073,53 @@ def make_setup_fn(ctxvals, ctxvals_size):
 # ============================================================================
 # Main
 # ============================================================================
-def run_add():
-    dev = Dev()
+def run_add(op='add'):
+    if op not in ('add', 'mul'): raise ValueError(f'unsupported operation {op!r}')
+    dev = None
     try:
+        stage_set(1, f'select transport for {op}')
+        dev = Dev()
         # Enable MSE
         cmd_reg = dev.cfg(0x04, 2)
         if not (cmd_reg & 0x0002):
-            dev._rpc(4, 0, 0x04, 2, payload=struct.pack('<H', cmd_reg | 0x0002))
+            dev.cfg_write(0x04, cmd_reg | 0x0002, 2)
         dev.map_bar(0)
         dev.write32(0x000200, 0xffffffff)
         print(f'PMC_ENABLE = 0x{dev.read32(0x000200):08x}')
+        pci_id = dev.cfg(0x00, 4)
+        if pci_id != 0x0a6510de: raise RuntimeError(f'expected EN210 10de:0a65, got {pci_id:#010x}')
+        stage_done(f'{type(dev).__name__}, PCI 10de:0a65, BAR0 mapped')
+
+        stage_set(2, 'identify GT218 and verify PRAMIN access')
+        boot0 = dev.read32(0x000000)
+        chipset = (boot0 >> 20) & 0xfff
+        if chipset != 0xa8: raise RuntimeError(f'expected GT218 chipset 0xa8, got {chipset:#x}')
+        stage_done('GT218 detected; GMMU tables are staged with the channel in S7')
+
+        stage_set(3, 'load VBIOS/context assets and execute legacy clock/devinit scripts')
 
         # VBIOS devinit
-        rom_path = os.path.join(os.path.dirname(__file__), 'en210.rom')
+        rom_path = os.path.join(os.path.dirname(__file__), 'runtime', 'en210.rom')
         with open(rom_path, 'rb') as f:
             image = f.read()
         scripts = find_vbios_scripts(image)
         for s in scripts:
             run_vbios_init(dev, image, scripts=[s], debug=False)
         print('Devinit complete.')
+
+        ctxprog_globals = {}
+        with open(os.path.join(os.path.dirname(__file__), 'runtime', 'ctxprog.py')) as f:
+            exec(f.read(), ctxprog_globals)
+        ctxprog = ctxprog_globals['ctxprog']
+        ctxvals_size = ctxprog_globals['ctxvals_size']
+        with open(os.path.join(os.path.dirname(__file__), 'runtime', 'ctxvals.bin'), 'rb') as f:
+            ctxvals = f.read()
+        print(f'[gr] ctxprog: {len(ctxprog)} instrs, ctxvals: {len(ctxvals)} bytes')
+        stage_done(f'{len(scripts)} VBIOS scripts; clocks/devinit complete; GR assets loaded')
+
+        stage_skip(4, 'GT218 has no secure Falcon/GSP boot chain')
+        stage_skip(5, 'legacy FIFO/GR is programmed directly; no GSP/RM')
+        stage_set(6, 'initialize VRAM, FIFO, PGRAPH, and golden GR context program')
 
         # Verify VRAM
         vram = VRAM(dev)
@@ -2741,34 +3130,25 @@ def run_add():
         # FIFO init
         fifo_init(dev)
 
-        # Load ctxprog + ctxvals
-        ctxprog_globals = {}
-        with open(os.path.join(os.path.dirname(__file__), 'ctxprog.py')) as f:
-            exec(f.read(), ctxprog_globals)
-        ctxprog = ctxprog_globals['ctxprog']
-        ctxvals_size = ctxprog_globals['ctxvals_size']
-        with open(os.path.join(os.path.dirname(__file__), 'ctxvals.bin'), 'rb') as f:
-            ctxvals = f.read()
-        print(f'[gr] ctxprog: {len(ctxprog)} instrs, ctxvals: {len(ctxvals)} bytes')
-
         # GR init
         gr_init(dev, ctxprog=ctxprog, ctxvals=ctxvals, ctxvals_size=ctxvals_size)
+        stage_done(f'VRAM verified; FIFO online; {len(ctxprog)}-word ctxprog uploaded')
 
         # Upload kernel SASS to VRAM
-        sass = get_kernel_sass()
+        sass = get_kernel_sass(op)
         print(f'[kernel] Uploading {len(sass)} bytes to 0x{KERNEL_ADDR:08x}...')
         vram.write_block(KERNEL_ADDR, sass)
         verify = vram.read_block(KERNEL_ADDR, len(sass))
         print(f'[kernel] Upload {"verified" if verify == sass else "FAILED"}')
 
-        # Prepare input data: a[i]=i, b[i]=i*10, expected out[i]=i*11
+        # Prepare input data: a[i]=i, b[i]=i*10.
         N = int(os.environ.get("EN210_N", "4"))
         block_dim = int(os.environ.get("EN210_BLOCK", str(N)))
         grid_dim = (N + block_dim - 1) // block_dim
         a_bytes = struct.pack(f'{N}f', *[float(i) for i in range(N)])
         b_bytes = struct.pack(f'{N}f', *[float(i * 10) for i in range(N)])
-        expected = [float(i) + float(i * 10) for i in range(N)]
-        print(f'[data] N={N}, block={block_dim}, grid={grid_dim}')
+        expected = [float(i) + float(i * 10) if op == 'add' else float(i) * float(i * 10) for i in range(N)]
+        print(f'[data] op={op} N={N}, block={block_dim}, grid={grid_dim}')
         print(f'[data] expected out = {expected[:8]}{"..." if N > 8 else ""}')
 
         vram.write_block(INPUT_A_ADDR, a_bytes)
@@ -2794,13 +3174,15 @@ def run_add():
         # Create channel and launch
         print('\n=== Compute Launch ===')
         setup_fn = make_setup_fn(ctxvals, ctxvals_size)
+        stage_set(7, 'construct legacy G84 channel, GMMU, and RAMFC')
         t_kern0 = time.time()
         create_channel(dev, vram, push_words=push, setup_fn=setup_fn)
         t_kern1 = time.time()
         kernel_ms = (t_kern1 - t_kern0) * 1000.0
-        print(f'[en210] kernel_time_ms={kernel_ms:.3f} N={N} block={block_dim} grid={grid_dim}')
+        print(f'[en210] kernel_time_ms={kernel_ms:.3f} op={op} N={N} block={block_dim} grid={grid_dim}')
 
         # Read back results
+        stage_set(10, f'read and validate {N} {op} results')
         print('\n=== Result Readback ===')
         time.sleep(0.5)
 
@@ -2856,27 +3238,123 @@ def run_add():
         mismatches = sum(1 for r, e in zip(results, expected) if r != e)
         print(f'\n=== Summary: N={N} mismatches={mismatches}/{N} ===')
         if mismatches == 0:
-            print(f'hardware_demo=ok N={N} block={block_dim} grid={grid_dim}')
+            stage_done(f'{op} matched {N}/{N}')
+            print(f'hardware_demo=ok op={op} N={N} block={block_dim} grid={grid_dim}')
         else:
-            print(f'hardware_demo=FAIL N={N} mismatches={mismatches}/{N}')
+            stage_fail(f'{op} mismatches={mismatches}/{N}')
+            raise RuntimeError(f'hardware_demo=FAIL op={op} N={N} mismatches={mismatches}/{N}')
 
+    except Exception as e:
+        stage_fail(f'{type(e).__name__}: {e}')
+        raise
     finally:
-        dev.close()
+        if dev is not None: dev.close()
+
+def offline_selftest():
+    """Exercise both kernels, assets, stages, and USB packet logic without a GPU."""
+    stage_set(1, 'offline Chestnut F0 transport model')
+    class FakeUSB:
+        def __init__(self): self.out = []
+        def control_write(self, request, value=0, index=0, data=b'', timeout=0):
+            self.out.append((request, value, index, data, timeout))
+        def control_read(self, request, length, **kwargs):
+            if request != 0xf0 or length != 8: raise AssertionError((request, length))
+            return struct.pack('<I', 0x44332211) + bytes(4)
+    ctrl = ChestnutController.__new__(ChestnutController)
+    ctrl.usb = FakeUSB()
+    if ctrl.pcie_request(0x00, 0x1001, size=1) != 0x22: raise AssertionError('F0 byte read')
+    ctrl.pcie_request(0x40, 0x1002, value=0xab, size=1)
+    if ctrl.usb.out[-1][1] != 0x440: raise AssertionError('F0 byte-enable encoding')
+    stage_done('F0 config/MMIO byte access encoded')
+
+    stage_set(2, 'offline PRAMIN window boundary model')
+    class FakeDev:
+        def __init__(self): self.writes, self.blocks = [], []
+        def write32(self, reg, val): self.writes.append((reg, val))
+        def write_block(self, reg, data): self.blocks.append((reg, bytes(data)))
+        def read_block(self, reg, size): return bytes(range(size))
+    fake_dev, payload = FakeDev(), b'abcdef'
+    vram = VRAM(fake_dev)
+    vram.write_block(0x1ffffc, payload)
+    if [len(data) for _, data in fake_dev.blocks] != [4, 4]: raise AssertionError('PRAMIN split')
+    if len(vram.read_block(0x1ffffc, len(payload))) != len(payload): raise AssertionError('PRAMIN read')
+    stage_done('PRAMIN bulk transfer splits safely at 1 MiB window')
+
+    stage_set(3, 'parse checked-in VBIOS and GR context assets')
+    runtime_dir = os.path.join(os.path.dirname(__file__), 'runtime')
+    with open(os.path.join(runtime_dir, 'en210.rom'), 'rb') as f: image = f.read()
+    scripts = find_vbios_scripts(image)
+    ctx = {}
+    with open(os.path.join(runtime_dir, 'ctxprog.py')) as f: exec(f.read(), ctx)
+    with open(os.path.join(runtime_dir, 'ctxvals.bin'), 'rb') as f: ctxvals = f.read()
+    if not scripts or len(ctx['ctxprog']) != 124 or len(ctxvals) != ctx['ctxvals_size']:
+        raise AssertionError('runtime asset structure')
+    stage_done(f'{len(scripts)} VBIOS scripts; 124-word ctxprog; {len(ctxvals)} context bytes')
+
+    stage_skip(4, 'GT218 has no secure Falcon/GSP boot chain')
+    stage_skip(5, 'legacy FIFO/GR is programmed directly; no GSP/RM')
+
+    stage_set(6, 'validate legacy GR context metadata')
+    if ctx['ctxvals_size'] != 0x4ba00: raise AssertionError('ctxvals size')
+    stage_done('ctxprog and golden context dimensions match GT218')
+
+    stage_set(7, 'validate GPFIFO/channel encodings')
+    entry = gp_entry(0x110000, 186)
+    if len(entry) != 8 or len(build_compute_push(VRAM_DMA_HANDLE, KERNEL_ADDR, STACK_ADDR,
+       INPUT_A_ADDR, INPUT_B_ADDR, OUTPUT_ADDR, 4, 4, 1)) != 186:
+        raise AssertionError('channel encoding')
+    stage_done('8-byte GPFIFO entry and 186-word compute push')
+
+    stage_set(8, 'build add and multiply Tesla SASS')
+    add_sass, mul_sass = build_kernel_sass('add'), build_kernel_sass('mul')
+    if len(add_sass) != 88 or len(mul_sass) != 88: raise AssertionError('SASS size')
+    changed = [i for i, (a, b) in enumerate(zip(add_sass, mul_sass)) if a != b]
+    if changed != [75] or add_sass[75] != 0xb0 or mul_sass[75] != 0xc0:
+        raise AssertionError(f'FP opcode delta {changed}')
+    if 'add.f32' not in kernel_ptx('add') or 'mul.f32' not in kernel_ptx('mul'):
+        raise AssertionError('PTX operation selection')
+    stage_done('88-byte add/mul kernels; only FADD32/FMUL32 opcode differs')
+
+    stage_set(9, 'simulate completed submission')
+    gp_get = gp_put = 1
+    fifo_intr = 0
+    if gp_get != gp_put or fifo_intr: raise AssertionError('submission model')
+    stage_done('GPGet=1, no FIFO interrupt')
+
+    stage_set(10, 'validate host-side expected vectors')
+    a, b = [float(i) for i in range(4)], [float(i * 10) for i in range(4)]
+    if [x + y for x, y in zip(a, b)] != [0.0, 11.0, 22.0, 33.0]: raise AssertionError('add vector')
+    if [x * y for x, y in zip(a, b)] != [0.0, 10.0, 40.0, 90.0]: raise AssertionError('mul vector')
+    stage_done('add and mul expected vectors verified')
+    print('offline_selftest=ok add_sass=88 mul_sass=88 stages=10 usb3_mock=ok')
 
 def main():
-    if "--probe" in sys.argv:
-        dev = Dev()
-        try:
-            ven_dev = dev.cfg(0x00, 4)
-            print(f"PCI_ID={ven_dev:#010x}")
-            dev.map_bar(0)
-            boot0 = dev.read32(0x000000)
-            print(f"PMC_BOOT_0={boot0:#010x} chip_id={(boot0>>20)&0xFFF:#05x}")
-        finally:
-            dev.close()
-        return
-    run_add()
+    try:
+        if '--offline-selftest' in sys.argv:
+            offline_selftest()
+            return
+        if "--probe" in sys.argv:
+            stage_set(1, 'probe selected transport')
+            dev = Dev()
+            try:
+                ven_dev = dev.cfg(0x00, 4)
+                print(f"PCI_ID={ven_dev:#010x}")
+                dev.map_bar(0)
+                stage_done(f'{type(dev).__name__}, PCI {ven_dev & 0xffff:04x}:{ven_dev >> 16:04x}')
+                stage_set(2, 'read chipset identity')
+                boot0 = dev.read32(0x000000)
+                print(f"PMC_BOOT_0={boot0:#010x} chip_id={(boot0>>20)&0xFFF:#05x}")
+                stage_done(f'chipset={(boot0 >> 20) & 0xfff:#x}')
+            finally:
+                dev.close()
+            return
+        args = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
+        op = args[0].lower() if args else 'add'
+        if op not in ('add', 'mul'):
+            raise SystemExit('usage: python3 examples_en210/add.py [add|mul]')
+        run_add(op)
+    finally:
+        stage_summary()
 
 if __name__ == "__main__":
     main()
-

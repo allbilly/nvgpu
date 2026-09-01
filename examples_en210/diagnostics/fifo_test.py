@@ -6,7 +6,7 @@ Based on nouveau nv50.c / g84.c channel layout.
 """
 from __future__ import annotations
 import sys, os, struct, socket, time, enum
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'examples_kepler'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'examples_kepler'))
 from nvbios_init import find_vbios_scripts, run_vbios_init
 
 # ============================================================================
@@ -506,7 +506,8 @@ def main():
     print(f'PMC_ENABLE = 0x{dev.read32(0x000200):08x}')
 
     # VBIOS devinit
-    with open(os.path.join(os.path.dirname(__file__), 'en210.rom'), 'rb') as f:
+    runtime_dir = os.path.join(os.path.dirname(__file__), '..', 'runtime')
+    with open(os.path.join(runtime_dir, 'en210.rom'), 'rb') as f:
       image = f.read()
     scripts = find_vbios_scripts(image)
     for s in scripts:
@@ -543,7 +544,7 @@ def main():
     print('\n=== GR Init ===')
     try:
       # Load generated ctxprog
-      ctxprog_path = os.path.join(os.path.dirname(__file__), 'ctxprog.py')
+      ctxprog_path = os.path.join(runtime_dir, 'ctxprog.py')
       if os.path.exists(ctxprog_path):
         ctxprog_globals = {}
         with open(ctxprog_path) as f:
@@ -553,7 +554,7 @@ def main():
         print(f'[gr] Loaded ctxprog: {len(ctxprog)} instructions, ctxvals_size=0x{ctxvals_size:x}')
 
         # Load ctxvals binary
-        ctxvals_path = os.path.join(os.path.dirname(__file__), 'ctxvals.bin')
+        ctxvals_path = os.path.join(runtime_dir, 'ctxvals.bin')
         with open(ctxvals_path, 'rb') as f:
           ctxvals = f.read()
         print(f'[gr] Loaded ctxvals: {len(ctxvals)} bytes')

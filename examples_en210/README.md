@@ -1,13 +1,13 @@
 # GT218 / GeForce 210 (ASUS EN210) eGPU bring-up progress
 
-Last updated: 2026-07-22
+Last updated: 2026-09-02
 
 ## Goal and honesty boundary
 
-Run `add.py` on the attached `10de:0a65` ASUS EN210 (GT218, GeForce 210, sm_12)
-and return a four-element integer result produced by GT218 hardware. CPU
-arithmetic and a host-side copy are diagnostics only and must never be reported
-as GPU addition.
+Run `add.py [add|mul]` on the attached `10de:0a65` ASUS EN210 (GT218,
+GeForce 210, sm_12) and return a four-element result produced by GT218 hardware.
+CPU arithmetic and a host-side copy are diagnostics only and must never be
+reported as GPU computation.
 
 ## Architecture summary (from Nouveau source)
 
@@ -50,8 +50,20 @@ NV50_COMPUTE method definitions (cl50c0.h, from Mesa):
 |---|---|
 | PCI detect | `10de:0a65`, ASUS EN210, GT218 |
 | BAR0 MMIO | `PMC_BOOT_0 = 0x0a8280b1` → chip_id `0xa8` = GT218 confirmed |
-| Transport | TinyGPU.app socket protocol, `--probe` reads MMIO correctly |
-| Offline selftest | `--middle-selftest` validates constants + wire protocol |
+| Transport | Direct Chestnut USB3 preferred, TinyGPU.app socket fallback; `--probe` reads MMIO |
+| Offline selftest | `--offline-selftest` validates add/mul SASS, assets, stages, and USB3 packet logic |
+
+Run from the repository root:
+
+```sh
+python3 examples_en210/add.py          # add (default)
+python3 examples_en210/add.py mul      # multiply
+python3 examples_en210/add.py --offline-selftest
+```
+
+The trace uses the same S1–S10 lifecycle as `examples/add.py`. On Tesla,
+S3 reports the real VBIOS clock/devinit work; only S4 (secure firmware boot)
+and S5 (GSP/RM) are marked N/A because GT218 predates those subsystems.
 
 ## Bring-up chain (all steps completed)
 
@@ -786,19 +798,14 @@ push buffer submission → kernel execution → result readback
 | 0x270000 | 0x1000 | Output array |
 | 0x290000 | 0x4B800 | GR context values (ctxvals) |
 
-### Files
+### Layout
 
 | File | Purpose |
 |---|---|
 | `add.py` | Main compute launch script |
-| `add_kernel.cu` | CUDA source for vector add kernel |
-| `add_kernel.ptx` | PTX intermediate (sm_12) |
-| `add_kernel.cubin` | Compiled cubin (sm_12) |
-| `add_sass.bin` | Raw SASS binary (88 bytes) |
-| `fifo_test.py` | FIFO/channel/GR init infrastructure |
-| `gen_ctxprog.c` | Context program generator (compiled to ctxprog binary) |
-| `extract_cuda65.sh` | Script to extract SASS from cubin via cuobjdump65 |
-| `setup_ptxas_6_5_osx.sh` | CUDA 6.5 toolchain setup for macOS |
+| `runtime/` | VBIOS, generated GR context, and optional raw SASS used by `add.py` |
+| `diagnostics/` | Benchmark runner, retained logs, and the legacy socket-only FIFO test |
+| `tools/` | CUDA 6.5 setup, kernel artifacts, and context generators/reference source |
 
 The Tesla path is actually **simpler in some ways** (no Falcon firmware to
 load) but **harder in others** (ctxprog generation is opaque, sm_12 tooling
