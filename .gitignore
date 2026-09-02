@@ -2,3 +2,4 @@ ref/*
 __pycache__/
 *.py[cod]
 logs/
+.DS_Store
