@@ -56,9 +56,9 @@ echo "1+1=" | DEV=NV python3 -m tinygrad.llm
 
 # Kepler
 examples_kepler_pcie/add.py
-- Linux port of examples_kepler/add.py: macOS TinyGPU.app socket transport
+- Linux port of examples_kepler/add_770.py: macOS TinyGPU.app socket transport
   replaced by LinuxPCIDevice (raw MMIO via sysfs resourceN mmap). Reuses
-  nvbios_init / pgraph_mmio_gk104 from examples_kepler/ via sys.path insert.
+  nvbios_init / pgraph_mmio_gk104 from examples_kepler/runtime/ via sys.path insert.
 - live path WORKING: hardware_demo=ok N=256 mismatches=0/256 (2026-07-15).
   KEPLER_LIVE_ACK gating is macOS-only; Linux only needs root (auto-sudo).
 - `--middle-selftest` and `NV_BACKEND=software` pass offline (no hardware/root).
@@ -66,7 +66,7 @@ examples_kepler_pcie/add.py
 - live add op needs: root (sudo), KEPLER_CUBIN=../examples_kepler/add_kepler.cubin,
   KEPLER_VBIOS=../examples_kepler/Palit.GTX770.4096.131216.rom, and
   ref/linux/ (torvalds/linux v7.2-rc2 sparse-checkout of
-  drivers/gpu/drm/nouveau/nvkm/engine/gr) for grctx_gk104.py to parse csdata.
+  drivers/gpu/drm/nouveau/nvkm/engine/gr) for runtime/grctx_gk104.py to parse csdata.
 - VBIOS devinit executes, GPC PLL locks, FECS posts ready, ctx_chan works,
   golden context saves, full add kernel runs with correct results.
 - KEPLER_SKIP_LTC=1 skips hot-path LTC invalidate calls (H26: Nouveau never

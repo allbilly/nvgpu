@@ -1,6 +1,6 @@
 """Semantic MEMX script executor (Nouveau memx.fuc + memx.c command model).
 
-Accepts the same command shapes used by ``examples_kepler/nvbios_init.py``:
+Accepts the same command shapes used by ``examples_kepler/runtime/nvbios_init.py``:
 
   ENTER, LEAVE, WR32(addr, data[, ...]), WAIT(addr, mask, data, nsec), DELAY(nsec)
 
@@ -29,7 +29,7 @@ from .values import parse_int, u32
 # Falcon IO: PTIMER low (macros.fuc NV_PPWR_TIMER_LOW).
 TIMER_LOW = 0x002C
 
-# Match examples_kepler/nvbios_init.py opcode numbers.
+# Match examples_kepler/runtime/nvbios_init.py opcode numbers.
 class MemxOp(IntEnum):
     ENTER = 1
     LEAVE = 2

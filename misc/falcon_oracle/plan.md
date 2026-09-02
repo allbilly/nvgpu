@@ -4,7 +4,7 @@
 **Target:** NVIDIA Falcon firmware used by the local GK104 PMU/FECS path  
 **Plan version:** 2026-07-18  
 **Primary implementation language:** Python  
-**Primary references:** local Nouveau source under `ref/linux/`, local envytools documentation/rnndb, existing `examples_kepler/add.py` fake and trace tests
+**Primary references:** local Nouveau source under `ref/linux/`, local envytools documentation/rnndb, existing `examples_kepler/add_770.py` fake and trace tests
 
 ---
 
@@ -294,7 +294,7 @@ tools/
         └── fixtures/
 ```
 
-Avoid putting the core interpreter inside `examples_kepler/add.py`. That file should import the oracle or adapters, not own them.
+Avoid putting the core interpreter inside `examples_kepler/add_770.py`. That file should import the oracle or adapters, not own them.
 
 ---
 
@@ -1258,8 +1258,8 @@ LIVE_BYTE_VERIFIED
 ```bash
 python3 -m py_compile tools/falcon_oracle/*.py
 python3 -m pytest tools/falcon_oracle/tests
-python3 examples_kepler/add.py --middle-selftest
-NV_BACKEND=software python3 examples_kepler/add.py
+python3 examples_kepler/add_770.py --middle-selftest
+NV_BACKEND=software python3 examples_kepler/add_770.py
 git diff --check
 ```
 
