@@ -34,8 +34,9 @@ The only external dependencies this module has are:
 NO imports from tinygrad.runtime.support / ops / device / renderer / uop / helpers
 are permitted on the live path — those have been vendored inline below.
 
-``python3 examples_kepler/add_660ti.py --middle-selftest`` exercises the offline
-builders without touching the card.  ``--mmiotrace-selftest`` is the golden
+``python3 examples_kepler/add_660ti.py --offline-selftest`` exercises the
+offline builders without touching the card (``--middle-selftest`` is retained
+as an alias).  ``--mmiotrace-selftest`` is the golden
 Nouveau mmiotrace gate (no hardware/pagemap).  ``NV_BACKEND=software`` runs the
 complete allocator and launch-word path against host memory.  On Linux a normal
 live invocation selects the unbound GK104 from sysfs and requests sudo when
@@ -4409,9 +4410,9 @@ def inspect_vbios(path):
     pos += 4
   if not pcirs:
     raise ValueError("VBIOS has no PCIR structure")
-  matches = [x for x in pcirs if x[1:3] == (0x10de, 0x1184)]
+  matches = [x for x in pcirs if x[1] == 0x10de and x[2] in GK104_PCI_IDS]
   if not matches:
-    raise ValueError("VBIOS does not contain a GK104/GTX 770 (10DE:1184) image")
+    raise ValueError("VBIOS does not contain a supported NVIDIA GK104 image")
 
   # BIT is the modern Kepler table directory.  Nouveau searches for the
   # extended signature ff b8 "BIT"; the header fields are documented by
@@ -4448,12 +4449,13 @@ def inspect_vbios(path):
             f"raw={(raw_offset if raw_offset is not None else 'unknown')}")
   return data
 
-def _vbios_first_image(data, device=0x1184):
+def _vbios_first_image(data, device=None):
   """Return the clean PCI ROM image for a matching GK104 image in an NVGI dump."""
+  allowed = GK104_PCI_IDS if device is None else {device}
   for pcir in range(len(data)):
     if data[pcir:pcir + 4] != b"PCIR" or pcir + 0x12 > len(data): continue
     vendor, dev = struct.unpack_from("<HH", data, pcir + 4)
-    if vendor != 0x10de or dev != device: continue
+    if vendor != 0x10de or dev not in allowed: continue
     size = struct.unpack_from("<H", data, pcir + 0x10)[0] * 512
     base = data.rfind(b"\x55\xaa", max(0, pcir - 0x1000), pcir + 1)
     if base >= 0 and base + size <= len(data): return data[base:base + size]
@@ -5278,7 +5280,10 @@ METHOD_NAMES = {
 def nvm(subchannel, method, *args, typ=2):
   return [(typ << 28) | (len(args) << 16) | (subchannel << 13) | (method >> 2), *args]
 
-# NV906F_SEMAPHORED: OPERATION_RELEASE | RELEASE_WFI_DIS (bit20) = 0x00100002.  NOT 0x01000002 (RELEASE_SIZE_4BYTE, bit24) — that leaves WFI enabled, and SET_OBJECT/LAUNCH leaves PGRAPH sticky-busy so a WFI RELEASE never stores.
+# Normal one-IB compute completion matches the working GTX 770 path and waits
+# for GR. Host-only/staged signaling disables WFI because no engine work
+# precedes it, or because the host publishes the next IB after each signal.
+GK104_SEM_RELEASE_WFI = 0x00000002
 GK104_SEM_RELEASE_NO_WFI = 0x00100002
 
 def gk104_semaphore(addr, value, operation):
@@ -5309,7 +5314,10 @@ def _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=None, tic_v
   min_temp = mp_count * GK104_TEMP_PER_MP
   assert temp_size >= min_temp and temp_size % mp_count == 0, f"temp_size={temp_size:#x} mp_count={mp_count} min={min_temp:#x}"
   temp_per_mp = temp_size // mp_count
-  # TIC/TSC: Mesa always points these at a real VRAM heap even for pure global LD/ST kernels (TEX_CB_INDEX=7).  Leaving them 0 left SKED quiet but SMs never retired stores on this 660 Ti path.
+  # Optional Mesa-style texture descriptor state.  The CUDA add/mul cubins use
+  # only global memory and CB0, and the proven GTX 770 path intentionally omits
+  # these methods.  Keep support for controlled experiments, but do not make
+  # an unneeded TIC/TSC dependency part of the minimal launch stream.
   words = [*nvm(1, 0x0000, KEPLER_COMPUTE_A), *nvm(1, 0x0790, temp_va >> 32, temp_va & 0xffffffff), *nvm(1, 0x02e4, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), *nvm(1, 0x02f0, temp_per_mp >> 32, temp_per_mp & ~0x7fff, 0xff), *nvm(1, 0x077c, 0xff << 24), *nvm(1, 0x0214, 0xfe << 24), *nvm(1, 0x0310, 0x300)]
   if tic_va:
     tsc_va = tic_va + 0x10000  # Mesa: TSC follows 2048*32B TIC entries
@@ -5346,8 +5354,10 @@ def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
       if (i + 1) < n:
         done += 1
   if batch <= 0:
-    # RELEASE_WFI=DIS: SET_OBJECT leaves PGRAPH_STATUS sticky-busy on this 7-TPC GK104, so a WFI RELEASE never stores even after SERIALIZE.  Rely on NV50_GRAPH_SERIALIZE above for method retirement; verify compute by reading the GPU-written output, not by WFI alone.
-    words.extend([*gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI)])
+    # One-IB completion is an execution fence, not merely a PBDMA progress
+    # marker. Keep the channel resident until LAUNCH/GRAPH_SERIALIZE retires.
+    words.extend([*gk104_semaphore(
+        timeline_addr, done, GK104_SEM_RELEASE_WFI)])
   words.extend([*nvm(0, 0x0020, 0)])
   return words, done
 
@@ -5357,7 +5367,7 @@ def build_multi_launch_ibs(timeline_addr, done_value, launch_desc_addrs,
                            ib_max=None, mp_count=None, tic_va=0):
   """Split chunk launches across GPFIFO IBs of ≤ib_max LAUNCHes each.
 
-  First IB includes compute setup; every IB ends with its own WFI semaphore
+  First IB includes compute setup; every IB ends with its own no-WFI semaphore
   (done_value, done_value+1, ...).  Host must stage GP_PUT one entry at a
   time and wait between IBs — publishing all entries up front leaves the
   second IB hung after the first WFI.  Returns (ib_word_lists, final_done).
@@ -5493,7 +5503,8 @@ def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=0x200, re
   # Word 30 (0x78): CB_ADDR_UPPER(0) bits 7:0 + CB_SIZE(0) bits 31:15.
   field(960, 967, (cbuf_addr >> 32) & 0xff)
   field(975, 991, cbuf_size)
-  # Mesa always binds CB7 (driver aux) because TEX_CB_INDEX=7.  CB index i uses bits at +64*i from CB0's fields.
+  # Optional Mesa driver-aux CB.  This is a uniform/aux allocation, not the
+  # TIC/TSC descriptor heap.  CB index i uses bits at +64*i from CB0's fields.
   if cb7_addr:
     field(640 + 7, 640 + 7, 1)  # CONSTANT_BUFFER_VALID(7)
     field(928 + 7 * 64, 959 + 7 * 64, cb7_addr & 0xffffffff)
@@ -6963,7 +6974,48 @@ def kepler_selftest():
   stage_set(7, "validate channel, USERD, and GPFIFO encodings")
   words = build_launch_words(0xdeadbeef00001000, 3, 7, 0x2000, 0x3000)
   assert any(method == 0x02bc for _, _, _, method, _, _ in decode_words(words))
-  stage_done(f"{len(words)} launch words decode with compute LAUNCH")
+  fence_words, _ = build_multi_launch_words(
+      0xdeadbeef00001000, 7, [0x2000], code_va=0x3000, batch=0)
+  fence_args = [args for _, _, _, method, _, args in decode_words(fence_words)
+                if method == 0x0010]
+  assert len(fence_args) == 1 and fence_args[0][-1] == GK104_SEM_RELEASE_WFI, \
+      f"normal compute completion must enable WFI: {fence_args!r}"
+  # Exercise the optional full Mesa-style setup as well as the minimal live
+  # default: seven MPs, 0x20000 TEMP bytes per MP, real TIC/TSC bases, and a
+  # distinct auxiliary constant buffer in QMD slot 7.
+  _temp_va = 0x02345678000
+  _code_va = 0x03456789000
+  _tic_va = 0x04567890000
+  _mp7_words, _ = build_multi_launch_words(
+      0xdeadbeef00001000, 7, [0x2000], code_va=_code_va,
+      temp_va=_temp_va, temp_size=7 * GK104_TEMP_PER_MP,
+      mp_count=7, tic_va=_tic_va, batch=0)
+  _mp7_decoded = list(decode_words(_mp7_words))
+  _mp7_methods = [method for _, _, _, method, _, _ in _mp7_decoded]
+  assert _mp7_methods[:12] == [
+      0x0000, 0x0790, 0x02e4, 0x02f0, 0x077c, 0x0214,
+      0x0310, 0x1574, 0x155c, 0x2608, 0x1698, 0x1608,
+  ], f"unexpected GTX 660 Ti compute setup order: {_mp7_methods!r}"
+  _mp7_args = {method: args for _, _, _, method, _, args in _mp7_decoded}
+  assert _mp7_args[0x02e4] == [0, GK104_TEMP_PER_MP, 0xff]
+  assert _mp7_args[0x02f0] == [0, GK104_TEMP_PER_MP, 0xff]
+  assert _mp7_args[0x1574] == [
+      _tic_va >> 32, _tic_va & 0xffffffff, 2047]
+  _tsc_va = _tic_va + 0x10000
+  assert _mp7_args[0x155c] == [
+      _tsc_va >> 32, _tsc_va & 0xffffffff, 2047]
+
+  _cb7_va = 0x056789a0000
+  _qmd = int.from_bytes(build_cwd(
+      0, (1, 1, 1), (256, 1, 1), cbuf_addr=0x10000,
+      cb7_addr=_cb7_va, cb7_size=0x800), "little")
+  _qmd_bits = lambda lo, hi: (_qmd >> lo) & ((1 << (hi - lo + 1)) - 1)
+  assert _qmd_bits(640, 647) == 0x81, "QMD must enable CB0 and CB7"
+  assert _qmd_bits(1376, 1407) == (_cb7_va & 0xffffffff)
+  assert _qmd_bits(1408, 1415) == ((_cb7_va >> 32) & 0xff)
+  assert _qmd_bits(1423, 1439) == 0x800
+  stage_done(f"{len(words)} baseline/{len(_mp7_words)} texture-aux launch words "
+             "decode with compute LAUNCH")
   stage_set(8, f"validate checked-in sm_30 {operation} workload")
   cubin_path = DEFAULT_MUL_CUBIN if operation == "mul" else DEFAULT_CUBIN
   cubin = pathlib.Path(cubin_path).read_bytes()
@@ -6989,18 +7041,15 @@ def run_software_demo(dev):
   """End-to-end data path on the software VRAM stand-in (no real Kepler SASS
   executes — the add is performed host-side to validate alloc/map/copy/CWD)."""
   import random
+  operation = os.environ.get("KEPLER_OPERATION", "add")
   N = 256
+  stage_set(6, "construct offline golden-context and allocator model")
   cubin = build_cubin()
   prog = dev.runtime("E_4", cubin)
   allocator = NVAllocator(dev)
 
-  if _hosts is not None:
-    a_host, b_host = _hosts
-    if len(a_host) != N or len(b_host) != N:
-      raise ValueError(f"_hosts length {len(a_host)}/{len(b_host)} != KEPLER_N={N}")
-  else:
-    a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
-    b_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
+  a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
+  b_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
   if os.environ.get("KEPLER_PRINT_IO", "0") != "0":
     _show = min(N, 16)
     print(f"[kepler] inputs a[0:{_show}]={[round(a_host[i], 4) for i in range(_show)]}",
@@ -7031,28 +7080,39 @@ def run_software_demo(dev):
                   regs=cubin_register_count(cubin, "E_4"))
   cwd_dev = allocator.alloc(len(cwd))
   allocator._copyin(cwd_dev, cwd)
+  stage_done("offline GR context, code, constants, and CWD allocated")
+  stage_set(7, "construct offline channel and GPFIFO methods")
   words = build_launch_words(0x1000, 1, 2, cwd_dev.va_addr, code_dev.va_addr)
   decoded = list(decode_words(words))
   assert any(m == 0x02bc for _, _, _, m, _, _ in decoded), "launch words must include KEPLER_COMPUTE_LAUNCH"
+  stage_done(f"{len(words)}-word channel launch stream ready")
+  stage_set(8, f"stage {operation} workload and CWD")
+  stage_done(f"N={N}, operation={operation}, CWD={len(cwd)} bytes")
 
-  # Simulate the kernel: out = a + b, reading/writing the mapped VRAM buffers.
+  # Simulate the kernel, reading/writing the mapped VRAM buffers.
+  stage_set(9, "simulate GPFIFO submit and compute completion")
   a_mv = a_dev.cpu_view()
   b_mv = b_dev.cpu_view()
   out_mv = out_dev.cpu_view()
   for i in range(N):
     av = struct.unpack_from("<f", a_mv, i * 4)[0]
     bv = struct.unpack_from("<f", b_mv, i * 4)[0]
-    struct.pack_into("<f", out_mv, i * 4, av + bv)
+    struct.pack_into("<f", out_mv, i * 4,
+                     av * bv if operation == "mul" else av + bv)
+  stage_done("software GP_GET reached GP_PUT")
 
+  stage_set(10, f"read and validate {N} {operation} results")
   out_host = bytearray(N * 4)
   allocator._copyout(out_host, out_dev)
   out_arr = array.array('f'); out_arr.frombytes(bytes(out_host))
 
-  operation = os.environ.get("KEPLER_OPERATION", "add")
   expected = ([a_host[i] * b_host[i] for i in range(N)] if operation == "mul"
               else [a_host[i] + b_host[i] for i in range(N)])
-  assert all(abs(out_arr[i] - expected[i]) < 1e-5 for i in range(N)), "software add mismatch"
-  print(f"software_demo=ok N={N} launch_words={len(words)} cwd_bytes={len(cwd)}")
+  assert all(abs(out_arr[i] - expected[i]) < 1e-5 for i in range(N)), \
+      f"software {operation} mismatch"
+  stage_done(f"{operation} matched {N}/{N}")
+  print(f"software_demo=ok N={N} operation={operation} "
+        f"launch_words={len(words)} cwd_bytes={len(cwd)}")
 
 # ----------------------------------------------------------------------------
 # Live GK104 submit (plan milestones 5-12).  GK104 FIFO registers confirmed from
@@ -10083,17 +10143,21 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
   # Nouveau keeps instmem on BAR2/PRAMIN, not BAR1-into-BAR1.  Atomic/HOST
   # bootstrap paths may set the flag only after their control-walk proof.
   #
-  # Mark classic-posted so channel-build FAST_ZERO/ctx-copy can use BAR1 page
-  # bulk instead of per-dword PRAMIN (~4.5M TinyGPU RPCs / ~35s otherwise).
-  # Warm reopen never re-runs post-POST BAR1, so this flag must be set here.
+  if not hasattr(dev, "ops"):
+    _gk104_bar1_verify_top(dev, mapped_size)
+  # Mark classic-posted only after the live aperture proof succeeds.  The
+  # cold 660 Ti tries this once immediately after BIT-I POST, before PMC/PFB
+  # bring-up; that attempt can build readable PRAMIN roots while BAR1 itself
+  # still returns a ``bad0ac`` walk sentinel.  Marking it ready before the
+  # proof made channel-build skip the required post-RAM rebuild and guaranteed
+  # a dead framebuffer aperture.  Warm reopen still retains this flag after a
+  # genuinely successful proof, enabling FAST_ZERO/ctx-copy bulk transfers.
   try:
     setattr(dev, "_bar1_classic_posted", True)
     setattr(dev, "_bar1_identity_size", mapped_size)
     setattr(dev, "_bar1_identity_userd", userd_alias_pa)
   except Exception:
     pass
-  if not hasattr(dev, "ops"):
-    _gk104_bar1_verify_top(dev, mapped_size)
   if DEBUG:
     print(f"[kepler] BAR1 identity enabled inst={inst_pa:#x} pgd={pgd_pa:#x} "
           f"spt={spt_pa:#x} size={mapped_size:#x} "
@@ -10460,7 +10524,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         f"attrib={attrib_cb.va_addr:#x}+{attrib_cb.size:#x} "
         f"mmio={mmio_list.va_addr:#x}+{mmio_list.size:#x}", flush=True)
   _bo, _ao = 0, _attrib_nr_max * sum(_tpc_nr)
-  # PPC+0xc0/0xe4 entries stay (Nouveau-shaped); LTC patch_ltc entries (0x17e91c/0x17e920) are omitted — they stuck FECS_MMIO_CTRL on WRITE.
+  # Match Nouveau and the live-proven GTX 770 context image.  The LTC
+  # patch entries belong after the per-PPC entries; FECS stopping on the last
+  # entry only identifies the final MMIO operation, not an invalid entry.
   for _gpc, _mask in enumerate(_ppc_masks):
     _count = _mask.bit_count()
     _ppc = 0x503000 + _gpc * 0x8000
@@ -10470,6 +10536,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     runtime_mmio_entries.append((_ppc + 0xe4, _e4))
     _bo += _attrib_nr_max * _count
     _ao += _alpha_nr_max * _count
+  runtime_mmio_entries.extend(((0x17e91c, dev.read32(0x17e91c)),
+                               (0x17e920, dev.read32(0x17e920))))
   mmio_blob = b"".join(struct.pack("<II", reg, value & 0xffffffff)
                        for reg, value in runtime_mmio_entries)
   vram[mmio_list.meta["pa"]:mmio_list.meta["pa"] + max(len(mmio_blob), 8)] = (mmio_blob + bytes(max(0, 8 - len(mmio_blob))))
@@ -11009,8 +11077,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     # else instead of adding a broad identity/aperture mapping.  temp_dev also
     # lives at 0x100000; mirrors must win over this guard in live_pte_map.
     fault_guard_pte_addr = cloned_by_pgd[0] + 0x100 * 8
-    # priv=1: SET_OBJECT firmware/GPC walk matches eng-ctx mapping style.
-    fault_guard_pte_wanted = (_alias_cursor >> 8) | 3
+    # Use the same writable, non-privileged leaf encoding as the proven GTX
+    # 770 path.  The earlier 660-only PRIV bit was not required by Nouveau.
+    fault_guard_pte_wanted = (_alias_cursor >> 8) | 1
     ctx_alias_ptes.append(
         (fault_guard_pte_addr, fault_guard_pte_wanted))
     _alias_cursor += 0x1000
@@ -13534,15 +13603,20 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"actual={_guard_after_vmm:#x}", flush=True)
     print(f"[kepler] runtime context armed: CHAN_ADDR={dev.read32(0x409b00):#x} "
           f"CHAN_NEXT={dev.read32(0x409b04):#x}", flush=True)
-    # L2 warming: read every read-only compute mirror before GP_PUT so SMs hit correct L2 lines.  Without this, N>1024 scattered ~14% of lanes with stale L2 data.  Skip write-only/scratch mirrors (out=2, temp=3, txc=4) — SMs don't read them as data.
+    # L2 warming: read every read-only compute mirror before GP_PUT so SMs hit
+    # correct L2 lines.  Select write-only/scratch buffers by metadata: mirror
+    # ordering changes when optional TIC/TSC state is disabled, so positional
+    # indices can accidentally skip the kernel code.
     _all_mirrors = getattr(dev, "_kepler_vram_mirrors", ()) or ()
-    _skip_indices = {2, 3, 4}
+    _skip_final_ltc_inv = os.environ.get("KEPLER_SKIP_FINAL_LTC_INV", "0") == "1"
+    if _skip_final_ltc_inv:
+      print("[kepler] pre-GP_PUT LTC invalidate skipped after L2 warming", flush=True)
     if use_vram_inst:
-      for _mi, _m in enumerate(_all_mirrors):
+      for _m in _all_mirrors:
         _mpa = _m.meta.get("vram_pa")
         if _mpa is None or _m.size > 0x100000:
           continue
-        if _mi in _skip_indices:
+        if not _m.meta.get("l2_warm", True):
           continue
         try:
           _want = bytes(_m.cpu_view()[:_m.size])
@@ -13602,7 +13676,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         if os.environ.get("KEPLER_SUBMIT_FE_PWR", "1") != "0":
           _gk104_fe_pwr_force_on(dev)
         # Final L2 invalidate (drop, no writeback) right before GP_PUT so SMs load fresh VRAM, not stale L2 lines re-cached by PTE/RAMFC BAR1 traffic.
-        if not _gk104_ltc_invalidate(dev, flush=False):
+        if (not _skip_final_ltc_inv and
+            not _gk104_ltc_invalidate(dev, flush=False)):
           print("[kepler] WARN: pre-GP_PUT LTC invalidate timed out", flush=True)
         dev.dev_impl.hw.mmio_write(
             1, _userd_mmio_base + USERD_GP_PUT, struct.pack("<I", _gp_put_initial))
@@ -13629,7 +13704,8 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"get={_get_phys:#x}/{_get_bar:#x} "
             f"put={_put_phys:#x}/{_put_bar:#x}")
     else:
-      if not _gk104_ltc_invalidate(dev, flush=False):
+      if (not _skip_final_ltc_inv and
+          not _gk104_ltc_invalidate(dev, flush=False)):
         print("[kepler] WARN: pre-GP_PUT LTC invalidate timed out", flush=True)
       dev.dev_impl.hw.mmio_write(1, _userd_mmio_base + USERD_GP_PUT,
                                  struct.pack("<I", _gp_put_initial))
@@ -13846,6 +13922,39 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
         val = _gk104_pramin_read32(dev, signal_vram_pa)
       else:
         val = struct.unpack_from("<I", vram, signal_pa)[0]
+      # Inspect launch faults before accepting the semaphore.  The semaphore
+      # method follows the launch in the same IB, so PGRAPH can reject the
+      # launch and still retire the semaphore before the host's first poll.
+      # Checking val first masked that failure as S9=OK plus untouched output.
+      if not _gp_get_snapshot_taken and dev.dev_impl.hw is not None:
+        _launch_fault = None
+        try:
+          _gp_get_now = struct.unpack("<I", dev.dev_impl.hw.mmio_read(
+              1, _userd_mmio_base + USERD_GP_GET, 4))[0]
+          _intr = dev.read32(0x400100)
+          _trap = dev.read32(0x400108)
+          _gpc_trap = dev.read32(0x400118)
+          _sked_status = dev.read32(0x407020) & 0x3fffffff
+          # A SKED trap means the compute launch did not retire.  Acknowledging
+          # it here lets the following WFI semaphore execute and falsely turns
+          # the launch into S9=OK with an untouched NaN output buffer.  Keep the
+          # first fault intact and fail with the pre-acknowledge register state.
+          _empty_sked_trap = bool(
+              (_intr & 0x00200000) and _trap == 0x00000100 and
+              _gpc_trap == 0 and _sked_status == 0)
+          _any_sked = bool(_sked_status) or bool(_trap & 0x100)
+          if _any_sked:
+            _launch_fault = (
+                f"SKED launch fault before acknowledge: "
+                f"INTR={_intr:#010x} TRAP={_trap:#010x} "
+                f"SKED={_sked_status:#010x} GPC={_gpc_trap:#010x} "
+                f"GP_GET={_gp_get_now} empty={int(_empty_sked_trap)}")
+            _gp_get_snapshot_taken = True
+        except Exception:
+          pass
+        if _launch_fault is not None:
+          print(f"[kepler-trap] {_launch_fault}", flush=True)
+          raise RuntimeError(_launch_fault)
       if val == _target:
         if _target == done_value:
           _kernel_ms = (time.perf_counter() - _kernel_t0) * 1000.0
@@ -13857,26 +13966,6 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           stage_done(f"completion semaphore={done_value}; {n_gp_entries} IBs retired")
           return
         break
-      if not _gp_get_snapshot_taken and dev.dev_impl.hw is not None:
-        try:
-          _gp_get_now = struct.unpack("<I", dev.dev_impl.hw.mmio_read(
-              1, _userd_mmio_base + USERD_GP_GET, 4))[0]
-          _intr = dev.read32(0x400100)
-          _trap = dev.read32(0x400108)
-          _gpc_trap = dev.read32(0x400118)
-          _sked_status = dev.read32(0x407020) & 0x3fffffff
-          # Service SKED even when GP_GET is still 0 — on 7-TPC boards the entry can trap before USERD advances, and waiting for GET leaves the channel wedged forever.
-          _empty_sked_trap = bool((_intr & 0x00200000) and _trap == 0x00000100 and _gpc_trap == 0 and _sked_status == 0)
-          _any_sked = bool(_sked_status) or bool(_trap & 0x100)
-          if _empty_sked_trap or (_any_sked and not _gp_get_snapshot_taken):
-            if _empty_sked_trap:
-              dev.write32(0x400108, 0x00000100)
-              dev.write32(0x400100, 0x00200000)
-              dev.write32(0x400500, 0x00010001)
-              print(f"[kepler-trap] serviced empty SKED: INTR={dev.read32(0x400100):#x} TRAP={dev.read32(0x400108):#x} GP_GET={_gp_get_now}", flush=True)
-            _gp_get_snapshot_taken = True
-        except Exception:
-          pass
       time.sleep(0.001)
     else:
       done_value = _target
@@ -13885,6 +13974,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     return
   if use_vram_inst:
     _timeout_fault_source = dev.read32(0x259c)
+    _timeout_pgraph = (
+        dev.read32(0x400100), dev.read32(0x400108),
+        dev.read32(0x400118), dev.read32(0x407020) & 0x3fffffff)
     _timeout_faults = []
     for _unit in range(8):
       if _timeout_fault_source & (1 << _unit):
@@ -13913,6 +14005,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           f"ENG={dev.read32(0x400a4):#x} PFIFO={dev.read32(0x2100):#x} "
           f"FAULTS={_timeout_fault_source:#x} "
           f"FAULT_RECORDS={[(u, hex(i), hex(lo), hex(hi), hex(t)) for u, i, lo, hi, t in _timeout_faults]} "
+          f"PGRAPH={tuple(hex(x) for x in _timeout_pgraph)} "
           f"PTE[0x100000]={_fault_va_pte:#x} "
           f"GR_BUFS={dev.read32(0x40800c):#x}/"
           f"{dev.read32(0x408004):#x}/"
@@ -13926,14 +14019,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
     import os as _os
     _n = int(_os.environ.get("KEPLER_N", "0") or "0")
     if _n > 0 and use_vram_inst and dev.dev_impl.hw is not None:
-      _out_pa = None
-      for _m in (getattr(dev, "_kepler_vram_mirrors", None) or []):
-        if getattr(_m, "size", 0) == _n * 4 and getattr(_m, "va_addr", 0) == 0x50000:
-          _out_pa = _m.meta.get("vram_pa") or _m.meta.get("pa")
-          break
+      _out_mirror = getattr(dev, "_kepler_output_mirror", None)
+      _out_pa = (None if _out_mirror is None else
+                 (_out_mirror.meta.get("vram_pa") or
+                  _out_mirror.meta.get("pa")))
       if _out_pa is None:
-        # Fall back to the classic out mirror PA from recent brings-up.
-        _out_pa = 0xb38000
+        raise RuntimeError("output mirror has no physical address")
       _chunk = 1024
       _words = []
       for _off in (0, 16 * _chunk, 19 * _chunk, _n - 1):
@@ -14287,29 +14378,35 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   _mp_count = _gk104_mp_count_for(dev)
   _temp_size = _mp_count * GK104_TEMP_PER_MP
   print(f"[kepler] compute TLS: mp_count={_mp_count} temp_size={_temp_size:#x}", flush=True)
-  # SET_OBJECT's firmware probe reads channel VA 0x100000; if TLS covers that leaf, live_pte_map fights the guard PTE and pre-GP_PUT restore punches a hole in TLS (GPC1+GPC2 stick busy, NaN output).  Keep allocating until VA is past 0x200000.
-  _tls_pads = []
-  _probe_lo, _probe_hi = 0x100000, 0x101000
-  _tls_floor = 0x200000
-  while True:
-    temp_dev = allocator.alloc(_temp_size, align=0x10000)
-    _t0, _t1 = temp_dev.va_addr, temp_dev.va_addr + temp_dev.size
-    _covers_probe = _t0 < _probe_hi and _t1 > _probe_lo
-    if not _covers_probe and _t0 >= _tls_floor:
-      break
-    _tls_pads.append(temp_dev)
-    if len(_tls_pads) > 32:
-      raise RuntimeError(f"failed to place TLS past SET_OBJECT probe: last={_t0:#x}+{_temp_size:#x} pads={len(_tls_pads)}")
-  print(f"[kepler] TLS va={temp_dev.va_addr:#x} (discarded {len(_tls_pads)} overlapping/low TLS allocs)", flush=True)
-  # Mesa txc heap (128 KiB) must not land in the GR scratch hole (pagepool @0x20000, bundle @0x28000) — low allocs stomp those PTEs when mirrors are applied.
-  _txc_spacers = []
-  while True:
-    txc_dev = allocator.alloc(0x20000, align=0x10000)
-    if txc_dev.va_addr >= 0x100000:
-      break
-    _txc_spacers.append(txc_dev)
-  allocator._copyin(txc_dev, bytes(0x20000))
-  print(f"[kepler] TIC/TSC heap va={txc_dev.va_addr:#x} (skipped {len(_txc_spacers)} low hole allocs)", flush=True)
+  # Preserve the proven GTX 770 VA layout: TLS starts at 0x100000 while the
+  # allocator can place code/CW directives in the low hole.  This cubin has no
+  # spills, so the firmware guard temporarily sharing TLS's first leaf is safe.
+  temp_dev = allocator.alloc(_temp_size, align=0x10000)
+  print(f"[kepler] TLS va={temp_dev.va_addr:#x}", flush=True)
+  # The checked-in CUDA cubins use no textures and reference only CB0.  Match
+  # the live-proven GTX 770 stream by default.  Mesa's full setup remains an
+  # opt-in diagnostic, with its texture descriptors and CB7 aux data kept in
+  # separate allocations (the old 660 path incorrectly aliased both).
+  _mesa_tex_aux = os.environ.get("KEPLER_MESA_TEX_AUX", "0") == "1"
+  txc_dev = aux_dev = None
+  if _mesa_tex_aux:
+    # The 128-KiB TIC/TSC heap must not land in the GR scratch hole (pagepool
+    # @0x20000, bundle @0x28000); low mirrors would overwrite those PTEs.
+    _txc_spacers = []
+    while True:
+      txc_dev = allocator.alloc(0x20000, align=0x10000)
+      if txc_dev.va_addr >= 0x100000:
+        break
+      _txc_spacers.append(txc_dev)
+    allocator._copyin(txc_dev, bytes(0x20000))
+    aux_dev = allocator.alloc(0x800, align=0x100)
+    allocator._copyin(aux_dev, bytes(0x800))
+    print(f"[kepler] TIC/TSC heap va={txc_dev.va_addr:#x}; "
+          f"CB7 aux va={aux_dev.va_addr:#x} "
+          f"(skipped {len(_txc_spacers)} low hole allocs)", flush=True)
+  else:
+    print("[kepler] TIC/TSC+CB7 disabled (minimal GTX 770-compatible stream)",
+          flush=True)
   # Code + constant (param) buffers for the launch descriptor.
   sass = elf_section_bytes(cubin, ".text.E_4")
   code_dev = allocator.alloc(round_up(len(sass), 0x100))
@@ -14323,7 +14420,11 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
         grid=(n_chunks, 1, 1), block=(chunk, 1, 1))
     cbuf_dev = allocator.alloc(len(cbuf))
     allocator._copyin(cbuf_dev, cbuf)
-    cwd = build_cwd(code_addr=0, grid=(n_chunks, 1, 1), block=(chunk, 1, 1), cbuf_addr=cbuf_dev.va_addr, regs=regs, cb7_addr=txc_dev.va_addr, cb7_size=0x800)
+    cwd = build_cwd(
+        code_addr=0, grid=(n_chunks, 1, 1), block=(chunk, 1, 1),
+        cbuf_addr=cbuf_dev.va_addr, regs=regs,
+        cb7_addr=aux_dev.va_addr if aux_dev is not None else 0,
+        cb7_size=0x800)
     cwd_dev = allocator.alloc(len(cwd))
     allocator._copyin(cwd_dev, cwd)
     cbuf_devs.append(cbuf_dev)
@@ -14337,7 +14438,11 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
           grid=(1, 1, 1), block=(n, 1, 1))
       cbuf_dev = allocator.alloc(len(cbuf))
       allocator._copyin(cbuf_dev, cbuf)
-      cwd = build_cwd(code_addr=0, grid=(1, 1, 1), block=(n, 1, 1), cbuf_addr=cbuf_dev.va_addr, regs=regs, cb7_addr=txc_dev.va_addr, cb7_size=0x800)
+      cwd = build_cwd(
+          code_addr=0, grid=(1, 1, 1), block=(n, 1, 1),
+          cbuf_addr=cbuf_dev.va_addr, regs=regs,
+          cb7_addr=aux_dev.va_addr if aux_dev is not None else 0,
+          cb7_size=0x800)
       cwd_dev = allocator.alloc(len(cwd))
       allocator._copyin(cwd_dev, cwd)
       cbuf_devs.append(cbuf_dev)
@@ -14349,8 +14454,18 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
   # the SYS aperture even though HUB/PBDMA semaphore traffic does.  Put the
   # complete compute working set behind the already-validated VRAM VMM.  The
   # output mirror is read back after WFI; no host arithmetic is involved.
-  dev._kepler_vram_mirrors = ([] if sem_only else
-      [a_dev, b_dev, out_dev, temp_dev, txc_dev, code_dev, *cbuf_devs, *cwd_devs])
+  _compute_mirrors = [a_dev, b_dev, out_dev, temp_dev]
+  if txc_dev is not None:
+    _compute_mirrors.append(txc_dev)
+  if aux_dev is not None:
+    _compute_mirrors.append(aux_dev)
+  _compute_mirrors.extend([code_dev, *cbuf_devs, *cwd_devs])
+  # These are GPU write-only/scratch for this launch.  Everything else,
+  # including code and constant/CWD data, must be warmed before GP_PUT.
+  out_dev.meta["l2_warm"] = False
+  temp_dev.meta["l2_warm"] = False
+  dev._kepler_vram_mirrors = [] if sem_only else _compute_mirrors
+  dev._kepler_output_mirror = out_dev
   allocator._copyin(a_dev, a_host.tobytes())
   allocator._copyin(b_dev, b_host.tobytes())
   # A GPU result must overwrite every lane; untouched VRAM stays non-finite.
@@ -14369,7 +14484,10 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
       raise ValueError(
           f"internal: {len(cwd_addrs)} CWDs exceeds one-channel ceiling "
           f"{_one_ib_max}")
-    words, launch_done = build_multi_launch_words(signal.va_addr, 2, cwd_addrs, code_dev.va_addr, temp_dev.va_addr, _temp_size, mp_count=_mp_count, tic_va=txc_dev.va_addr)
+    words, launch_done = build_multi_launch_words(
+        signal.va_addr, 2, cwd_addrs, code_dev.va_addr,
+        temp_dev.va_addr, _temp_size, mp_count=_mp_count,
+        tic_va=txc_dev.va_addr if txc_dev is not None else 0)
     launch_batches = [(words, launch_done)]
   # Verify compute buffers are mapped in the channel's VMM
   if dev.dev_impl.hw is not None:
@@ -14397,17 +14515,38 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
           f"RED_SWITCH={dev.read32(0x409614):#x} "
           f"PGRAPH_STATUS={_pgraph_status_pre:#x} "
           f"FECS_CTRL={dev.read32(0x409100):#x}", flush=True)
-    # H2 guard: SET_OBJECT hang clears GPC1/2 TPC_NR (c08→0) with sticky GPC_STATUS=0x6; re-arm from silicon 0x2608 right before the push.  Disable with KEPLER_PRE_LAUNCH_FLOORSWEEP=0.
-    if os.environ.get("KEPLER_PRE_LAUNCH_FLOORSWEEP", "1") != "0":
-      _gpc_nr = dev.read32(0x409604) & 0x1f
-      _fuse_tpc = _gk104_read_tpc_nr(dev, _gpc_nr)
+    # The complete floorsweep stream belongs to GR initialization, before the
+    # golden/runtime context is saved and attached.  Replaying it here was an
+    # H2 recovery experiment added by the unverified 660 Ti WIP; it is absent
+    # from the working GTX 770 path and overwrites live topology state just
+    # before SET_OBJECT.  Preserve the pre-launch state by default so the first
+    # launch fault remains diagnostic.  Dirty-state experiments may explicitly
+    # opt in with KEPLER_PRE_LAUNCH_FLOORSWEEP=1.
+    _gpc_nr = dev.read32(0x409604) & 0x1f
+    _fuse_tpc = _gk104_read_tpc_nr(dev, _gpc_nr)
+    _pre_c08 = [dev.read32(0x500c08 + g * 0x8000)
+                for g in range(_gpc_nr)]
+    _pre_405b00 = dev.read32(0x405b00)
+    _topology_expected = (sum(_fuse_tpc) << 8) | _gpc_nr
+    _topology_match = (
+        _pre_c08 == _fuse_tpc and _pre_405b00 == _topology_expected)
+    _replay_floorsweep = (
+        os.environ.get("KEPLER_PRE_LAUNCH_FLOORSWEEP", "0") == "1")
+    print(f"[kepler] pre-launch topology: fuse_tpc={_fuse_tpc} "
+          f"c08={[hex(x) for x in _pre_c08]} "
+          f"405b00={_pre_405b00:#x}/{_topology_expected:#x} "
+          f"match={_topology_match} replay={_replay_floorsweep}",
+          flush=True)
+    if _replay_floorsweep:
       _ppc_masks = [((1 << _fuse_tpc[g]) - 1) if _fuse_tpc[g] else 0 for g in range(_gpc_nr)]
       # Prefer live PPC mask when silicon reports one.
       _ppc_masks = [(dev.read32(0x500c30 + g * 0x8000) & 0xff) or _ppc_masks[g] for g in range(_gpc_nr)]
       _gk104_grctx_floorsweep(dev, _fuse_tpc, _ppc_masks)
       print(f"[kepler] pre-launch floorsweep re-armed: tpc={_fuse_tpc} ppc={[hex(m) for m in _ppc_masks]}", flush=True)
-    _pre_c08 = [dev.read32(0x500c08 + g * 0x8000) for g in range(4)]
-    print(f"[kepler] pre-launch GPC TPC_NR: c08={[hex(x) for x in _pre_c08]} 405b00={dev.read32(0x405b00):#x} GPC_STATUS={dev.read32(0x400604):#x}", flush=True)
+    print(f"[kepler] pre-launch GR state: "
+          f"c08={[hex(dev.read32(0x500c08 + g * 0x8000)) for g in range(_gpc_nr)]} "
+          f"405b00={dev.read32(0x405b00):#x} "
+          f"GPC_STATUS={dev.read32(0x400604):#x}", flush=True)
   if DEBUG:
     pgd_idx = (signal.va_addr >> 27) & 0x1fff
     spt_idx = (signal.va_addr >> 12) & 0x7fff
@@ -14444,13 +14583,6 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     print(f"hardware_{test_stage}=ok value=2")
     _freeze_stop_and_hold(dev, f"{test_stage}-complete")
     return
-
-  # Read-only failure triage must run before the final output read freezes the
-  # direct-USB transport.  Unlike the legacy unsafe diagnostic below, this
-  # snapshot does not acknowledge traps or write any GR register.
-  if (dev.dev_impl.hw is not None and
-      os.environ.get("KEPLER_POSTLAUNCH_READONLY_DIAGNOSTICS") == "1"):
-    snapshot_gr_traps(dev, "after_launch_readonly")
 
   # Deep trap/status capture changes live GR state and emits hundreds of RPCs.
   # Keep it available only as an explicit unsafe diagnostic; a normal add run
@@ -14583,7 +14715,8 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     dev.dev_impl.hw.freeze("missing-output-vram-mapping")
     raise RuntimeError("full-add output has no VRAM BAR1 mapping")
   if dev.dev_impl.hw is not None:
-    # Host RELEASE is WFI=DIS (sticky PGRAPH busy after SET_OBJECT).  Poll VRAM output until the NaN sentinel clears or settle budget expires, so we don't declare failure while SMs are still in flight.
+    # Normal one-IB RELEASE waits for GR.  Retain a short bounded sentinel check
+    # for output visibility before copying the complete result buffer.
     _out_pa = out_dev.meta["vram_pa"]
     _sent = struct.pack("<I", 0x7fc00001) * min(N, 8)
     _t0 = time.perf_counter()
@@ -14605,7 +14738,9 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
         break
       time.sleep(0.001)
     print(f"[kepler] output settle: waited_ms={(time.perf_counter()-_t0)*1000:.1f} head={_chunk[:16].hex()} via={_mirror_mode}", flush=True)
-    # LAUNCH is followed by GRAPH_SERIALIZE; final host RELEASE is WFI=DIS.  Prefer PRAMIN for the output blob when mirrors used PRAMIN; BAR1 path keeps TinyGPU's arm_final_output_read one-shot.
+    # LAUNCH is followed by GRAPH_SERIALIZE and a WFI-enabled host RELEASE.
+    # Prefer PRAMIN for the output blob when mirrors used PRAMIN; BAR1 keeps
+    # TinyGPU's arm_final_output_read one-shot.
     _out_n = len(out_host)
     _use_pramin_out = (_mirror_mode == "pramin-all" or (_mirror_mode == "pramin" and _out_n <= int(os.environ.get("KEPLER_MIRROR_PRAMIN_MAX", "0x10000"), 0)))
     if _use_pramin_out:
@@ -15208,7 +15343,9 @@ def main():
     if "--probe-nouveau-init-io" in sys.argv:
       _probe_nouveau_init_io(); return
   # Offline goldens pin Palit strap-6; live 660 Ti reads 0x101000=0x80405096 → RAMCFG group 5.  Pinning strap 6 on live trains wrong M0205/M0209 tables → GP_PUT-consumed / semaphore-never-done timeouts (same signature as wrong mp_count TEMP).
-  _offline = ("--middle-selftest" in sys.argv or "--mmiotrace-selftest" in sys.argv)
+  _offline_selftest = any(
+      flag in sys.argv for flag in ("--offline-selftest", "--middle-selftest"))
+  _offline = (_offline_selftest or "--mmiotrace-selftest" in sys.argv)
   if _offline:
     os.environ["KEPLER_RAMCFG_STRAP"] = "6"
   else:
@@ -15220,7 +15357,7 @@ def main():
   os.environ.setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")
   os.environ.setdefault("KEPLER_RAM_BLOCK", "0")
   os.environ.setdefault("KEPLER_RAM_MEMX_WR", "1")
-  if "--middle-selftest" in sys.argv:
+  if _offline_selftest:
     # Offline fake register buses intentionally have no PMU Falcon.  Keep the
     # live default strict, but allow the documented selftest command to use
     # the host-write golden model (same policy as the macOS wrapper).
@@ -15280,7 +15417,7 @@ def main():
   }
   backend = os.environ.get("NV_BACKEND", "kepler")
   offline = any(x in sys.argv for x in (
-      "--middle-selftest", "--mmiotrace-selftest",
+      "--offline-selftest", "--middle-selftest", "--mmiotrace-selftest",
       "--vbios-info", "--vbios-init-info", "--compare-cubin"))
   if OSX and not offline:
     # Proven TinyGPU classic BAR1 + literal PRAMIN path (Night41ay/bc).
@@ -15332,8 +15469,8 @@ def main():
         os.makedirs(os.path.dirname(os.path.abspath(
             os.environ["KEPLER_RPC_TRACE"])) or ".", exist_ok=True)
         _ensure_tinygpu_server()
-  needs_hardware = backend != "software" and (bool(live_probe_flags.intersection(sys.argv)) or
-                                                "--middle-selftest" not in sys.argv)
+  needs_hardware = backend != "software" and (
+      bool(live_probe_flags.intersection(sys.argv)) or not _offline_selftest)
   if (needs_hardware and os.environ.get("KEPLER_NO_AUTO_SUDO") != "1" and
       hasattr(os, "geteuid") and os.geteuid() != 0):
     # Raw sysfs BAR mmap normally requires root.  Re-exec the exact interpreter
@@ -15524,11 +15661,15 @@ def main():
   run_err = None
   dev = None
 
-  def _emit_quiet_diagnostics(prefix="[kepler]", also=("hardware_demo=", "[nvbios]", "[kepler-trap]")):
+  def _emit_quiet_diagnostics(
+      prefixes=("[kepler]", "[kepler-trap]", "[transport]", "[pcie]",
+                "[phase]", "[hw]", "[mem]", "[wait]", "[reg]", "[S"),
+      also=("hardware_demo=", "[nvbios]")):
     if quiet_buf is None:
       return
     for line in quiet_buf.getvalue().splitlines():
-      if line.startswith(prefix) or any(line.startswith(a) for a in also):
+      visible = line.lstrip()
+      if visible.startswith(prefixes) or any(visible.startswith(a) for a in also):
         print(line, flush=True)
 
   def _one_live_pass():

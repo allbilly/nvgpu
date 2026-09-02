@@ -12,7 +12,7 @@ Kepler has no GSP; only S5 is skipped for that reason.
 # Offline, no GPU access
 python3 -S examples_kepler/add_770.py --offline-selftest
 python3 -S examples_kepler/add_770.py --trace-selftest
-python3 -S examples_kepler/add_660ti.py --middle-selftest
+python3 -S examples_kepler/add_660ti.py --offline-selftest
 python3 -S examples_kepler/add_660ti.py --trace-selftest
 NV_BACKEND=software python3 -S examples_kepler/add_770.py add
 NV_BACKEND=software python3 -S examples_kepler/add_770.py mul
@@ -30,8 +30,8 @@ KEPLER_IFACE=USB python3 examples_kepler/add_660ti.py
 KEPLER_IFACE=SOCKET python3 examples_kepler/add_660ti.py mul
 ```
 
-`--middle-selftest` remains an alias for `--offline-selftest` in the GTX 770
-entry point. Multiplication is selected by passing `mul` to either board entry
+`--middle-selftest` remains an alias for `--offline-selftest` in both Kepler
+entry points. Multiplication is selected by passing `mul` to either board entry
 point, matching the EN210 interface.
 
 The GTX 770 macOS path prefers direct Chestnut USB3 and falls back to
