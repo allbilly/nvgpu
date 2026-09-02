@@ -1,4 +1,4 @@
-# Auto-generated from gk104.c / gf100.c / gf108.c / gf117.c / gf119.c
+# Runtime table auto-generated from gk104.c / gf100.c / gf108.c / gf117.c / gf119.c
 # Flattened gk104_gr_pack_mmio with later writes overriding earlier ones.
 GK104_PGRAPH_PACK_MMIO = [
   (0x400080, 0x003083c2),

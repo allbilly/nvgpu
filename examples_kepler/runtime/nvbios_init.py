@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal but complete NVINIT / devinit script executor for GK104 VBIOS.
+"""Runtime NVINIT / devinit script executor for GK104 VBIOS.
 
 This is a straight port of the VBIOS parser in
 `nvkm/subdev/bios/init.c` from the Nouveau driver.  The original
-`examples_kepler/add.py` `_vbios_target_ops` is only a partial decoder and
+`examples_kepler/add_770.py` `_vbios_target_ops` is only a partial decoder and
 misaligns as soon as it hits opcodes it does not recognise (e.g.
 RAM_RESTRICT_ZM_REG_GROUP 0x8f), so it never actually executes the VBIOS
 devinit scripts.  This module replaces it.
@@ -2259,7 +2259,7 @@ def run_vbios_ram_program(dev, image: bytes, freq_mhz: int = 1000,
     raise RuntimeError(
         "PMU MEMX unavailable; refusing host GDDR5 and bit0 pause on a "
         "possibly-wedged GPU.  Power-cycle the eGPU enclosure, restart "
-        "TinyGPU server, then cold-run add.py once (no probe).")
+        "TinyGPU server, then cold-run the selected board entry point once (no probe).")
 
   def mask(reg: int, m: int, value: int, *, force: bool = False) -> int:
     """Queue one ``ramfuc_mask`` write only when Nouveau would queue it."""

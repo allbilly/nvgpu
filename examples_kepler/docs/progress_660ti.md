@@ -254,7 +254,7 @@ cycle (not just USB replug or server restart).
 ### Linux PCIe path status
 
 The Linux path (`examples_kepler_pcie/add.py` re-exporting
-`examples_kepler/add.py`) is **working**: `hardware_demo=ok N=256` with
+`examples_kepler/add_770.py`) is **working**: `hardware_demo=ok N=256` with
 `mismatches=0/256` on the GTX 770 at 09:00.0 (2026-07-15). VBIOS devinit
 executes, GPC PLL locks, FECS posts ready, ctx_chan works, golden context
 saves, and the full add kernel runs with correct results. The blocker was
@@ -270,7 +270,7 @@ accumulation.
 
 The H25 fixes were originally applied only to `add_660ti.py` (GTX 660 Ti /
 macOS TinyGPU). The Linux port (`examples_kepler_pcie/add.py`) re-exports
-`examples_kepler/add.py` (GTX 770), which had the same three bugs:
+`examples_kepler/add_770.py` (GTX 770), which had the same three bugs:
 
 1. **APLRemotePCIDevice sysmem mmap leak**: `alloc_sysmem` created a
    `FileIOInterface(fd=fd)` that was immediately discarded — the fd got

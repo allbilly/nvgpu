@@ -1,4 +1,4 @@
-# Progress — GTX 770 / GK104 bring-up (`examples_kepler/add.py`)
+# Progress — GTX 770 / GK104 bring-up (`examples_kepler/add_770.py`)
 
 Live status of getting a Kepler `sm_30` `out[i]=a[i]+b[i]` kernel running on the
 GTX 770 (GK104) eGPU over USB4 via TinyGPU. Reference plan: `plan.md`.
@@ -87,7 +87,7 @@ Each tested on real HW with full MMIO traces:
 1. **VBIOS obtained and validated.** `Palit.GTX770.4096.131216.rom` is 169,984
    bytes, SHA-256 `d574f587406c107e963c702a7980c4773226d4815d86afc77f9a60d96df7d02d`,
    and contains two `10DE:1184` PCIR images plus a 19-entry BIT directory.
-   `python3 examples_kepler/add.py --vbios-info` performs this validation.
+   `python3 examples_kepler/add_770.py --vbios-info` performs this validation.
    The dump is an `NVGI` multi-image container: the matching images begin at
    file offsets `0x600` and `0xfc00`; the inspector now reports both PCIR and
    image-relative BIT coordinates so the executor does not accidentally use
@@ -135,7 +135,7 @@ Each tested on real HW with full MMIO traces:
 
 - Added and validated the Palit ROM loader, BIT-I init-table discovery, GK104 PLL
   limits parsing, direct NVINIT writes, group writes, AND/OR/RESET decoding, and
-  condition-table discovery in `examples_kepler/add.py`.
+  condition-table discovery in `examples_kepler/add_770.py`.
 - Offline self-test remains green.
 - Live `--probe-vbios-devinit` executes the ROM's direct power/clock writes, but
   `0x137000` still reads `0xbadf3001`, `0x409604` remains zero, and the PLL
@@ -187,7 +187,7 @@ Each tested on real HW with full MMIO traces:
   instead of placing method dwords directly in the ring and writing a byte
   address to `GP_PUT`.
 - `--middle-selftest`, software demo, Falcon probe, and VBIOS inspectors pass.
-- Full hardware `python3 examples_kepler/add.py` now reaches channel submission
+- Full hardware `python3 examples_kepler/add_770.py` now reaches channel submission
   and times out with semaphore `0` (no crash). The remaining hardware blocker is
   GR context/channel execution: the current RAMIN still supplies a zero-filled
   placeholder instead of nouveau's generated GK104 context, so the compute
@@ -1074,10 +1074,10 @@ Nouveau register addresses.
 
 ### Verification
 
-- `python3 -m py_compile examples_kepler/add.py` passes.
-- `python3 examples_kepler/add.py --middle-selftest` passes, including checks for
+- `python3 -m py_compile examples_kepler/add_770.py` passes.
+- `python3 examples_kepler/add_770.py --middle-selftest` passes, including checks for
   the CUDA parameter ABI, CWD size/GPR fields, and MP trap addresses.
-- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+- `NV_BACKEND=software python3 examples_kepler/add_770.py` reports
   `software_demo=ok N=256` with a correct 256-element add result.
 - With no real cubin and Docker unavailable, the default command exits before
   touching the GPU with: `hardware launch refused: live hardware requires a
@@ -1090,7 +1090,7 @@ Nouveau register addresses.
 ## Session 2026-07-13 — real sm_30 cubin obtained; FECS falcon stuck at PC 0x567
 
 Docker came online, so a genuine nvcc-compiled `sm_30` add cubin is now
-available at `examples_kepler/add_kepler.cubin` (24 instructions, 8 registers).
+available at `examples_kepler/runtime/add_kepler.cubin` (24 instructions, 8 registers).
 CUDA 11.0.3-devel-ubuntu20.04 was used because CUDA 11.8+ dropped `sm_30` from
 nvcc. The cubin is compiled as `sm_35` then the ELF flags are patched to
 `0x001e051e` (sm_30); the SASS instructions used (MOV/S2R/IMAD/ISCADD/LD.E/
@@ -1158,11 +1158,11 @@ interrupt or mailbox signal that never arrives.
 
 ### Verification
 
-- `python3 -m py_compile examples_kepler/add.py` passes.
-- `python3 examples_kepler/add.py --middle-selftest` passes.
-- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+- `python3 -m py_compile examples_kepler/add_770.py` passes.
+- `python3 examples_kepler/add_770.py --middle-selftest` passes.
+- `NV_BACKEND=software python3 examples_kepler/add_770.py` reports
   `software_demo=ok N=256`.
-- `KEPLER_CUBIN=./add_kepler.cubin python3 examples_kepler/add.py` runs the
+- `KEPLER_CUBIN=./add_kepler.cubin python3 examples_kepler/add_770.py` runs the
   full hardware path but fails with `hardware add mismatch (256/256 wrong)`.
 - `hardware_demo=ok` is still not achieved.
 
@@ -1219,8 +1219,8 @@ checkpoint.
 
 ### Tests at this checkpoint
 
-- `python3 -m py_compile examples_kepler/add.py`: pass.
-- `python3 examples_kepler/add.py --middle-selftest`: pass,
+- `python3 -m py_compile examples_kepler/add_770.py`: pass.
+- `python3 examples_kepler/add_770.py --middle-selftest`: pass,
   `launch_words=19`.
 - Live eGPU run: reaches `NVA0C0_LAUNCH`, then MP trap and timeout.
 
@@ -1234,7 +1234,7 @@ the preceding checkpoint.
 NVIDIA's archived 36 MB `cuda-nvcc-10-2_10.2.89-1_amd64.deb` was downloaded
 to `/tmp` and extracted without installing it system-wide.  Its `ptxas` was run
 inside the already-cached CUDA 11 container only to provide an amd64 Linux
-runtime.  The source is `examples_kepler/add_kepler.ptx` and the compiler
+runtime.  The source is `examples_kepler/tools/add_kepler.ptx` and the compiler
 reported:
 
 ```
@@ -1243,7 +1243,7 @@ Compiling entry function 'E_4' for 'sm_30'
 Used 8 registers, 344 bytes cmem[0]
 ```
 
-The resulting `examples_kepler/add_kepler.cubin` is 1768 bytes, has native ELF
+The resulting `examples_kepler/runtime/add_kepler.cubin` is 1768 bytes, has native ELF
 flags `0x001e051e`, and SHA-256
 `0716d4ce397d5e2126bec9fd9cd3c32bdfd312326333ce641a3a78a2bd89e098`.
 No ELF flag patch is used.  CUDA 10.2 `nvdisasm` confirms the expected native
@@ -1421,7 +1421,7 @@ domain clock is not being routed to the engine.
 
 ### Verification
 
-- `python3 -m py_compile examples_kepler/add.py` passes.
+- `python3 -m py_compile examples_kepler/add_770.py` passes.
 - Hardware run still fails: `TimeoutError: semaphore did not reach 2
   (last=1)` after 2-second poll.
 - `PGRAPH_STATUS=0xbadf1000` throughout — GR engine never accessible.
@@ -1561,7 +1561,7 @@ aborts that escalate to a host panic.
 - Acknowledge MMU faults through `0x259c` and decode only source-selected
   records.
 - Mirror USERD `GP_PUT` through PRAMIN and invalidate LTC.
-- Use the checked-in nvcc-built `examples_kepler/add_kepler.cubin` by default,
+- Use the checked-in nvcc-built `examples_kepler/runtime/add_kepler.cubin` by default,
   so the normal command no longer requires `KEPLER_CUBIN` or Docker.
 
 ### Live validation and remaining blocker
@@ -1579,11 +1579,11 @@ aborts that escalate to a host panic.
 
 ### Verification
 
-- `python3 -m py_compile examples_kepler/add.py` passes.
-- `python3 examples_kepler/add.py --middle-selftest` passes.
-- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+- `python3 -m py_compile examples_kepler/add_770.py` passes.
+- `python3 examples_kepler/add_770.py --middle-selftest` passes.
+- `NV_BACKEND=software python3 examples_kepler/add_770.py` reports
   `software_demo=ok N=256` with correct results.
-- `python3 examples_kepler/add.py --probe` identifies GK104 (`chip_id=0x0e4`).
+- `python3 examples_kepler/add_770.py --probe` identifies GK104 (`chip_id=0x0e4`).
 
 ## Session 2026-07-13 — GR runlist fixed; semaphore gate passes on silicon
 
@@ -1611,7 +1611,7 @@ aborts that escalate to a host panic.
 ### Live verification
 
 - Default semaphore-only command now succeeds on the GK104 eGPU:
-  `KEPLER_TEST_SEM_ONLY=1 python3 examples_kepler/add.py` reports
+  `KEPLER_TEST_SEM_ONLY=1 python3 examples_kepler/add_770.py` reports
   `hardware_semaphore=ok value=2` with `MMU_FAULT: none`.
 - `python3 -m py_compile`, `--middle-selftest`, and the software demo pass.
 - Repeated live runs in this session did not crash macOS.
@@ -1666,8 +1666,8 @@ aborts that escalate to a host panic.
 
 ### Verification retained
 
-- `python3 -m py_compile examples_kepler/add.py` passes.
-- `python3 examples_kepler/add.py --middle-selftest` passes with 35 launch
+- `python3 -m py_compile examples_kepler/add_770.py` passes.
+- `python3 examples_kepler/add_770.py --middle-selftest` passes with 35 launch
   words after adding TEMP setup.
 - The semaphore-only silicon gate previously passed with `MMU_FAULT: none`;
   it must be rerun after the macOS reboot before another compute launch.
@@ -1807,10 +1807,10 @@ aborts that escalate to a host panic.
 
 ### Current verification and next safe hardware gate
 
-- `python3 -m py_compile examples_kepler/add.py` passes.
-- `python3 examples_kepler/add.py --middle-selftest` passes with
+- `python3 -m py_compile examples_kepler/add_770.py` passes.
+- `python3 examples_kepler/add_770.py --middle-selftest` passes with
   `launch_words=39`, including the new TinyGPU/PCI shutdown test.
-- `NV_BACKEND=software python3 examples_kepler/add.py` reports
+- `NV_BACKEND=software python3 examples_kepler/add_770.py` reports
   `software_demo=ok N=256` with correct results.
 - `git diff --check` passes.
 - A final local Nouveau audit confirms the reset bits used here: GK104 maps
@@ -1831,7 +1831,7 @@ aborts that escalate to a host panic.
 
 ### Live semaphore result after enclosure power-cycle
 
-- Ran exactly one `KEPLER_TEST_SEM_ONLY=1 python3 examples_kepler/add.py` with
+- Ran exactly one `KEPLER_TEST_SEM_ONLY=1 python3 examples_kepler/add_770.py` with
   late `GP_PUT`; no compute launch was attempted.
 - The GPU completed normally: PBDMA consumed the entry, the completion
   semaphore reached 2, `MMU_FAULT: none`, and the process exited successfully.
@@ -1983,11 +1983,11 @@ aborts that escalate to a host panic.
 
 ### Offline validation and safety status
 
-- `python3 -m py_compile examples_kepler/add.py`: pass.
-- `python3 examples_kepler/add.py --middle-selftest`: pass,
+- `python3 -m py_compile examples_kepler/add_770.py`: pass.
+- `python3 examples_kepler/add_770.py --middle-selftest`: pass,
   `launch_words=39`; the fake-register test proves PGOB restore, fixed-clock
   selection, PLL disable, all eight clock-gate values, and all leaf masks.
-- `NV_BACKEND=software python3 examples_kepler/add.py`: pass,
+- `NV_BACKEND=software python3 examples_kepler/add_770.py`: pass,
   `software_demo=ok N=256 launch_words=39 cwd_bytes=256`.
 - No eGPU MMIO, probe, app launch, or other live hardware access was performed
   in this session.  The fix is offline-verified but not yet live-validated.
@@ -1999,7 +1999,7 @@ aborts that escalate to a host panic.
 
 ## Session 2026-07-14 — live attempt blocked before hardware access
 
-- Authorized one isolated `python3 -u examples_kepler/add.py` hardware run.
+- Authorized one isolated `python3 -u examples_kepler/add_770.py` hardware run.
 - TinyGPU rejected the very first `CFG_READ` of PCI command register offset
   `0x04` with: `Driver not available. Check: System Report > PCI for GPU,
   System Settings > Privacy & Security.`
@@ -2051,10 +2051,10 @@ aborts that escalate to a host panic.
 
 ### Validation after lifecycle fix
 
-- `python3 -m py_compile examples_kepler/add.py`: pass.
-- `python3 examples_kepler/add.py --middle-selftest`: pass,
+- `python3 -m py_compile examples_kepler/add_770.py`: pass.
+- `python3 examples_kepler/add_770.py --middle-selftest`: pass,
   `launch_words=39`, including failed-constructor cleanup regression coverage.
-- `NV_BACKEND=software python3 examples_kepler/add.py`: pass,
+- `NV_BACKEND=software python3 examples_kepler/add_770.py`: pass,
   `software_demo=ok N=256 launch_words=39 cwd_bytes=256`.
 - `git diff --check`: pass.
 - No post-reboot eGPU probe or hardware retry was made.  The Kepler leaf IRQ,
@@ -2105,7 +2105,7 @@ aborts that escalate to a host panic.
 - Removed function reset and decode-disable from both normal `NVDevice.close()`
   and the partial/direct transport finalizer.  The generic reset RPC and its
   offline protocol test remain available in code, but the GK104 path no longer
-  calls them.  This change is local to `examples_kepler/add.py` and does not
+  calls them.  This change is local to `examples_kepler/add_770.py` and does not
   alter the working 3080 or `allbilly/amdgpu` implementations.
 - Added an offline wire-level assertion that the real GK104 close emits exactly
   config read/write/read, retains BAR decode, clears bus mastering, disables
@@ -2214,7 +2214,7 @@ aborts that escalate to a host panic.
 
 ### Comparison with committed history
 
-- Reviewed all commits touching `examples_kepler/add.py`.  Commit `6b04d4f`
+- Reviewed all commits touching `examples_kepler/add_770.py`.  Commit `6b04d4f`
   (`failure is isolated to A0C0 SET_OBJEC`) is the last committed diagnostic
   path that records a complete two-second hardware timeout without recording a
   macOS panic.  Its path had no layered channel/PCI close implementation.
@@ -2494,7 +2494,7 @@ aborts that escalate to a host panic.
   first corrected run after fixing `_temp_sock()` to use the literal `/tmp`
   path; the earlier failed attempt never connected to hardware.
 - Source commit: `eec69db1d7e887bdb79dbf936159f02bc7e8d126`.
-- `examples_kepler/add.py` SHA-256:
+- `examples_kepler/add_770.py` SHA-256:
   `61acbb9f0a4f77d437b73527ae8d19f86fae3ad3fd3a53c3f9e19fcfa79a4a8a8`.
 - Program log: `logs/add-20260714-124500.log`.
 - Client trace: `logs/rpc-20260714-124500.log` (577,654,916 bytes).
@@ -2596,7 +2596,7 @@ aborts that escalate to a host panic.
 
 ## Session 2026-07-16 — cold GDDR5 / PRAMIN / `KEPLER_N=8`
 
-Operator notes also live in `examples_kepler/reset_egpu.md` (night–night17).
+Operator notes also live in `examples_kepler/docs/reset_egpu.md` (night–night17).
 Goal this arc: cold bring-up far enough for `hardware_demo=ok N=8`.
 **Not yet achieved** — furthest point: **FECS ready + deferred bit0 + enabled
 BAR1**, but pre-bit0 PRAMIN stores do not create valid physical VRAM roots.

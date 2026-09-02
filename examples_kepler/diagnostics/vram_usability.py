@@ -5,8 +5,8 @@ Boots the shared TinyGPU path, reads per-FBP size straps, then walks VRAM
 through the BAR0 PRAMIN window (1 MiB, retargeted via 0x1700).  Sparse unique
 markers detect dead ranges and bit19 / wrap aliasing without writing all 4 GiB.
 
-  python3 examples_kepler/vram_usability.py
-  KEPLER_VRAM_STRIDE=0x400000 python3 examples_kepler/vram_usability.py  # denser
+  python3 examples_kepler/diagnostics/vram_usability.py
+  KEPLER_VRAM_STRIDE=0x400000 python3 examples_kepler/diagnostics/vram_usability.py  # denser
 """
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ import sys
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-for _p in (REPO_ROOT, os.path.join(REPO_ROOT, "ref")):
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+for _p in (REPO_ROOT,):
   if _p not in sys.path:
     sys.path.insert(0, _p)
 

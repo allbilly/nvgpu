@@ -44,16 +44,16 @@ Before changing or touching hardware, record the exact source state:
 ```bash
 git rev-parse HEAD
 git status --short
-git diff -- examples_kepler/add.py examples_kepler/progress.md
-shasum -a 256 examples_kepler/add.py
+git diff -- examples_kepler/add_770.py examples_kepler/docs/progress.md
+shasum -a 256 examples_kepler/add_770.py
 ```
 
 Run all offline gates:
 
 ```bash
-python3 -m py_compile examples_kepler/add.py
-python3 examples_kepler/add.py --middle-selftest
-NV_BACKEND=software python3 examples_kepler/add.py
+python3 -m py_compile examples_kepler/add_770.py
+python3 examples_kepler/add_770.py --middle-selftest
+NV_BACKEND=software python3 examples_kepler/add_770.py
 git diff --check
 ```
 
@@ -537,7 +537,7 @@ env \
   KEPLER_RPC_TRACE="$PWD/logs/rpc-$(date +%Y%m%d-%H%M%S).log" \
   PYTHONUNBUFFERED=1 \
   DEBUG=0 \
-  python3 examples_kepler/add.py \
+  python3 examples_kepler/add_770.py \
   2>&1 | tee "logs/add-$(date +%Y%m%d-%H%M%S).log"
 ```
 
@@ -567,4 +567,3 @@ The host-stability problem is fixed only when:
 7. A deliberate kernel-error test fails in userspace with bounded diagnostics rather than destabilizing the PCIe controller.
 
 The highest-priority suspected defect is currently the remaining post-completion BAR0 activity visible in `add.py`, despite `progress.md` stating that the normal path had been reduced to a single BAR1 output read followed by client-only close.
-

@@ -4,7 +4,8 @@
 Self-contained like ``examples/add.py``: RM/GMMU/FIFO/launch, firmware, cubin,
 and debug live in this file.  Transport is platform-selected:
 
-  - macOS: TinyGPU.app DriverKit Unix socket (``/tmp/tinygpu.sock``)
+  - macOS: direct Chestnut USB3 (preferred), with TinyGPU.app's DriverKit
+    Unix socket (``/tmp/tinygpu.sock``) as fallback
   - Linux: raw BAR0/BAR1 mmap via sysfs ``resourceN`` (root / CAP_SYS_RAWIO;
     GK104 unbound from nvidia)
 
@@ -27,28 +28,30 @@ fully implemented and runnable — it validates the Kepler cubin builder, the
 GK104 GMMU page-table helpers, the CWD launch-word builder, and the shared
 platform scaffolding.
 
-The only external dependencies this module has are:
-  - tinygrad.runtime.autogen.{nv, nv_570, nv_regs, pci, libc}  (ctypes constants only)
+The only repo-local dependencies this module has are:
+  - autogen.{nv, nv_570, nv_regs, pci, libc}  (ctypes constants only)
   - Python standard library
-  - nvbios_init / pgraph_mmio_gk104 (sibling modules in this directory)
+  - runtime/nvbios_init / runtime/pgraph_mmio_gk104
 
 NO imports from tinygrad.runtime.support / ops / device / renderer / uop / helpers
 are permitted on the live path — those have been vendored inline below.
 
-``python3 examples_kepler/add.py --middle-selftest`` exercises the offline
+``python3 examples_kepler/add_770.py --middle-selftest`` exercises the offline
 builders without touching the card.  ``--mmiotrace-selftest`` is the golden
 Nouveau mmiotrace gate (no hardware/pagemap).  ``NV_BACKEND=software`` runs the
 complete allocator and launch-word path against host memory.  On Linux a normal
 live invocation selects the unbound GK104 from sysfs and requests sudo when
 necessary; on macOS it talks to TinyGPU.app at ``/tmp/tinygpu.sock``.
-``KEPLER_OPERATION=mul`` selects the multiply image and expected vector result.
+Pass ``mul`` as the first argument (or set ``KEPLER_OPERATION=mul``) to select
+the multiply image and expected vector result.
 ``examples_kepler_pcie/add.py`` is a thin re-export of this file for older
-callers.  DEBUG=1 enables the detailed register trace; normal launches keep
-only summary lines so a successful health check is easy to spot in logs.
-Progress and crash-safety notes live beside this file in `progress.md`.
+callers.  KEPLER_TRACE=1 (the default) enables semantic bring-up tracing;
+KEPLER_TRACE=2 adds changed register reads and all register writes.  DEBUG=1
+enables invasive diagnostics and remains refused by the crash-isolated live path.
+Progress and crash-safety notes live under `docs/`.
 """
 from __future__ import annotations
-import os, sys, ctypes, ctypes.util, time, mmap, struct, math, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib, json, threading, io
+import os, sys, ctypes, ctypes.util, time, mmap, struct, math, array as _array_mod, socket, subprocess, contextlib, functools, itertools, enum, atexit, select, dataclasses, collections, urllib.request, hashlib, tempfile, gzip, pathlib, json, threading, io, builtins
 from typing import cast, Any, ClassVar, Generic, TypeVar
 
 # Resolve everything from this checkout before importing tinygrad.  This keeps
@@ -56,13 +59,15 @@ from typing import cast, Any, ClassVar, Generic, TypeVar
 # working without installing anything system-wide.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-SHARED_KEPLER_DIR = SCRIPT_DIR  # assets + nvbios_init live beside this file
-TINYGRAD_ROOT = os.path.join(REPO_ROOT, "ref")
-for _path in (TINYGRAD_ROOT, SHARED_KEPLER_DIR):
+RUNTIME_DIR = os.path.join(SCRIPT_DIR, "runtime")
+TOOLS_DIR = os.path.join(SCRIPT_DIR, "tools")
+DIAGNOSTICS_DIR = os.path.join(SCRIPT_DIR, "diagnostics")
+SHARED_KEPLER_DIR = RUNTIME_DIR  # live helper modules are organized with runtime assets
+for _path in (REPO_ROOT, SHARED_KEPLER_DIR, DIAGNOSTICS_DIR):
   if _path not in sys.path: sys.path.insert(0, _path)
-DEFAULT_VBIOS = os.path.join(SHARED_KEPLER_DIR, "Palit.GTX770.4096.131216.rom")
-DEFAULT_CUBIN = os.path.join(SHARED_KEPLER_DIR, "add_kepler.cubin")
-DEFAULT_MUL_CUBIN = os.path.join(SHARED_KEPLER_DIR, "mul_kepler.cubin")
+DEFAULT_VBIOS = os.path.join(RUNTIME_DIR, "Palit.GTX770.4096.131216.rom")
+DEFAULT_CUBIN = os.path.join(RUNTIME_DIR, "add_kepler.cubin")
+DEFAULT_MUL_CUBIN = os.path.join(RUNTIME_DIR, "mul_kepler.cubin")
 # Reference produced by CUDA 10.2 `ptxas -arch=sm_30` for the multiply
 # variant assembled from the checked-in Kepler PTX.  Keep this independent of
 # the add cubin so a stale/precompiled add image cannot silently run a mul test.
@@ -70,21 +75,239 @@ MUL_CUBIN_BYTES = 1768
 MUL_CUBIN_SHA256 = "7f0e019e5fe8dc5e68e1b14a70c3841391b63062df2daba26d01f8e6d0ac2a52"
 
 # Optional override for PCI transport (tests / alternate backends).
-# Default: APLRemotePCIDevice on macOS, LinuxPCIDevice elsewhere.
+# Default: direct Chestnut USB3 when present on macOS, then TinyGPU socket;
+# LinuxPCIDevice elsewhere.
 _PCI_TRANSPORT_FACTORY = None
 def set_pci_transport_factory(factory):
   global _PCI_TRANSPORT_FACTORY
   _PCI_TRANSPORT_FACTORY = factory
 
-# --- autogen ctypes (allowed: "ctypes constants only") ---
-from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
-from tinygrad.runtime.autogen import nv_regs
-from tinygrad.runtime.autogen import libc
+# --- repo-local autogen ctypes (allowed: "ctypes constants only") ---
+from autogen import nv, nv_570 as nv_gpu, pci, libusb
+from autogen import nv_regs
+from autogen import libc
 # Reuse the Kepler bring-up modules from examples_kepler/ rather than duplicating
 # them here (ponytail: fewest files).  NV_KEPLER_PATH overrides for non-standard layouts.
 sys.path.insert(0, os.environ.get("NV_KEPLER_PATH", SHARED_KEPLER_DIR))
 import nvbios_init
 from pgraph_mmio_gk104 import GK104_PGRAPH_PACK_MMIO
+
+TRACE = int(os.environ.get("KEPLER_TRACE", os.environ.get("NV_TRACE", "1")) or 0)
+_trace_last_reg_read = {}
+_trace_tls = threading.local()
+_raw_print = builtins.print
+
+def _trace_depth():
+  return getattr(_trace_tls, "depth", 0)
+
+def _trace_set_depth(depth):
+  _trace_tls.depth = max(0, int(depth))
+
+def print(*args, **kwargs):
+  """Module-local print that indents narrative output inside trace scopes."""
+  depth = _trace_depth() if TRACE else 0
+  if depth and args:
+    prefix = "  " * depth
+    first = args[0]
+    if isinstance(first, str):
+      first = prefix + first.replace("\n", "\n" + prefix)
+    else:
+      first = prefix + str(first)
+    args = (first, *args[1:])
+  return _raw_print(*args, **kwargs)
+
+_TRACE_PLUMBING = frozenset({
+    "_trace_caller", "_trace_emit", "trace_note", "trace_call_scope",
+    "stage_set", "stage_done", "stage_skip", "stage_fail", "print",
+    "__enter__", "__exit__", "<lambda>",
+})
+
+def _trace_caller():
+  frame = sys._getframe(1)
+  while frame is not None:
+    name = frame.f_code.co_name
+    if name not in _TRACE_PLUMBING:
+      owner = frame.f_locals.get("self")
+      if owner is not None:
+        return f"{type(owner).__name__}.{name}"
+      return name
+    frame = frame.f_back
+  return "?"
+
+def _trace_emit(stage_label, tag, caller, message, *, depth=None):
+  if not TRACE: return
+  prefix = "  " * (_trace_depth() if depth is None else max(0, depth))
+  label = f"[{stage_label}] " if stage_label else ""
+  lines = str(message).splitlines() or [""]
+  _raw_print(f"{prefix}{label}{tag}[{caller}] {lines[0]}", flush=True)
+  continuation = prefix + (" " * len(label)) + "  "
+  for line in lines[1:]:
+    _raw_print(f"{continuation}{line}", flush=True)
+
+def _next_subsection():
+  global _stage_subsection
+  _stage_subsection += 1
+  return f"S{_stage_current}.{_stage_subsection}" if _stage_current else ""
+
+def trace_note(message, tag="CTX", caller=None):
+  """Emit a numbered semantic subsection, comparable to examples/add.py."""
+  if TRACE:
+    _trace_emit(_next_subsection(), tag, caller or _trace_caller(), message)
+
+@contextlib.contextmanager
+def trace_call_scope(label, *, caller=None, detail=""):
+  """Print one meaningful function call/return and indent all child output."""
+  if not TRACE:
+    yield
+    return
+  owner = caller or label
+  section = _next_subsection()
+  suffix = f" {detail}" if detail else ""
+  _trace_emit(section, "CALL", owner, f"begin{suffix}")
+  old_depth = _trace_depth()
+  _trace_set_depth(old_depth + 1)
+  start_ns = time.monotonic_ns()
+  try:
+    yield
+  except BaseException as exc:
+    _trace_set_depth(old_depth)
+    _trace_emit(section, "FAIL", owner, f"{type(exc).__name__}: {exc}")
+    raise
+  else:
+    _trace_set_depth(old_depth)
+    _trace_emit(section, "RETURN", owner,
+                f"done duration_ms={(time.monotonic_ns() - start_ns) / 1e6:.3f}")
+
+def traced_call(fn):
+  """Decorator for coarse driver operations; never use on MMIO/poll helpers."""
+  @functools.wraps(fn)
+  def wrapper(*args, **kwargs):
+    with trace_call_scope(fn.__qualname__, caller=fn.__qualname__):
+      return fn(*args, **kwargs)
+  return wrapper
+
+STAGES = ["PCIe/Transport", "GPU Discovery+MMU", "Firmware+Clock Prep",
+          "Legacy Falcon Boot", "GSP/RM Online", "Golden GR Context",
+          "User Channels+GPFIFO", "Workload+CWD Prep", "Submit+Execute",
+          "Result Validation"]
+_stage_status = {}
+_stage_current = 0
+_stage_subsection = 0
+_stage_reported = False
+
+def stage_reset():
+  global _stage_current, _stage_subsection, _stage_reported
+  _stage_status.clear()
+  _stage_current = 0
+  _stage_subsection = 0
+  _stage_reported = False
+  _trace_set_depth(0)
+
+def stage_set(n, note=""):
+  global _stage_current, _stage_subsection
+  _trace_set_depth(0)
+  _stage_current = n
+  _stage_subsection = 0
+  _stage_status[n] = {"ok": False, "note": note,
+                      "start_ns": time.monotonic_ns()}
+  if TRACE:
+    _trace_emit(f"S{n}", "CALL", _trace_caller(),
+                f"{STAGES[n - 1]} — {note or 'begin'}", depth=0)
+    _trace_set_depth(1)
+
+def stage_done(note=""):
+  if not _stage_current: return
+  st = _stage_status.setdefault(
+      _stage_current, {"ok": False, "note": "", "start_ns": time.monotonic_ns()})
+  st["ok"] = True
+  st["duration_ms"] = (time.monotonic_ns() - st["start_ns"]) / 1e6
+  if note: st["note"] = note
+  if TRACE:
+    _trace_set_depth(0)
+    _trace_emit(f"S{_stage_current}", "RETURN", _trace_caller(),
+                f"{STAGES[_stage_current - 1]} — done "
+                f"duration_ms={st['duration_ms']:.3f}", depth=0)
+
+def stage_skip(n, note):
+  global _stage_current, _stage_subsection
+  _trace_set_depth(0)
+  _stage_current = n
+  _stage_subsection = 0
+  _stage_status[n] = {"ok": False, "na": True, "note": note,
+                      "duration_ms": 0.0}
+  if TRACE:
+    _trace_emit(f"S{n}", "N/A", _trace_caller(),
+                f"{STAGES[n - 1]} — {note}", depth=0)
+
+def stage_fail(note):
+  if not _stage_current: return
+  st = _stage_status.setdefault(
+      _stage_current, {"ok": False, "note": "", "start_ns": time.monotonic_ns()})
+  st.update(failed=True, note=note,
+            duration_ms=(time.monotonic_ns() - st["start_ns"]) / 1e6)
+
+def stage_summary():
+  global _stage_reported
+  if not TRACE or _stage_reported or not _stage_status: return
+  _stage_reported = True
+  _trace_set_depth(0)
+  _raw_print("\n" + "=" * 62, flush=True)
+  _raw_print(f"{'NVIDIA KEPLER RUN':^62}", flush=True)
+  _raw_print("=" * 62, flush=True)
+  for i, name in enumerate(STAGES, 1):
+    st = _stage_status.get(i)
+    if st and st.get("ok"): mark = "OK  "
+    elif st and st.get("failed"): mark = "FAIL"
+    elif st and st.get("na"): mark = "N/A "
+    elif st: mark = "...."
+    else: mark = "----"
+    elapsed = (f" {st['duration_ms']:9.3f} ms" if st and
+               st.get("duration_ms") is not None else "             ")
+    extra = f"  {st['note']}" if st and st.get("note") else ""
+    _raw_print(f"[S{i}] {name:<28} {mark}{elapsed}{extra}", flush=True)
+  _raw_print("=" * 62, flush=True)
+
+atexit.register(stage_summary)
+
+def configure_operation():
+  """Accept the same ``add_770.py [add|mul]`` interface as the other examples."""
+  if len(sys.argv) > 1 and sys.argv[1] in ("add", "mul"):
+    os.environ["KEPLER_OPERATION"] = sys.argv.pop(1)
+  operation = os.environ.get("KEPLER_OPERATION", "add").lower()
+  if operation not in ("add", "mul"):
+    raise SystemExit(f"unsupported operation {operation!r}; expected add or mul")
+  os.environ["KEPLER_OPERATION"] = operation
+  return operation
+
+def trace_format_selftest():
+  """Exercise trace numbering/indentation without probing PCI or USB."""
+  if not TRACE:
+    raise RuntimeError("--trace-selftest requires KEPLER_TRACE=1 or 2")
+  stage_reset()
+  capture = io.StringIO()
+  with contextlib.redirect_stdout(capture):
+    stage_set(1, "exercise trace formatter without hardware")
+    trace_note("numbered semantic subsection")
+    with trace_call_scope("trace_demo.inner", caller="trace_demo.inner"):
+      print("indented child detail")
+    stage_done("trace hierarchy rendered")
+    stage_skip(5, "expected no-GSP example")
+    stage_summary()
+  rendered = capture.getvalue()
+  required = (
+      "[S1] CALL[trace_format_selftest]",
+      "  [S1.1] CTX[trace_format_selftest]",
+      "  [S1.2] CALL[trace_demo.inner]",
+      "    indented child detail",
+      "  [S1.2] RETURN[trace_demo.inner]",
+      "[S1] RETURN[trace_format_selftest]",
+      "[S5] N/A[trace_format_selftest]",
+  )
+  missing = [needle for needle in required if needle not in rendered]
+  if missing:
+    raise AssertionError(f"trace formatter missing records: {missing}")
+  _raw_print(rendered, end="")
+  _raw_print("kepler_trace_selftest=ok subsections=2 indentation=2 caller_tags=ok")
 
 # ============================================================================
 # Helpers (slimmed from tinygrad/helpers.py — Kepler-agnostic, reused verbatim)
@@ -120,11 +343,24 @@ def from_mv(mv: memoryview, to_type=ctypes.c_char):
   return ctypes.cast(ctypes.addressof(to_type.from_buffer(mv)), ctypes.POINTER(to_type * len(mv))).contents
 
 def wait_cond(cb, *args, value=True, timeout_ms=10000, msg=""):
-  start_time = int(time.perf_counter() * 1000)
+  start_ns = time.perf_counter_ns()
+  caller = sys._getframe(1).f_code.co_name
+  label = msg or getattr(cb, "__name__", "condition")
+  iters = 0
   val = None
-  while int(time.perf_counter() * 1000) - start_time < timeout_ms:
-    if (val := cb(*args)) == value: return val
+  while (time.perf_counter_ns() - start_ns) / 1e6 < timeout_ms:
+    iters += 1
+    if (val := cb(*args)) == value:
+      if TRACE:
+        print(f"[wait] S{_stage_current} {caller}: {label}: met after "
+              f"{iters} polls / {(time.perf_counter_ns() - start_ns) / 1e6:.3f} ms "
+              f"value={val!r}", flush=True)
+      return val
     time.sleep(0.0001)
+  if TRACE:
+    print(f"[wait] S{_stage_current} {caller}: {label}: TIMEOUT after "
+          f"{iters} polls / {(time.perf_counter_ns() - start_ns) / 1e6:.3f} ms "
+          f"value={val!r} expected={value!r}", flush=True)
   raise TimeoutError(f"{msg}. Timed out after {timeout_ms} ms, condition not met: {val} != {value}")
 
 def _ensure_downloads_dir() -> pathlib.Path:
@@ -506,6 +742,71 @@ class RemotePCIDevice:
     raise NotImplementedError
 
 
+_PCIE_SPEEDS = {
+  1: "Gen1/2.5GT/s", 2: "Gen2/5.0GT/s", 3: "Gen3/8.0GT/s",
+  4: "Gen4/16GT/s", 5: "Gen5/32GT/s", 6: "Gen6/64GT/s",
+}
+_PCIE_TYPES = {
+  pci.PCI_EXP_TYPE_ENDPOINT: "endpoint",
+  pci.PCI_EXP_TYPE_LEG_END: "legacy-endpoint",
+  pci.PCI_EXP_TYPE_ROOT_PORT: "root-port",
+  pci.PCI_EXP_TYPE_UPSTREAM: "upstream-port",
+  pci.PCI_EXP_TYPE_DOWNSTREAM: "downstream-port",
+  pci.PCI_EXP_TYPE_PCI_BRIDGE: "pcie-pci-bridge",
+  pci.PCI_EXP_TYPE_PCIE_BRIDGE: "pci-pcie-bridge",
+}
+
+def _pcie_find_cap(read_config, cap_id):
+  """Walk a function's conventional PCI capability list without writes."""
+  if not (read_config(pci.PCI_STATUS, 2) & pci.PCI_STATUS_CAP_LIST):
+    return None
+  ptr, seen = read_config(pci.PCI_CAPABILITY_LIST, 1) & 0xfc, set()
+  while ptr and ptr not in seen and 0x40 <= ptr <= 0xfc:
+    seen.add(ptr)
+    if read_config(ptr + pci.PCI_CAP_LIST_ID, 1) == cap_id:
+      return ptr
+    ptr = read_config(ptr + pci.PCI_CAP_LIST_NEXT, 1) & 0xfc
+  return None
+
+def _pcie_link_snapshot(read_config):
+  """Decode advertised and negotiated PCIe link state from config space."""
+  ident = read_config(pci.PCI_VENDOR_ID, 4)
+  cap = _pcie_find_cap(read_config, pci.PCI_CAP_ID_EXP)
+  if cap is None:
+    return {"ident": ident, "cap": None}
+  flags = read_config(cap + pci.PCI_EXP_FLAGS, 2)
+  link_cap = read_config(cap + pci.PCI_EXP_LNKCAP, 4)
+  link_ctl = read_config(cap + pci.PCI_EXP_LNKCTL, 2)
+  link_sta = read_config(cap + pci.PCI_EXP_LNKSTA, 2)
+  return {
+    "ident": ident, "cap": cap,
+    "type": (flags & pci.PCI_EXP_FLAGS_TYPE) >> 4,
+    "max_speed": link_cap & pci.PCI_EXP_LNKCAP_SLS,
+    "max_width": (link_cap & pci.PCI_EXP_LNKCAP_MLW) >> 4,
+    "speed": link_sta & pci.PCI_EXP_LNKSTA_CLS,
+    "width": (link_sta & pci.PCI_EXP_LNKSTA_NLW) >> pci.PCI_EXP_LNKSTA_NLW_SHIFT,
+    "training": bool(link_sta & pci.PCI_EXP_LNKSTA_LT),
+    "dll_active": bool(link_sta & pci.PCI_EXP_LNKSTA_DLLLA),
+    "aspm": link_ctl & pci.PCI_EXP_LNKCTL_ASPMC,
+    "raw_status": link_sta,
+  }
+
+def _format_pcie_link(label, snap):
+  vendor, device = snap["ident"] & 0xffff, snap["ident"] >> 16
+  if snap["cap"] is None:
+    return f"[pcie] {label} id={vendor:04x}:{device:04x} capability=absent"
+  type_name = _PCIE_TYPES.get(snap["type"], f"type-{snap['type']}")
+  max_speed = _PCIE_SPEEDS.get(snap["max_speed"], f"code{snap['max_speed']}")
+  speed = _PCIE_SPEEDS.get(snap["speed"], f"code{snap['speed']}")
+  return (
+      f"[pcie] {label} id={vendor:04x}:{device:04x} "
+      f"type={type_name} max={max_speed}x{snap['max_width']} "
+      f"negotiated={speed}x{snap['width']} "
+      f"training={'yes' if snap['training'] else 'no'} "
+      f"dll={'active' if snap['dll_active'] else 'inactive'} "
+      f"aspm={snap['aspm']:#x} lnksta={snap['raw_status']:#06x}")
+
+
 def _detect_gk104_bdf():
   """Scan /sys/bus/pci/devices for an unbound NVIDIA GK104 and return its BDF.
   A device bound to any driver (nvidia, nouveau, snd_hda_intel, ...) is skipped:
@@ -870,8 +1171,593 @@ class APLRemotePCIDevice(RemotePCIDevice):
       return None
 
 
+def _usb_check(rc, name):
+  if rc < 0:
+    err = ctypes.string_at(libusb.libusb_strerror(rc)).decode("utf-8", errors="replace")
+    raise RuntimeError(f"{name}: {err} ({rc})")
+  return rc
+
+
+class USB3:
+  """Minimal libusb transport for the Chestnut PCIe controller."""
+  @staticmethod
+  @functools.cache
+  def ctx():
+    ctx = ctypes.POINTER(libusb.struct_libusb_context)()
+    _usb_check(libusb.libusb_init(ctypes.byref(ctx)), "libusb_init")
+    return ctx
+
+  @classmethod
+  def list_devices(cls, vendor, product):
+    devs = ctypes.POINTER(ctypes.POINTER(libusb.struct_libusb_device))()
+    count = _usb_check(
+        libusb.libusb_get_device_list(cls.ctx(), ctypes.byref(devs)),
+        "libusb_get_device_list")
+    found = []
+    try:
+      for i in range(count):
+        desc = libusb.struct_libusb_device_descriptor()
+        _usb_check(libusb.libusb_get_device_descriptor(devs[i], ctypes.byref(desc)),
+                   "libusb_get_device_descriptor")
+        if (desc.idVendor, desc.idProduct) == (vendor, product):
+          dev = libusb.libusb_ref_device(devs[i])
+          found.append((dev, f"usb:{libusb.libusb_get_bus_number(dev)}-"
+                             f"{libusb.libusb_get_device_address(dev)}"))
+    finally:
+      libusb.libusb_free_device_list(devs, 1)
+    return found
+
+  def __init__(self, dev):
+    self.dev = dev
+    self.handle = ctypes.POINTER(libusb.struct_libusb_device_handle)()
+    self.claimed = self.closed = False
+    try:
+      _usb_check(libusb.libusb_open(dev, ctypes.byref(self.handle)), "libusb_open")
+      auto_detach = libusb.libusb_set_auto_detach_kernel_driver(self.handle, 1)
+      if auto_detach not in (0, libusb.LIBUSB_ERROR_NOT_SUPPORTED):
+        _usb_check(auto_detach, "libusb_set_auto_detach_kernel_driver")
+      active = libusb.libusb_kernel_driver_active(self.handle, 0)
+      if active > 0:
+        _usb_check(libusb.libusb_detach_kernel_driver(self.handle, 0),
+                   "libusb_detach_kernel_driver")
+      elif active < 0 and active != libusb.LIBUSB_ERROR_NOT_SUPPORTED:
+        _usb_check(active, "libusb_kernel_driver_active")
+      config = ctypes.c_int()
+      _usb_check(libusb.libusb_get_configuration(self.handle, ctypes.byref(config)),
+                 "libusb_get_configuration")
+      if config.value != 1:
+        _usb_check(libusb.libusb_set_configuration(self.handle, 1),
+                   "libusb_set_configuration")
+      _usb_check(libusb.libusb_claim_interface(self.handle, 0),
+                 "libusb_claim_interface")
+      self.claimed = True
+      _usb_check(libusb.libusb_set_interface_alt_setting(self.handle, 0, 0),
+                 "libusb_set_interface_alt_setting")
+    except Exception:
+      self.close()
+      raise
+
+  def close(self):
+    if self.closed:
+      return
+    self.closed = True
+    if self.claimed and self.handle:
+      with contextlib.suppress(Exception):
+        libusb.libusb_release_interface(self.handle, 0)
+    if self.handle:
+      with contextlib.suppress(Exception):
+        libusb.libusb_close(self.handle)
+    if self.dev:
+      with contextlib.suppress(Exception):
+        libusb.libusb_unref_device(self.dev)
+
+  def describe(self):
+    desc = libusb.struct_libusb_device_descriptor()
+    _usb_check(libusb.libusb_get_device_descriptor(self.dev, ctypes.byref(desc)),
+               "libusb_get_device_descriptor")
+    speed = libusb.libusb_get_device_speed(self.dev)
+    speed_name = {0: "unknown", 1: "1.5Mb/s", 2: "12Mb/s", 3: "480Mb/s",
+                  4: "5Gb/s", 5: "10Gb/s"}.get(speed, f"code{speed}")
+    return f"{desc.idVendor:04x}:{desc.idProduct:04x} {speed_name}"
+
+  def control_write(self, request, value=0, index=0, data=b"", timeout=1000):
+    buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data) if data else None
+    rc = _usb_check(libusb.libusb_control_transfer(
+        self.handle, 0x40, request, value, index, buf, len(data), timeout),
+        f"control OUT 0x{request:02x}")
+    if rc != len(data):
+      raise RuntimeError(f"control OUT 0x{request:02x}: short write {rc}/{len(data)}")
+
+  def control_read(self, request, length, value=0, index=0, timeout=1000):
+    buf = (ctypes.c_ubyte * length)()
+    rc = _usb_check(libusb.libusb_control_transfer(
+        self.handle, 0xc0, request, value, index, buf, length, timeout),
+        f"control IN 0x{request:02x}")
+    if rc != length:
+      raise RuntimeError(f"control IN 0x{request:02x}: short read {rc}/{length}")
+    return bytes(buf)
+
+  def bulk_write(self, payload, timeout=30000):
+    payload = bytes(payload)
+    buf = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+    transferred = ctypes.c_int()
+    _usb_check(libusb.libusb_bulk_transfer(
+        self.handle, 0x02, buf, len(payload), ctypes.byref(transferred), timeout),
+        "bulk OUT 0x02")
+    if transferred.value != len(payload):
+      raise RuntimeError(f"bulk OUT 0x02: short write {transferred.value}/{len(payload)}")
+
+  def bulk_read(self, length, timeout=30000):
+    buf, transferred = (ctypes.c_ubyte * length)(), ctypes.c_int()
+    _usb_check(libusb.libusb_bulk_transfer(
+        self.handle, 0x81, buf, length, ctypes.byref(transferred), timeout),
+        "bulk IN 0x81")
+    if transferred.value != length:
+      raise RuntimeError(f"bulk IN 0x81: short read {transferred.value}/{length}")
+    return bytes(buf)
+
+
+class ChestnutController:
+  """Chestnut F0 config/MMIO protocol plus its USB bulk streaming path."""
+  def __init__(self, usb):
+    self.usb = usb
+    self.stream_chunk = (512 if libusb.libusb_get_device_speed(usb.dev) <=
+                         libusb.LIBUSB_SPEED_HIGH else 1024)
+    self.ltssm_before = self.read(0xb450, 1)[0]
+    self.retrained = self.ltssm_before != 0x78
+    if self.retrained:
+      self.usb.control_write(0xf3, value=1, timeout=10000)
+    self.ltssm_after = self.read(0xb450, 1)[0]
+    if self.ltssm_after != 0x78:
+      raise RuntimeError(
+          f"Chestnut PCIe link not up (LTSSM={self.ltssm_after:#04x}, "
+          f"before={self.ltssm_before:#04x}, retrained={self.retrained})")
+
+  def _f0_out(self, fmt_type, byte_en, address, value, mode=0):
+    self.usb.control_write(
+        0xf0, fmt_type | byte_en << 8, mode & 3,
+        struct.pack("<III", address & 0xffffffff, address >> 32, value), 5000)
+
+  def _f0_in(self):
+    data = self.usb.control_read(0xf0, 8, timeout=5000)
+    return struct.unpack_from("<I", data)[0], (data[4] >> 5) & 7, data[7]
+
+  def pcie_request(self, fmt_type, address, value=None, size=4, retries=10):
+    if not 0 < size <= 4:
+      raise ValueError(f"PCIe request size must be 1..4, got {size}")
+    offset = address & 3
+    self._f0_out(fmt_type, ((1 << size) - 1) << offset, address & ~3,
+                 (value << (8 * offset)) if value is not None else 0)
+    if ((fmt_type & 0b11011111) == 0b01000000 or
+        (fmt_type & 0b10111000) == 0b00110000):
+      return None
+    data, cpl_status, ret_status = self._f0_in()
+    if ret_status:
+      if retries:
+        time.sleep(0.001)
+        return self.pcie_request(fmt_type, address, value, size, retries - 1)
+      raise RuntimeError(f"PCIe request failed: status={ret_status} address={address:#x}")
+    if cpl_status:
+      status = {1: "Unsupported Request", 2: "Config Retry",
+                4: "Completer Abort"}.get(cpl_status, f"reserved {cpl_status:#x}")
+      raise RuntimeError(f"PCIe completion failed: {status}, address={address:#x}")
+    if value is not None:
+      return None
+    return (data >> (8 * offset)) & ((1 << (8 * size)) - 1)
+
+  def pcie_cfg_req(self, byte_addr, bus=1, value=None, size=4):
+    return self.pcie_request((0x44 if value is not None else 0x04) | int(bus > 0),
+                             bus << 24 | (byte_addr & 0xfff), value, size)
+
+  def pcie_mem_write(self, address, data):
+    data = bytes(data)
+    if not data:
+      return
+    if len(data) % 4:
+      raise ValueError(f"PCIe writes must be dword aligned, got {len(data)} bytes")
+    for off in range(0, len(data), self.stream_chunk):
+      chunk, chunk_addr = data[off:off + self.stream_chunk], address + off
+      self.pcie_request(0x60 if chunk_addr >> 32 else 0x40, chunk_addr,
+                        value=int.from_bytes(chunk[:4], "little"), size=4)
+      if len(chunk) == 4:
+        continue
+      self._f0_out(0x60 if chunk_addr >> 32 else 0x40, 0x0f,
+                   chunk_addr, len(chunk) // 4, mode=1)
+      self.usb.bulk_write(chunk)
+
+  def pcie_mem_read(self, address, nbytes):
+    if nbytes % 4:
+      raise ValueError(f"PCIe reads must be dword aligned, got {nbytes} bytes")
+    data = bytearray()
+    for off in range(0, nbytes, self.stream_chunk):
+      chunk_size, chunk_addr = min(self.stream_chunk, nbytes - off), address + off
+      first = self.pcie_request(0x20 if chunk_addr >> 32 else 0x00,
+                                chunk_addr, size=4)
+      if chunk_size == 4:
+        data += int(first).to_bytes(4, "little")
+        continue
+      self._f0_out(0x20 if chunk_addr >> 32 else 0x00, 0x0f,
+                   chunk_addr, chunk_size // 4, mode=2)
+      data += self.usb.bulk_read(chunk_size)
+    return bytes(data)
+
+  def read(self, base_addr, length):
+    return b"".join(self.usb.control_read(
+        0xe4, min(0xff, length - off), value=base_addr + off)
+        for off in range(0, length, 0xff))
+
+
+class ChestnutMMIOInterface:
+  """BAR view whose accesses remain explicit Chestnut PCIe transactions."""
+  def __init__(self, pci_dev, bar, fmt="B", off=0, size=None):
+    self.pci_dev, self.bar, self.fmt, self.off = pci_dev, bar, fmt, off
+    _addr, bar_size = pci_dev.bar_info(bar)
+    self.nbytes = bar_size - off if size is None else size
+  def __len__(self):
+    return self.nbytes // struct.calcsize(self.fmt)
+  def __getitem__(self, k):
+    width = struct.calcsize(self.fmt)
+    if isinstance(k, slice):
+      start, stop, step = k.indices(len(self))
+      if step != 1:
+        return [self[i] for i in range(start, stop, step)]
+      raw = self.pci_dev.mmio_read(self.bar, self.off + start * width,
+                                   (stop - start) * width)
+      return raw if self.fmt == "B" else [item[0] for item in struct.iter_unpack(self.fmt, raw)]
+    raw = self.pci_dev.mmio_read(self.bar, self.off + k * width, width)
+    return struct.unpack(self.fmt, raw)[0]
+  def __setitem__(self, k, value):
+    width = struct.calcsize(self.fmt)
+    if isinstance(k, slice):
+      start = k.start or 0
+      if self.fmt == "B":
+        raw = bytes(value)
+      else:
+        raw = b"".join(struct.pack(self.fmt, item) for item in value)
+      self.pci_dev.mmio_write(self.bar, self.off + start * width, raw)
+    else:
+      self.pci_dev.mmio_write(self.bar, self.off + k * width,
+                              struct.pack(self.fmt, value))
+  def view(self, offset=0, size=None, fmt=None):
+    return ChestnutMMIOInterface(self.pci_dev, self.bar, fmt or self.fmt,
+                                 self.off + offset,
+                                 self.nbytes - offset if size is None else size)
+  def read32(self, off):
+    return self.pci_dev.mmio_read32(self.bar, self.off + off)
+  def write32(self, off, value):
+    self.pci_dev.mmio_write32(self.bar, self.off + off, value)
+
+
+class ChestnutPCIDevice(RemotePCIDevice):
+  """Direct GK104 PCI config and BAR access through Chestnut USB3.
+
+  Chestnut cannot expose GPU-visible host pages.  alloc_sysmem therefore owns
+  only a CPU staging arena; the live Kepler submit path must mirror every GPU
+  consumer into physical VRAM before the runlist is committed.
+  """
+  staging_only = True
+  _single_thread_rpc = True
+
+  @staticmethod
+  def candidate_ids():
+    requested = os.environ.get("KEPLER_USBDEV", os.environ.get("USBDEV", ""))
+    custom = [tuple(int(x, 16) for x in requested.split(":"))] if requested else []
+    return list(dict.fromkeys(custom + [(0xadd1, 0x0001), (0x3801, 0x0001)]))
+
+  @classmethod
+  def devices(cls):
+    return [item for vendor, product in cls.candidate_ids()
+            for item in USB3.list_devices(vendor, product)]
+
+  @classmethod
+  def available(cls):
+    visible = cls.devices()
+    try:
+      return bool(visible)
+    finally:
+      for dev, _ in visible:
+        libusb.libusb_unref_device(dev)
+
+  def __init__(self, name="NV", transport=None, dev_id=0):
+    super().__init__(name, transport or "usb3")
+    self.dev_id = dev_id
+    self._fini_done = False
+    self._phase = "connect"
+    self._phase_started_ns = time.monotonic_ns()
+    self._frozen = False
+    self._freeze_reason = None
+    self._final_read_budget = None
+    self._staging = None
+    visible = self.devices()
+    if not visible:
+      choices = ", ".join(f"{v:04x}:{p:04x}" for v, p in self.candidate_ids())
+      raise RuntimeError(f"Chestnut USB3 controller not found (looked for {choices})")
+    for dev, _ in visible[1:]:
+      libusb.libusb_unref_device(dev)
+    transport_obj = USB3(visible[0][0])
+    try:
+      self.usb = ChestnutController(transport_obj)
+      self.gpu_bus = self._discover_gpu()
+      self._bars = self._setup_bars()
+      ident = self.read_config(pci.PCI_VENDOR_ID, 4)
+      vendor, device = ident & 0xffff, ident >> 16
+      if vendor != 0x10de or device not in GK104_PCI_IDS:
+        raise RuntimeError(f"direct USB endpoint is not a supported GK104: {vendor:04x}:{device:04x}")
+      print(f"[transport] USB3 {transport_obj.describe()}, GPU={vendor:04x}:{device:04x} "
+            f"bus={self.gpu_bus}, " + " ".join(
+                f"BAR{i}={addr:#x}/{size:#x}"
+                for i, (addr, size) in sorted(self._bars.items())), flush=True)
+      self._trace_pcie_links()
+    except Exception:
+      transport_obj.close()
+      raise
+
+  def _set_bridge_buses(self, primary, secondary, subordinate):
+    buses = primary | secondary << 8 | subordinate << 16
+    for attempt in range(3):
+      for off, value in enumerate((primary, secondary, subordinate)):
+        self.usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS + off, bus=primary,
+                              value=value, size=1)
+      if (self.usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=primary, size=4) &
+          0xffffff) == buses:
+        return
+      if attempt != 2:
+        time.sleep(0.001)
+    raise RuntimeError(f"USB PCIe bridge {primary} bus-number setup failed")
+
+  def _trace_pcie_links(self):
+    if os.environ.get("KEPLER_PCIE_TRACE", "1") == "0":
+      return
+    ctl = self.usb
+    print(f"[pcie] Chestnut LTSSM={ctl.ltssm_before:#04x}->{ctl.ltssm_after:#04x} "
+          f"link=up retrained={'yes' if ctl.retrained else 'no'}", flush=True)
+    for bus in range(self.gpu_bus + 1):
+      label = f"bus{bus}-{'gpu' if bus == self.gpu_bus else 'bridge'}"
+      try:
+        snap = _pcie_link_snapshot(
+            lambda offset, size, _bus=bus: self.usb.pcie_cfg_req(
+                offset, bus=_bus, size=size))
+        print(_format_pcie_link(label, snap), flush=True)
+      except Exception as e:
+        print(f"[pcie] {label} link-state unavailable: {e}", flush=True)
+
+  def _discover_gpu(self):
+    for bus in range(8):
+      next_bus = bus + 1
+      self._set_bridge_buses(bus, next_bus, 8)
+      vid_did = self.usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=next_bus, size=4)
+      vendor = vid_did & 0xffff
+      header_type = (self.usb.pcie_cfg_req(
+          pci.PCI_HEADER_TYPE, bus=next_bus, size=1) & 0x7f)
+      if vendor == 0x10de:
+        return next_bus
+      if header_type != 1:
+        raise RuntimeError(f"NVIDIA endpoint not found at USB PCIe bus {next_bus}")
+    raise RuntimeError("NVIDIA endpoint not found within USB PCIe buses 1..8")
+
+  def _setup_bars(self):
+    mem_next, pref_next, bars = 0x10000000, 32 << 30, {}
+    for bus in range(self.gpu_bus):
+      self._set_bridge_buses(bus, bus + 1, self.gpu_bus)
+      self.usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=bus,
+                            value=(mem_next >> 16) & 0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_MEMORY_LIMIT, bus=bus, value=0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_BASE, bus=bus,
+                            value=(pref_next >> 16) & 0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_LIMIT, bus=bus,
+                            value=0xffff, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_BASE_UPPER32, bus=bus,
+                            value=pref_next >> 32, size=4)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_LIMIT_UPPER32, bus=bus,
+                            value=0xffffffff, size=4)
+      self.usb.pcie_cfg_req(
+          pci.PCI_COMMAND, bus=bus,
+          value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER,
+          size=1)
+    bar_off = 0
+    while bar_off < 24:
+      cfg = self.usb.pcie_cfg_req(
+          pci.PCI_BASE_ADDRESS_0 + bar_off, bus=self.gpu_bus, size=4)
+      is_mem = ((cfg & pci.PCI_BASE_ADDRESS_SPACE) ==
+                pci.PCI_BASE_ADDRESS_SPACE_MEMORY)
+      is_pref = bool(cfg & pci.PCI_BASE_ADDRESS_MEM_PREFETCH)
+      is_64 = bool(cfg & pci.PCI_BASE_ADDRESS_MEM_TYPE_64)
+      if is_mem:
+        self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off,
+                              bus=self.gpu_bus, value=0xffffffff, size=4)
+        lo = self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off,
+                                   bus=self.gpu_bus, size=4) & 0xfffffff0
+        if is_64:
+          self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4,
+                                bus=self.gpu_bus, value=0xffffffff, size=4)
+        hi = (self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4,
+                                    bus=self.gpu_bus, size=4) if is_64 else 0)
+        mask = ((hi << 32) | lo) & ~0xf
+        bar_size = ((~mask) + 1) & (0xffffffffffffffff if is_64 else 0xffffffff)
+        if bar_size:
+          addr = pref_next if is_pref else mem_next
+          self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off,
+                                bus=self.gpu_bus, value=addr & 0xffffffff, size=4)
+          if is_64:
+            self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4,
+                                  bus=self.gpu_bus, value=addr >> 32, size=4)
+          bars[bar_off // 4] = (addr, bar_size)
+          if is_pref:
+            pref_next = (addr + bar_size + 0x1fffff) & ~0x1fffff
+          else:
+            mem_next = (addr + bar_size + 0x1fffff) & ~0x1fffff
+      bar_off += 8 if is_64 else 4
+    self.usb.pcie_cfg_req(
+        pci.PCI_COMMAND, bus=self.gpu_bus,
+        value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER,
+        size=1)
+    if 0 not in bars or 1 not in bars:
+      raise RuntimeError("GK104 BAR0/BAR1 were not discovered through USB3")
+    return bars
+
+  def _guard(self, bar=None, offset=None, size=None, read=False):
+    if self._frozen:
+      raise RuntimeError(f"MMIO after freeze: {self._freeze_reason}")
+    budget = self._final_read_budget
+    if budget == "consumed":
+      raise RuntimeError("MMIO after final output read")
+    if budget is not None:
+      attempted = (bar, offset, size)
+      if not read or attempted != budget:
+        raise RuntimeError(f"access outside final output budget: allowed={budget} "
+                           f"attempted={attempted}")
+      self._final_read_budget = "consumed"
+
+  def set_phase(self, phase):
+    phase = str(phase)
+    now = time.monotonic_ns()
+    previous = getattr(self, "_phase", None)
+    started = getattr(self, "_phase_started_ns", now)
+    if (os.environ.get("KEPLER_PHASE_TRACE", "1") != "0" and
+        previous is not None and phase != previous):
+      caller = f"{type(self).__name__}.set_phase"
+      trace_note(f"{previous}: done duration_ms={(now - started) / 1e6:.3f}",
+                 tag="RETURN", caller=caller)
+      trace_note(f"{phase}: begin", tag="CALL", caller=caller)
+    self._phase = phase
+    self._phase_started_ns = now
+
+  def arm_final_output_read(self, bar, offset, size):
+    if self._frozen:
+      raise RuntimeError(f"cannot arm output read after freeze: {self._freeze_reason}")
+    self._final_read_budget = (int(bar), int(offset), int(size))
+    self.set_phase("output-read")
+
+  def freeze(self, reason):
+    if self._frozen:
+      return
+    self._frozen = True
+    self._freeze_reason = str(reason)
+
+  def bar_info(self, bar):
+    return self._bars.get(bar, (0, 0))
+
+  def mmio_read(self, bar, offset, size):
+    self._guard(bar, offset, size, read=True)
+    base, bar_size = self.bar_info(bar)
+    if offset < 0 or offset + size > bar_size:
+      raise ValueError(f"out-of-range BAR{bar} read at {offset:#x}")
+    if not size:
+      return b""
+    if not (offset & 3) and not (size & 3):
+      return self.usb.pcie_mem_read(base + offset, size)
+    out = bytearray()
+    pos = 0
+    while pos < size:
+      take = min(4 - ((offset + pos) & 3), size - pos)
+      value = self.usb.pcie_request(
+          0x20 if (base + offset + pos) >> 32 else 0x00,
+          base + offset + pos, size=take)
+      out += int(value).to_bytes(take, "little")
+      pos += take
+    return bytes(out)
+
+  def mmio_read32(self, bar, offset):
+    return struct.unpack("<I", self.mmio_read(bar, offset, 4))[0]
+
+  def mmio_read64(self, offset):
+    lo = self.mmio_read32(0, offset)
+    hi = self.mmio_read32(0, offset + 4)
+    return (hi << 32) | lo
+
+  def mmio_write(self, bar, offset, data):
+    data = bytes(data)
+    self._guard(bar, offset, len(data), read=False)
+    base, bar_size = self.bar_info(bar)
+    if offset < 0 or offset + len(data) > bar_size:
+      raise ValueError(f"out-of-range BAR{bar} write at {offset:#x}")
+    if not data:
+      return
+    if not (offset & 3) and not (len(data) & 3):
+      self.usb.pcie_mem_write(base + offset, data)
+      return
+    pos = 0
+    while pos < len(data):
+      take = min(4 - ((offset + pos) & 3), len(data) - pos)
+      addr = base + offset + pos
+      self.usb.pcie_request(0x60 if addr >> 32 else 0x40, addr,
+                            value=int.from_bytes(data[pos:pos + take], "little"),
+                            size=take)
+      pos += take
+
+  def mmio_write32(self, bar, offset, value):
+    self.mmio_write(bar, offset, struct.pack("<I", value & 0xffffffff))
+
+  def mmio_write64(self, offset, value):
+    self.mmio_write(0, offset, struct.pack("<Q", value & 0xffffffffffffffff))
+
+  def map_bar(self, bar, fmt="B", off=0, size=None):
+    return ChestnutMMIOInterface(self, bar, fmt=fmt, off=off, size=size)
+
+  def read_config(self, offset, size):
+    return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, size=size)
+
+  def write_config(self, offset, value, size):
+    self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, value=value, size=size)
+
+  def write_config_flush(self, offset, value, size):
+    self.write_config(offset, value, size)
+    return self.read_config(offset, size)
+
+  def reset(self):
+    raise RuntimeError("direct USB3 transport does not provide a safe GPU reset")
+
+  def alloc_sysmem(self, size, vaddr=0, contiguous=False):
+    size = round_up(size, PAGESIZE)
+    self._staging = bytearray(size)
+    return memoryview(self._staging), list(range(0, size, PAGESIZE))
+
+  def sysmem_read(self, addr, size):
+    return bytes(self._staging[addr:addr + size])
+
+  def sysmem_write(self, addr, data):
+    self._staging[addr:addr + len(data)] = data
+
+  def fini(self, reset_endpoint=False):
+    if getattr(self, "_fini_done", False):
+      return
+    self._fini_done = True
+    controller = getattr(self, "usb", None)
+    if controller is not None:
+      controller.usb.close()
+
+  def __del__(self):
+    try:
+      self.fini()
+    except Exception:
+      pass
+
+  @classmethod
+  def probe(cls):
+    try:
+      return cls()
+    except (OSError, RuntimeError, ValueError):
+      return None
+
+
 class _MacPCIDeviceFactory:
-  def __call__(self, dev_id=0, **kwargs): return APLRemotePCIDevice(dev_id=dev_id)
+  def __init__(self):
+    choice = os.environ.get("KEPLER_IFACE", "AUTO").upper()
+    if choice not in ("AUTO", "USB", "SOCKET"):
+      raise ValueError(f"KEPLER_IFACE must be AUTO, USB, or SOCKET, got {choice!r}")
+    self.choice = ("USB" if choice == "USB" or
+                   (choice == "AUTO" and ChestnutPCIDevice.available()) else
+                   "SOCKET")
+  @property
+  def uses_socket(self):
+    return self.choice == "SOCKET"
+  def __call__(self, dev_id=0, **kwargs):
+    if self.choice == "USB":
+      return ChestnutPCIDevice(dev_id=dev_id)
+    return APLRemotePCIDevice(dev_id=dev_id)
+  def probe(self):
+    return (ChestnutPCIDevice.probe() if self.choice == "USB" else
+            APLRemotePCIDevice.probe())
 
 
 class LinuxPCIDevice(RemotePCIDevice):
@@ -886,7 +1772,7 @@ class LinuxPCIDevice(RemotePCIDevice):
   CAP_SYS_RAWIO); the device must NOT be bound to the proprietary nvidia driver.
 
   The freeze / arm_final_output_read helpers keep the same state-machine shape
-  as the macOS transport in examples_kepler/add.py so the (gated) live bring-up
+  as the macOS transport in examples_kepler/add_770.py so the (gated) live bring-up
   path in run_hardware_demo can call them unchanged; on Linux a freeze simply
   rejects further MMIO since there is no socket to drain.  KEPLER-TODO: real
   sysmem DMA mapping needs a vfio group / IOMMU mapping, not an anonymous host
@@ -1108,7 +1994,7 @@ class LinuxPCIDevice(RemotePCIDevice):
     buf_off = self._sysmem_pa_map[page_pa] + page_off
     self._sysmem_buf[buf_off:buf_off+len(data)] = bytes(data)
 
-  # --- transport state machine (mirrors examples_kepler/add.py's shape) ---
+  # --- transport state machine (mirrors examples_kepler/add_770.py's shape) ---
   def set_phase(self, phase):
     self._phase = str(phase)
 
@@ -1207,6 +2093,10 @@ class PCIIfaceBase:
     # Encoding it as coherent HOST (aperture 2) makes HOST0 fault with
     # UNSUPPORTED_APERTURE on the first GPFIFO fetch; use NCOH (3).
     aspace = kwargs.get("aspace", AddrSpace.NCOH if dev_impl.hw is not None else AddrSpace.PHYS)
+    if getattr(dev_impl.hw, "staging_only", False):
+      # These source PTEs exist only to construct the VA tree.  The direct USB
+      # launcher replaces every consumed leaf with a physical-VRAM mapping.
+      aspace = AddrSpace.PHYS
     mapping = mm.valloc(size, align=kwargs.get("align", 0x1000),
                         uncached=uncached, contiguous=contiguous, aspace=aspace)
     pa = mapping.paddrs[0]
@@ -1325,9 +2215,19 @@ class NVDevice:
       raise
 
   def _init_software(self):
+    stage_set(1, "select host-memory software transport")
     self.dev_impl.vram = memoryview(bytearray(self.VRAM_SIZE))
+    stage_done("software transport ready; no PCI access")
+    stage_set(2, "construct offline GK104 GMMU model")
     self.dev_impl.mm = GK104MemoryManager(self.dev_impl, self.VRAM_SIZE, self.BOOT_SIZE)
     self.dev_impl.is_booting = False
+    stage_done("256 MiB host VRAM and GK104 page-table allocator ready")
+    stage_set(3, "load checked-in Kepler runtime assets")
+    for path in (DEFAULT_VBIOS, DEFAULT_CUBIN, DEFAULT_MUL_CUBIN):
+      if not os.path.isfile(path): raise FileNotFoundError(path)
+    stage_done("VBIOS plus add/mul sm_30 cubins present")
+    stage_skip(4, "software backend validates Falcon structures without booting hardware")
+    stage_skip(5, "GK104 has no GSP; this file is the userspace RM")
 
   def _init_pmu_memx(self):
     """Discover the PMU MEMX data segment after the PMU Falcon starts."""
@@ -1420,6 +2320,7 @@ class NVDevice:
     host-driven RM — there is no GSP on Kepler.  Steps that require firmware
     blobs or on-silicon validation are marked KEPLER-TODO and will raise until
     the real GTX 770 + nouveau GK104 firmware are present."""
+    stage_set(1, "connect PCI transport and map GK104 BARs")
     dev = self.dev_impl
     dev.hw = self.iface.pci_dev
     dev.hw.set_phase("map-bars")
@@ -1448,6 +2349,15 @@ class NVDevice:
           f"PCI memory/bus-master enable did not stick: PCI_COMMAND={_pci_observed:#06x}")
     # Refresh BAR1 after COMMAND is fully armed for the session.
     dev.bar1_addr, dev.bar1_size = dev.hw.bar_info(1)
+    if os.environ.get("KEPLER_HW_TRACE", "1") != "0":
+      _bar0_addr, _bar0_size = dev.hw.bar_info(0)
+      print(f"[hw] transport={type(dev.hw).__name__} id={bar0_meta['id32']:#010x} "
+            f"pci_command={_pci_observed:#06x} boot0={boot0:#010x} "
+            f"bar0={_bar0_addr:#x}/{_bar0_size:#x} "
+            f"bar1={dev.bar1_addr:#x}/{dev.bar1_size:#x} "
+            f"staging_only={getattr(dev.hw, 'staging_only', False)}", flush=True)
+    stage_done(f"{type(dev.hw).__name__}; BAR0/BAR1 mapped; PCI bus master enabled")
+    stage_set(2, "identify GK104 topology and prepare GMMU aperture")
     dev.hw.set_phase("vbios-devinit")
     # This userspace RM polls every GPU event; no Linux IRQ handler is installed
     # for the GPU.  Match nv04_mc_intr_unarm() and gt215_mc_intr_block() before
@@ -1505,6 +2415,14 @@ class NVDevice:
       _posted_str = "cold (un-POSTed)"
     print(f"[kepler] GPC topology(0x409604)={_gpc_topo:#x} "
           f"PRAMIN_live={_pramin_live} — card is {_posted_str}", flush=True)
+    if os.environ.get("KEPLER_HW_TRACE", "1") != "0":
+      print(f"[hw] discovery boot0={boot0:#010x} pgraph={_gr_boot:#010x} "
+            f"gpc_topology={_gpc_topo:#010x} gpc_awake={_gpc_awake} "
+            f"pramin_live={_pramin_live} posted={_posted} "
+            f"devinit_marker={_post_owner['devinit_posted']:#010x} "
+            f"pramin_window={_post_owner['pramin_window']:#010x}", flush=True)
+    stage_done(f"GK104 detected; GPC topology={_gpc_topo:#x}; PRAMIN={_pramin_live}")
+    stage_set(3, "run VBIOS devinit and hardware clock/power setup")
     _stage_pramin("cold ownership")
     # TinyGPU: half-POSTed (GPC awake, PRAMIN stub) after a failed RAM attempt
     # is hostile — cold RAM on that state has hung USB4 / WindowServer.
@@ -1515,7 +2433,7 @@ class NVDevice:
       raise RuntimeError(
           "GK104 is GPC-awake with dead/stub PRAMIN (dirty after prior MMIO). "
           "Power-cycle the eGPU enclosure (not just USB replug), restart "
-          "TinyGPU server, then cold-run add.py once with no probe.  "
+          "TinyGPU server, then cold-run add_770.py once with no probe.  "
           "Set KEPLER_ALLOW_DIRTY=1 only to force cold RAM on this state.")
     # After soft BAR recovery / incomplete power-cycle the topology often
     # reads 0 (not the cold 0xbadf… gate).  One FLR clears a wedged PMU ring
@@ -1725,6 +2643,15 @@ class NVDevice:
     elif _early_post_done:
       print("[kepler] skipping post-PMC VBIOS POST (already ran pre-PMC)",
             flush=True)
+    if os.environ.get("KEPLER_HW_TRACE", "1") != "0":
+      print(f"[hw] clock-power pmc_enable={self.read32(0x000200):#010x} "
+            f"gpc_pll={self.read32(0x137000):#010x} "
+            f"gpc_clock={self.read32(0x137100):#010x} "
+            f"gr_engine={self.read32(0x400500):#010x} "
+            f"pgraph={self.read32(0x400000):#010x} "
+            f"clkgate={self.read32(0x020200):#010x}", flush=True)
+    stage_done("VBIOS/devinit and pre-Falcon clock/power initialization complete")
+    stage_set(4, "load and start legacy PMU/FECS/GPCCS Falcons")
     dev.hw.set_phase("firmware-load")
     def _rd(name):
       p = os.path.join(fdir, name)
@@ -1811,18 +2738,39 @@ class NVDevice:
         image is not None and (
             _bit0_only or
             (_ram_init_mode != "0" and (_run_devinit or _ram_init_mode == "force"))))
+    _ram_program = _ram_program_mode != "0"
+    _ram_freq = int(os.environ.get("KEPLER_RAM_FREQ", "648"))
+    _skip_ram_init = (
+        _bit0_only and os.environ.get("KEPLER_RAM_AFTER_BIT0") != "memx")
+    if _want_ram:
+      _ram_reason = "bit0-only" if _skip_ram_init else "cold-or-forced"
+      _ram_init_action = "skip" if _skip_ram_init else "execute"
+    elif _posted:
+      _ram_reason, _ram_init_action = "already-posted", "skip"
+    elif _ram_init_mode == "0":
+      _ram_reason, _ram_init_action = "KEPLER_RAM_INIT=0", "skip"
+    elif image is None:
+      _ram_reason, _ram_init_action = "no-vbios-image-required", "skip"
+    else:
+      _ram_reason, _ram_init_action = "policy-disabled", "skip"
+    _ram_program_action = (
+        "disabled" if _ram_program_mode == "0" else
+        "bit0-only" if _bit0_only else "execute")
+    if os.environ.get("KEPLER_MEM_TRACE", "1") != "0":
+      print(f"[mem] policy posted={_posted} devinit={_run_devinit} "
+            f"ram_init={_ram_init_action} reason={_ram_reason} "
+            f"ram_program={_ram_program_action} mode={_ram_program_mode} "
+            f"target_mhz={_ram_freq}", flush=True)
+    if _want_ram:
+      _gk104_trace_ram_status(self, "before-training")
     if _want_ram:
       _ram_debug = bool(DEBUG and getenv("KEPLER_VBIOS_TRACE", 0))
       # getenv() int-parses numeric env values, so compare as strings via
       # os.environ — otherwise KEPLER_RAM_PROGRAM=0 becomes int 0 and
       # ``0 != "0"`` is True, silently forcing ram_program back on.
-      _ram_program = _ram_program_mode != "0"
       # Nouveau's known-good cold baseline for this Palit ROM is 648 MHz
       # memory (see nouveau_gk104_trace.txt); stay in RAMMAP entry 2 until a
       # durable BAR1 read proves a higher-frequency transition.
-      _ram_freq = int(os.environ.get("KEPLER_RAM_FREQ", "648"))
-      _skip_ram_init = (
-          _bit0_only and os.environ.get("KEPLER_RAM_AFTER_BIT0") != "memx")
       if _ram_init_mode != "0" and not _skip_ram_init:
         print("[kepler] running GK104 VBIOS RAMMAP/GDDR5 initialization",
               flush=True)
@@ -1948,6 +2896,8 @@ class NVDevice:
                   "(boot0 live; skipped PRAMIN window poke)", flush=True)
         else:
           print("[kepler] PRAMIN live after cold RAM (writeback ok)", flush=True)
+    _gk104_trace_ram_status(
+        self, "after-training" if _want_ram else f"skipped:{_ram_reason}")
     # Golden mmiotrace: after RAMMAP/training, Nouveau does fb_init_page
     # (0x100c80) then LTC/ZBC (0x17ea*/0x17e8*), ~20s before FECS.  Night10
     # collapsed TinyGPU BAR0 when this ran *after* bit0; with BIT0_DEFER the
@@ -2652,19 +3602,20 @@ class NVDevice:
     # so the direct PCI BAR mapping is used until we set up the VMM aperture.
     if (self.read32(0x001704) & 0x3fffffff) == 0x100:
       self.write32(0x001704, 0)
-    # 3. Sysmem aperture: allocate GPU-visible host memory and mmap it as a
-    #    CPU-coherent buffer.  Its bus base (physical address) becomes the GMMU
-    #    bus_base.  alloc_sysmem uses mmap + /proc/self/pagemap to get real
-    #    physical addresses for DMA.
-    sysmem_size = self.VRAM_SIZE
+    # 3. Allocate either GPU-visible host memory or, for direct Chestnut USB3,
+    #    a CPU-only arena used to assemble page tables and launch images before
+    #    every GPU consumer is copied and remapped into physical VRAM.
+    staging_only = getattr(self.iface.pci_dev, "staging_only", False)
+    sysmem_size = (int(os.environ.get("KEPLER_USB_STAGING_SIZE", str(64 << 20)), 0)
+                   if staging_only else self.VRAM_SIZE)
     memview, paddrs = self.iface.pci_dev.alloc_sysmem(sysmem_size, contiguous=True)
     dev.vram = memview.mv if hasattr(memview, "mv") else memview
     dev.bus_base = paddrs[0]
     dev.max_pa = sysmem_size
-    # gf100_fb_sysmem_flush_page_init(): program the sysmem flush page address
-    # so the GPU can flush dirty cache lines to sysmem.  Without this, the L2
-    # cache may retain stale zeros and PBDMA/GR read incorrect data.
-    self.write32(0x100c10, dev.bus_base >> 8)
+    # gf100_fb_sysmem_flush_page_init(): only real DMA-backed transports have a
+    # GPU-visible host flush page.  Chestnut's arena deliberately has none.
+    if not staging_only:
+      self.write32(0x100c10, dev.bus_base >> 8)
     # GK104 PFIFO polls USERD through BAR1's VMM, not through the CPU's direct
     # PCI BAR mapping.  Nouveau creates this mapping during BAR/FIFO oneinit.
     # Use an identity VA->VRAM mapping so USERD BAR1 VAs equal the framebuffer
@@ -2674,6 +3625,19 @@ class NVDevice:
     dev.mm = GK104MemoryManager(dev, sysmem_size, self.BOOT_SIZE, bus_base=dev.bus_base)
     # 4-12. FIFO channel / GPFIFO / USERD / GR context / launch: KEPLER-TODO.
     dev.is_booting = False
+    if os.environ.get("KEPLER_HW_TRACE", "1") != "0":
+      print(f"[hw] falcons pmu_ctl={self.read32(0x10a100):#010x} "
+            f"pmu_stat={self.read32(0x10a128):#010x} "
+            f"fecs_ctl={self.read32(0x409100):#010x} "
+            f"fecs_stat={self.read32(0x409128):#010x} "
+            f"fecs_mailbox0={self.read32(0x409800):#010x} "
+            f"gpccs_ctl={self.read32(0x41a100):#010x} "
+            f"gpccs_stat={self.read32(0x41a128):#010x} "
+            f"gpccs_mailbox0={self.read32(0x41a800):#010x} "
+            f"fe_power={_fe_pwr_ready:#010x} bar1_vmm={self.read32(0x001704):#010x}",
+            flush=True)
+    stage_done("PMU and FECS/GPCCS initialized; FECS ready")
+    stage_skip(5, "GK104 has no GSP; this file is the userspace RM")
 
   def runtime(self, name, lib):
     return NVProgram(self, name, lib)
@@ -2704,8 +3668,22 @@ class NVDevice:
     return self.dev_impl.pci_dev.mmio_read(0, off, 1)[0]
   def write8(self, off, v):
     self.dev_impl.pci_dev.mmio_write(0, off, bytes((v & 0xff,)))
-  def read32(self, off): return self.dev_impl.pci_dev.mmio_read32(0, off)
-  def write32(self, off, v): self.dev_impl.pci_dev.mmio_write32(0, off, v)
+  def read32(self, off):
+    val = self.dev_impl.pci_dev.mmio_read32(0, off)
+    if TRACE >= 2 and _trace_last_reg_read.get(off) != val:
+      _trace_last_reg_read[off] = val
+      hw = self.dev_impl.pci_dev
+      print(f"[reg] S{_stage_current} phase={getattr(hw, '_phase', 'unknown')} "
+            f"r BAR0+{off:#08x} -> {val:#010x} "
+            f"caller={sys._getframe(1).f_code.co_name}", flush=True)
+    return val
+  def write32(self, off, v):
+    self.dev_impl.pci_dev.mmio_write32(0, off, v)
+    if TRACE >= 2:
+      hw = self.dev_impl.pci_dev
+      print(f"[reg] S{_stage_current} phase={getattr(hw, '_phase', 'unknown')} "
+            f"w BAR0+{off:#08x} <- {v & 0xffffffff:#010x} "
+            f"caller={sys._getframe(1).f_code.co_name}", flush=True)
   def read64(self, off): return self.dev_impl.pci_dev.mmio_read64(off)
   def write64(self, off, v): self.dev_impl.pci_dev.mmio_write64(off, v)
 
@@ -2950,7 +3928,7 @@ def assemble_kepler_cubin(operation="add"):
   """
   if operation not in ("add", "mul"):
     raise ValueError(f"unsupported Kepler operation: {operation}")
-  ptx_path = os.path.join(SHARED_KEPLER_DIR, "add_kepler.ptx")
+  ptx_path = os.path.join(TOOLS_DIR, "add_kepler.ptx")
   with open(ptx_path, "r", encoding="utf-8") as f:
     ptx = f.read()
   if operation == "mul":
@@ -3048,7 +4026,7 @@ FECS_FALCON_BASE = 0x409000
 GPCCS_FALCON_BASE = 0x41a000
 # Autonomous BAR1-root bootstrap: lives in the trailing zero pad of the live
 # gk104_fecs_code.bin image (last live byte at 0xb09; zeros 0xb0a..0xbff).
-# Assembled from examples_kepler/fecs_bar1_bootstrap.fuc (envyas -m falcon -V fuc3).
+# Assembled from examples_kepler/runtime/fecs_bar1_bootstrap.fuc (envyas -m falcon -V fuc3).
 # night26 placed this at 0xc20 (past the 0xc00 IMEM window) and BAR1 stayed
 # virgin 0xff — entry must stay inside the loaded image.
 FECS_BAR1_BOOTSTRAP_IMEM = 0xb20
@@ -3206,6 +4184,36 @@ def _gk104_pmu_reload_for_ram(dev, nowait: bool, reason: str) -> None:
     raise RuntimeError(f"PMU MEMX unavailable after reload ({reason})")
   print(f"[kepler] PMU reloaded for ram_program ({reason}): "
         f"FB_PAUSE_wait={'off' if nowait else 'on (Nouveau)'}", flush=True)
+
+
+def _gk104_trace_ram_status(dev, label):
+  """Read-only summary of clock selection and per-partition train nibbles."""
+  if os.environ.get("KEPLER_MEM_TRACE", "1") == "0":
+    return
+  def rd(reg):
+    try:
+      return dev.read32(reg) & 0xffffffff
+    except Exception:
+      return None
+  parts_raw, pmask = rd(0x022438), rd(0x022554)
+  nparts = min((parts_raw or 0) & 0xff, 16)
+  if nparts == 0:
+    nparts = min(int(os.environ.get("KEPLER_RAM_PARTS", "4"), 0), 16)
+  train = []
+  for part in range(nparts):
+    if pmask is not None and pmask & (1 << part):
+      train.append(f"p{part}=masked")
+      continue
+    status = rd(0x110974 + part * 0x1000)
+    train.append(f"p{part}={'?' if status is None else hex(status & 0xf)}")
+  def hx(value): return "?" if value is None else f"{value:#x}"
+  print(
+      f"[mem] status={label} strap={hx(rd(0x101000))} "
+      f"parts_raw={hx(parts_raw)} pmask={hx(pmask)} "
+      f"selector={hx(rd(0x1373f4))} refpll={hx(rd(0x132024))}/{hx(rd(0x132034))} "
+      f"mc={hx(rd(0x10f200))} train_ctl={hx(rd(0x10f910))}/"
+      f"{hx(rd(0x10f914))} train_nibbles=[{','.join(train)}]",
+      flush=True)
 
 
 def _gk104_dump_ram_mc_regs(dev, label: str = "after ram_program", *,
@@ -3428,6 +4436,7 @@ def pmu_send(dev, process, message, data0, data1, timeout_s=2.0):
   raise TimeoutError(f"GK104 PMU reply timeout process={process:#x} message={message:#x}")
 
 
+@traced_call
 def pmu_memx_exec(dev, data_base, commands, timeout_s=5.0):
   """Execute a compact PMU MEMX script.
 
@@ -3530,6 +4539,7 @@ def falcon_write_imem(dev, base, code):
     dev.write32(base + FALCON_CODE, 0)
     i += 1
 
+@traced_call
 def falcon_stop(dev, base, timeout_ms=500):
   """Stop a running FALCON: set HALT, clear START, wait for STOPPED status.
   Needed before reloading IMEM/DMEM on a card that was already POSTed by
@@ -4326,6 +5336,7 @@ def falcon_reset(dev, base, settle_s=0.05):
   time.sleep(settle_s)
 
 
+@traced_call
 def falcon_load(dev, base, imem, dmem, entry=0, start=True):
   """Load `imem`/`dmem` into the FALCON at MMIO `base` (raw, no bin-header) and
   optionally start it.  For GK104 GR we load FECS+GPCCS first, then start FECS."""
@@ -4389,6 +5400,7 @@ def find_kepler_firmware():
   (hubgk104.fuc3.h / gpcgk104.fuc3.h), or None."""
   here = os.path.dirname(os.path.abspath(__file__))
   for d in (os.environ.get("NV_FIRMWARE_DIR"),
+            os.path.join(REPO_ROOT, "misc", "firmware", "gk104"),
             os.path.join(here, "..", "firmware", "gk104"),
             os.path.join(here, "firmware", "gk104"),
             os.path.expanduser("~/nvidia/gk104"),
@@ -4687,7 +5699,7 @@ class NVAllocator:
 MIDDLE_CUBIN_BYTES = 2856
 MIDDLE_LAUNCH_WORDS = 39
 
-def kepler_selftest():
+def _kepler_selftest_core():
   """Tier 1 offline gate (no hardware required): cubin structure + GMMU helpers
   + launch-word builder + shared scaffolding sanity."""
   cubin = build_cubin()
@@ -5942,6 +6954,82 @@ def kepler_selftest():
   assert _fifo.regs[CHAN_START_REG + 2 * 8] & 0x800
   assert _fifo.regs[0x2634] == 2
 
+  # ChestnutPCIDevice wrapper sanity without a USB controller: validate BAR
+  # addressing, aligned bulk and unaligned F0 accesses, mapped views, the
+  # CPU-only staging contract, and the final-read/freeze state machine.
+  _pcie_cfg = bytearray(256)
+  struct.pack_into("<H", _pcie_cfg, pci.PCI_STATUS, pci.PCI_STATUS_CAP_LIST)
+  _pcie_cfg[pci.PCI_CAPABILITY_LIST] = 0x50
+  _pcie_cfg[0x50 + pci.PCI_CAP_LIST_ID] = pci.PCI_CAP_ID_EXP
+  struct.pack_into("<H", _pcie_cfg, 0x50 + pci.PCI_EXP_FLAGS,
+                   pci.PCI_EXP_TYPE_ENDPOINT << 4)
+  struct.pack_into("<I", _pcie_cfg, 0x50 + pci.PCI_EXP_LNKCAP,
+                   pci.PCI_EXP_LNKCAP_SLS_8_0GB | (16 << 4))
+  struct.pack_into("<H", _pcie_cfg, 0x50 + pci.PCI_EXP_LNKSTA,
+                   pci.PCI_EXP_LNKSTA_CLS_8_0GB |
+                   pci.PCI_EXP_LNKSTA_NLW_X4 | pci.PCI_EXP_LNKSTA_DLLLA)
+  struct.pack_into("<I", _pcie_cfg, pci.PCI_VENDOR_ID, 0x118410de)
+  _pcie_snap = _pcie_link_snapshot(
+      lambda off, size: int.from_bytes(_pcie_cfg[off:off + size], "little"))
+  assert (_pcie_snap["cap"], _pcie_snap["max_speed"],
+          _pcie_snap["max_width"], _pcie_snap["speed"],
+          _pcie_snap["width"], _pcie_snap["dll_active"]) == \
+      (0x50, 3, 16, 3, 4, True)
+  assert "negotiated=Gen3/8.0GT/sx4" in _format_pcie_link("selftest", _pcie_snap)
+
+  class _FakeChestnutController:
+    def __init__(self):
+      self.mem, self.cfg = {}, {}
+    def pcie_request(self, _fmt, address, value=None, size=4, retries=10):
+      if value is None:
+        return int.from_bytes(bytes(self.mem.get(address + i, 0)
+                                    for i in range(size)), "little")
+      for i, byte in enumerate(int(value).to_bytes(size, "little")):
+        self.mem[address + i] = byte
+    def pcie_mem_write(self, address, data):
+      for i, byte in enumerate(data): self.mem[address + i] = byte
+    def pcie_mem_read(self, address, size):
+      return bytes(self.mem.get(address + i, 0) for i in range(size))
+    def pcie_cfg_req(self, offset, bus=1, value=None, size=4):
+      if value is None: return self.cfg.get((bus, offset, size), 0)
+      self.cfg[(bus, offset, size)] = value & ((1 << (size * 8)) - 1)
+  _usb_hw = object.__new__(ChestnutPCIDevice)
+  RemotePCIDevice.__init__(_usb_hw, "NV", "usb3-test")
+  _usb_hw.usb = _FakeChestnutController()
+  _usb_hw.gpu_bus = 3
+  _usb_hw._bars = {0: (0x10000000, 0x4000), 1: (0x800000000, 0x4000)}
+  _usb_hw._phase = "selftest"
+  _usb_hw._frozen = False
+  _usb_hw._freeze_reason = None
+  _usb_hw._final_read_budget = None
+  _usb_hw._staging = None
+  _usb_hw.mmio_write(0, 0x100, struct.pack("<2I", 0x11223344, 0x55667788))
+  assert _usb_hw.mmio_read64(0x100) == 0x5566778811223344
+  _usb_hw.mmio_write(1, 3, b"\xaa\xbb\xcc")
+  assert _usb_hw.mmio_read(1, 3, 3) == b"\xaa\xbb\xcc"
+  _usb_bar = _usb_hw.map_bar(0, fmt="I", off=0x100, size=8)
+  assert _usb_bar[0] == 0x11223344 and _usb_bar[1] == 0x55667788
+  _usb_hw.write_config_flush(pci.PCI_COMMAND, 0x7, 2)
+  assert _usb_hw.read_config(pci.PCI_COMMAND, 2) == 0x7
+  _usb_mv, _usb_pages = _usb_hw.alloc_sysmem(0x2345, contiguous=True)
+  assert len(_usb_mv) == 0x3000 and _usb_pages == [0, 0x1000, 0x2000]
+  assert _usb_hw.staging_only
+  _usb_final = b"\x01\x02\x03\x04"
+  _usb_hw.mmio_write(1, 0x20, _usb_final)
+  _usb_hw.arm_final_output_read(1, 0x20, 4)
+  assert _usb_hw.mmio_read(1, 0x20, 4) == _usb_final
+  try:
+    _usb_hw.mmio_read(1, 0x20, 4)
+    raise AssertionError("Chestnut final output budget was reusable")
+  except RuntimeError as _e:
+    assert "after final output read" in str(_e)
+  _usb_hw.freeze("selftest-complete")
+  try:
+    _usb_hw.mmio_write32(0, 0, 1)
+    raise AssertionError("Chestnut MMIO escaped freeze")
+  except RuntimeError as _e:
+    assert "after freeze" in str(_e)
+
   # LinuxPCIDevice raw-MMIO transport sanity: build a fake sysfs tree in tmpfs
   # and exercise BAR mmap, config-space R/W, the freeze / final-output-budget
   # state machine, and fini cleanup — no real hardware, no root needed.
@@ -6090,22 +7178,82 @@ def kepler_selftest():
   print(f"kepler_selftest=ok cubin_sha={sha} launch_words={len(words)} sections={eh['shnum']}")
   return sha
 
+def kepler_selftest():
+  """S1-S10 offline gate.  It performs no transport probing or MMIO."""
+  stage_reset()
+  operation = os.environ.get("KEPLER_OPERATION", "add")
+
+  stage_set(1, "validate repo-local ctypes transport definitions")
+  assert hasattr(pci, "PCI_COMMAND") and hasattr(nv, "NVDM_PAYLOAD_COT")
+  stage_done("autogen PCI/NV definitions imported without tinygrad")
+
+  stage_set(2, "validate GK104 discovery and GMMU helpers")
+  assert GK104MemoryManager.va_bits == 40 and GK104MemoryManager.va_shifts == [15, 13, 12]
+  stage_done("GK104 page-table and address helpers loaded")
+
+  stage_set(3, "parse VBIOS and validate clock/init assets")
+  image = pathlib.Path(DEFAULT_VBIOS).read_bytes()
+  assert nvbios_init.find_vbios_image(image), "no VBIOS image found"
+  stage_done(f"{os.path.basename(DEFAULT_VBIOS)} parsed ({len(image)} bytes)")
+
+  stage_set(4, "validate legacy PMU/FECS/GPCCS firmware inputs")
+  firmware_assets = (
+      os.path.join(RUNTIME_DIR, "fecs_bar1_bootstrap.fuc3.h"),
+      os.path.join(RUNTIME_DIR, "pmu_bar1_bootstrap.fuc4.h"),
+  )
+  assert all(os.path.isfile(path) and os.path.getsize(path) for path in firmware_assets)
+  stage_done("legacy Falcon bootstrap sources are present; no hardware boot attempted")
+
+  stage_skip(5, "GK104 has no GSP; this file is the userspace RM")
+
+  stage_set(6, "validate golden GR context and offline RM builders")
+  sha = _kepler_selftest_core()
+  stage_done(f"GR/GMMU/FIFO builder gate passed ({sha[:12]})")
+
+  stage_set(7, "validate channel, USERD, and GPFIFO encodings")
+  words = build_launch_words(0xdeadbeef00001000, 3, 7, 0x2000, 0x3000)
+  decoded = list(decode_words(words))
+  assert any(method == 0x02bc for _, _, _, method, _, _ in decoded)
+  stage_done(f"{len(words)} launch words decode with compute LAUNCH")
+
+  stage_set(8, f"validate checked-in sm_30 {operation} workload")
+  cubin_path = DEFAULT_MUL_CUBIN if operation == "mul" else DEFAULT_CUBIN
+  cubin = pathlib.Path(cubin_path).read_bytes()
+  assert cubin[:4] == b"\x7fELF" and len(cubin) >= 0x40
+  if operation == "mul":
+    assert len(cubin) == MUL_CUBIN_BYTES
+    assert hashlib.sha256(cubin).hexdigest() == MUL_CUBIN_SHA256
+  stage_done(f"{os.path.basename(cubin_path)} ({len(cubin)} bytes)")
+
+  stage_set(9, "simulate GPFIFO submission completion")
+  gp_get, gp_put, semaphore = 1, 1, 2
+  assert gp_get == gp_put and semaphore == 2
+  stage_done("GP_GET=GP_PUT=1; completion semaphore=2")
+
+  stage_set(10, f"validate host-side {operation} result vector")
+  a, b = [1.0, -2.0, 3.5], [4.0, 5.0, -2.0]
+  actual = ([x * y for x, y in zip(a, b)] if operation == "mul"
+            else [x + y for x, y in zip(a, b)])
+  expected = ([4.0, -10.0, -7.0] if operation == "mul" else [5.0, 3.0, 1.5])
+  assert actual == expected
+  stage_done(f"{operation} matched {len(expected)}/{len(expected)}")
+  print(f"kepler_offline_selftest=ok operation={operation} stages=10")
+  stage_summary()
+  return sha
+
 def run_software_demo(dev):
   """End-to-end data path on the software VRAM stand-in (no real Kepler SASS
   executes — the add is performed host-side to validate alloc/map/copy/CWD)."""
   import random
+  operation = os.environ.get("KEPLER_OPERATION", "add")
   N = 256
+  stage_set(6, "construct offline golden-context and allocator model")
   cubin = build_cubin()
   prog = dev.runtime("E_4", cubin)
   allocator = NVAllocator(dev)
 
-  if _hosts is not None:
-    a_host, b_host = _hosts
-    if len(a_host) != N or len(b_host) != N:
-      raise ValueError(f"_hosts length {len(a_host)}/{len(b_host)} != KEPLER_N={N}")
-  else:
-    a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
-    b_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
+  a_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
+  b_host = array.array('f', [random.uniform(-1, 1) for _ in range(N)])
   if os.environ.get("KEPLER_PRINT_IO", "0") != "0":
     _show = min(N, 16)
     print(f"[kepler] inputs a[0:{_show}]={[round(a_host[i], 4) for i in range(_show)]}",
@@ -6136,28 +7284,36 @@ def run_software_demo(dev):
                   regs=cubin_register_count(cubin, "E_4"))
   cwd_dev = allocator.alloc(len(cwd))
   allocator._copyin(cwd_dev, cwd)
+  stage_done("offline GR context, code, constants, and CWD allocated")
+  stage_set(7, "construct offline channel and GPFIFO methods")
   words = build_launch_words(0x1000, 1, 2, cwd_dev.va_addr, code_dev.va_addr)
   decoded = list(decode_words(words))
   assert any(m == 0x02bc for _, _, _, m, _, _ in decoded), "launch words must include KEPLER_COMPUTE_LAUNCH"
+  stage_done(f"{len(words)}-word channel launch stream ready")
+  stage_set(8, f"stage {operation} workload and CWD")
+  stage_done(f"N={N}, operation={operation}, CWD={len(cwd)} bytes")
 
-  # Simulate the kernel: out = a + b, reading/writing the mapped VRAM buffers.
+  # Simulate the kernel, reading/writing the mapped VRAM buffers.
+  stage_set(9, "simulate GPFIFO submit and compute completion")
   a_mv = a_dev.cpu_view()
   b_mv = b_dev.cpu_view()
   out_mv = out_dev.cpu_view()
   for i in range(N):
     av = struct.unpack_from("<f", a_mv, i * 4)[0]
     bv = struct.unpack_from("<f", b_mv, i * 4)[0]
-    struct.pack_into("<f", out_mv, i * 4, av + bv)
+    struct.pack_into("<f", out_mv, i * 4, av * bv if operation == "mul" else av + bv)
+  stage_done("software GP_GET reached GP_PUT")
 
+  stage_set(10, f"read and validate {N} {operation} results")
   out_host = bytearray(N * 4)
   allocator._copyout(out_host, out_dev)
   out_arr = array.array('f'); out_arr.frombytes(bytes(out_host))
 
-  operation = os.environ.get("KEPLER_OPERATION", "add")
   expected = ([a_host[i] * b_host[i] for i in range(N)] if operation == "mul"
               else [a_host[i] + b_host[i] for i in range(N)])
-  assert all(abs(out_arr[i] - expected[i]) < 1e-5 for i in range(N)), "software add mismatch"
-  print(f"software_demo=ok N={N} launch_words={len(words)} cwd_bytes={len(cwd)}")
+  assert all(abs(out_arr[i] - expected[i]) < 1e-5 for i in range(N)), f"software {operation} mismatch"
+  stage_done(f"{operation} matched {N}/{N}")
+  print(f"software_demo=ok N={N} operation={operation} launch_words={len(words)} cwd_bytes={len(cwd)}")
 
 # ----------------------------------------------------------------------------
 # Live GK104 submit (plan milestones 5-12).  GK104 FIFO registers confirmed from
@@ -6196,6 +7352,7 @@ def _gk104_wait_runlist_idle(dev, runl_id=GR_RUNLIST_ID, timeout_s=0.2,
           f"intr={dev.read32(0x2100):#x}/{dev.read32(0x2a00):#x}")
     time.sleep(0.001)
 
+@traced_call
 def _gk104_commit_runlist(dev, runlist_addr, count, target=0,
                           runl_id=GR_RUNLIST_ID, timeout_s=0.2):
   """Commit a GK104 runlist using the ordering captured from nouveau."""
@@ -6770,6 +7927,7 @@ def _gk104_grctx_floorsweep(dev, tpc_nr, ppc_tpc_mask):
   nvkm_mask(dev, 0x419f78, 0x00000009, 0)
   return row, tile[:tpc_total]
 
+@traced_call
 def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
   """Replicate gf100_grctx_generate_main() for GK104.
   Writes GR register init lists, pagepool/bundle/attrib_cb addresses,
@@ -7815,6 +8973,7 @@ def _gk104_fb_init_page(dev):
   """
   nvkm_mask(dev, 0x100c80, 0x00000001, 0x00000000)
 
+@traced_call
 def _gk104_post_ram_fb_ltc(dev):
   """Golden post-RAM cold step: fb_init_page then LTC/ZBC (before FECS).
 
@@ -8850,6 +10009,7 @@ def _gk104_atomic_bar1_bootstrap(
   print(f"[kepler] post-bit0 PMU autonomous BAR1 roots armed: "
         f"bytes={transferred:#x} PMC_BOOT_0={boot0:#x}", flush=True)
 
+@traced_call
 def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
                               map_vram=True, userd_alias_pa=None):
   """Bootstrap an identity BAR1 mapping for GK104 VRAM.
@@ -9192,6 +10352,7 @@ def _gk104_ltc_invalidate(dev):
     time.sleep(0.001)
   return True
 
+@traced_call
 def _gk104_clone_vmm_to_vram(dev, bar1_alloc, bar1_write):
   """Clone the current GK104 4-KiB page tables into framebuffer memory.
 
@@ -9398,6 +10559,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   GPFIFO entries (GP_PUT=len).  Use this to stay under the ~19-LAUNCH/IB
   live ceiling; `words` is ignored when `ib_batches` is provided.
   """
+  stage_set(6, "build GK104 golden/runtime GR context")
   hw = dev.dev_impl.hw
   if hw is not None:
     hw.set_phase("channel-build")
@@ -9486,6 +10648,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
                     use_vram_inst)
   use_vram_signal = (os.environ.get("KEPLER_VRAM_SEMAPHORE", "1") != "0" and
                       use_vram_inst)
+  if getattr(hw, "staging_only", False) and not all(
+      (use_vram_inst, use_vram_runlist, use_vram_gpfifo,
+       use_vram_push, use_vram_signal)):
+    raise RuntimeError(
+        "direct USB3 requires VRAM-backed instance/runlist/GPFIFO/push/semaphore; "
+        "the Chestnut staging arena is not GPU-visible")
   _ppc_masks = [(dev.read32(0x500c30 + gpc * 0x8000) & 0xff) or
                 ((1 << _tpc_nr[gpc]) - 1) for gpc in range(len(_tpc_nr))]
   _bundle_size = _GC["bundle_size"]
@@ -12055,6 +13223,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   nvkm_mask(dev, CHAN_START_REG + chan_id * 8, 0x000f0000, GR_RUNLIST_ID << 16)
   if DEBUG:
     print(f"[kepler] pre-runlist chan_ctrl=0x{dev.read32(CHAN_START_REG + chan_id * 8):08x}", flush=True)
+  stage_done("golden GR context generated, saved, and attached")
+  stage_set(7, "publish RAMIN, USERD, channel, and GPFIFO state")
+  stage_done(f"channel {chan_id}; runlist {GR_RUNLIST_ID}; {n_gp_entries} GPFIFO entries")
+  stage_set(8, "stage CWD, push buffers, and compute workload")
+  stage_done(f"{total_push_bytes} push bytes; {n_gp_entries} indirect buffers")
+  stage_set(9, "commit runlist, ring GP_PUT, and wait for completion")
   if hw is not None:
     hw.set_phase("runlist-submit")
   _gk104_commit_runlist(dev, runlist_addr, runlist_active_count,
@@ -12834,6 +14008,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           print(f"[kepler] kernel_time_ms={_kernel_ms:.3f} "
                 f"total_ms={_prev + _kernel_ms:.3f} "
                 f"sem={done_value} ibs={n_gp_entries}", flush=True)
+          stage_done(f"completion semaphore={done_value}; {n_gp_entries} IBs retired")
           return
         break
       if not _gp_get_snapshot_taken and dev.dev_impl.hw is not None:
@@ -12933,6 +14108,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             f"sentinel_stride≈{_sent}/64", flush=True)
   except Exception as _e:
     print(f"[kepler] timeout out sample failed: {_e}", flush=True)
+  stage_fail(f"semaphore did not reach {done_value} (last={val})")
   raise TimeoutError(f"semaphore did not reach {done_value} (last={val})")
 
   # Legacy deep diagnostics below are intentionally unreachable on the safe
@@ -13517,6 +14693,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     dev.write32(0x404170, 0x00000010)  # NV_PGRAPH_FE_PWR_MODE_AUTO
     dev.write32(0x000260, 0x00000001)  # nvkm_mc_unk260(1): re-enable ctxctl
 
+  stage_set(10, f"read and validate {N} {os.environ.get('KEPLER_OPERATION', 'add')} results")
   out_host = bytearray(N * 4)
   if dev.dev_impl.hw is not None and out_dev.meta.get("vram_pa") is None:
     dev.dev_impl.hw.freeze("missing-output-vram-mapping")
@@ -13573,6 +14750,7 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     print(f"[kepler] exp[0:{_show}]={[round(expected[i], 4) for i in range(_show)]}",
           flush=True)
   if _mismatches > 0:
+    stage_fail(f"{operation} mismatches={_mismatches}/{N}")
     print(f"[kepler] raw output hex: {out_host[:32].hex()}", flush=True)
     print(f"[kepler] raw a_host hex: {a_host.tobytes()[:32].hex()}", flush=True)
     print(f"[kepler] raw b_host hex: {b_host.tobytes()[:32].hex()}", flush=True)
@@ -13580,22 +14758,29 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     dev.dev_impl.hw.freeze("output-read-complete")
   _freeze_stop_and_hold(dev, "output-read-complete")
   assert _mismatches == 0, f"hardware {operation} mismatch ({_mismatches}/{N} wrong)"
+  stage_done(f"{operation} matched {N}/{N}")
   print(f"hardware_demo=ok N={N} operation={operation}")
   _kt = getattr(dev, "_kepler_kernel_time_ms", None)
   if _kt is not None:
     print(f"[kepler] kernel_time_total_ms={float(_kt):.3f}", flush=True)
 
+def _probe_mac_device():
+  factory = (_PCI_TRANSPORT_FACTORY
+             if isinstance(_PCI_TRANSPORT_FACTORY, _MacPCIDeviceFactory)
+             else _MacPCIDeviceFactory())
+  return factory.probe()
+
 def _probe_hw_device():
-  """Return a live PCI transport for probe flags (TinyGPU on macOS, sysfs on Linux)."""
+  """Return the selected live PCI transport (USB3/socket on macOS, sysfs on Linux)."""
   if OSX:
-    return APLRemotePCIDevice.probe()
+    return _probe_mac_device()
   return LinuxPCIDevice.probe()
 
-# --- macOS TinyGPU probe / server helpers ---
+# --- macOS direct-USB/socket probe and server helpers ---
 def _probe():
-  dev = APLRemotePCIDevice.probe()
+  dev = _probe_mac_device()
   if dev is None:
-    print("probe: TinyGPU.app socket is not reachable (is the eGPU connected?)")
+    print("probe: selected macOS PCI transport is not reachable (is the eGPU connected?)")
     raise SystemExit(1)
   try:
     boot0, meta = _gk104_ensure_bar0_mmio(dev)
@@ -13608,7 +14793,7 @@ def _probe():
 
 def _probe_post_ownership():
   """Read the inherited Nouveau POST boundary and exit without GPU writes."""
-  dev = APLRemotePCIDevice.probe()
+  dev = _probe_mac_device()
   if dev is None:
     print("probe-post-ownership: TinyGPU.app socket is not reachable")
     raise SystemExit(1)
@@ -13627,7 +14812,7 @@ def _probe_post_ownership():
 
 def _probe_rom_shadow_ownership():
   """Read Nouveau's inherited PRAMIN VBIOS-source predicates; write nothing."""
-  dev = APLRemotePCIDevice.probe()
+  dev = _probe_mac_device()
   if dev is None:
     print("probe-rom-shadow-ownership: TinyGPU.app socket is not reachable")
     raise SystemExit(1)
@@ -13645,7 +14830,7 @@ def _probe_rom_shadow_ownership():
 
 def _probe_golden_preinit():
   """Compare all seven safe pre-init golden reads without GPU writes."""
-  dev = APLRemotePCIDevice.probe()
+  dev = _probe_mac_device()
   if dev is None:
     print("probe-golden-preinit: TinyGPU.app socket is not reachable")
     raise SystemExit(1)
@@ -13661,7 +14846,7 @@ def _probe_golden_preinit():
 
 def _probe_option_rom_vga_preamble():
   """A/B the proven x86-ROM VGA prefix against immediate PRAMIN state."""
-  dev = APLRemotePCIDevice.probe()
+  dev = _probe_mac_device()
   if dev is None:
     print("probe-option-rom-vga-preamble: TinyGPU.app socket is not reachable")
     raise SystemExit(1)
@@ -13688,7 +14873,7 @@ def _probe_option_rom_vga_preamble():
 
 def _probe_nouveau_init_io():
   """A/B the executed Palit INIT_IO special case before any other init."""
-  dev = APLRemotePCIDevice.probe()
+  dev = _probe_mac_device()
   if dev is None:
     print("probe-nouveau-init-io: TinyGPU.app socket is not reachable")
     raise SystemExit(1)
@@ -13743,7 +14928,7 @@ def _probe_nouveau_base_lifecycle(*, bisect_post_scripts=False):
   through-ltc). Optional ``KEPLER_LIFECYCLE_BAR_MAP_SIZE`` (default
   ``0x1000``).
   """
-  dev = APLRemotePCIDevice.probe()
+  dev = _probe_mac_device()
   if dev is None:
     print("probe-nouveau-base-lifecycle: TinyGPU.app socket is not reachable")
     raise SystemExit(1)
@@ -14093,11 +15278,18 @@ def _ensure_tinygpu_server():
         f"see {log_path}", flush=True)
 
 def main():
+  stage_reset()
+  operation = configure_operation()
+  if "--trace-selftest" in sys.argv:
+    trace_format_selftest()
+    return
+  mac_factory = None
   # The verified GTX 770 sequence needs FIFO reset; retain an environment
   # override for diagnosis, but make the known-good behavior the default.
   os.environ.setdefault("KEPLER_FIFO_RESET", "1")
   if OSX:
-    set_pci_transport_factory(_MacPCIDeviceFactory())
+    mac_factory = _MacPCIDeviceFactory()
+    set_pci_transport_factory(mac_factory)
     os.environ.setdefault("KEPLER_NO_AUTO_SUDO", "1")
     # Dispatch macOS-only cold-lifecycle probes before the shared launcher.
     if "--probe-nouveau-base-lifecycle" in sys.argv:
@@ -14117,7 +15309,7 @@ def main():
   os.environ.setdefault("KEPLER_PMU_ENTER_NOWAIT", "1")
   os.environ.setdefault("KEPLER_RAM_BLOCK", "0")
   os.environ.setdefault("KEPLER_RAM_MEMX_WR", "1")
-  if "--middle-selftest" in sys.argv:
+  if "--middle-selftest" in sys.argv or "--offline-selftest" in sys.argv:
     # Offline fake register buses intentionally have no PMU Falcon.  Keep the
     # live default strict, but allow the documented selftest command to use
     # the host-write golden model (same policy as the macOS wrapper).
@@ -14128,12 +15320,11 @@ def main():
     # Offline golden-mmiotrace gate — no hardware / pagemap.  Run this on
     # macOS before the next eGPU replug.
     os.environ.setdefault("KEPLER_RAM_REQUIRE_MEMX", "0")
-    sys.path.insert(0, SHARED_KEPLER_DIR)
+    sys.path.insert(0, DIAGNOSTICS_DIR)
     import mmiotrace_selftest as _mmio_st
     raise SystemExit(_mmio_st.run_mmiotrace_selftest(
         _mmio_st.build_hooks_from_add_module(sys.modules[__name__])))
   if "--compare-cubin" in sys.argv:
-    operation = os.environ.get("KEPLER_OPERATION", "add")
     try:
       assembled = assemble_kepler_cubin(operation)
     except (OSError, RuntimeError, subprocess.SubprocessError) as e:
@@ -14177,7 +15368,7 @@ def main():
   }
   backend = os.environ.get("NV_BACKEND", "kepler")
   offline = any(x in sys.argv for x in (
-      "--middle-selftest", "--mmiotrace-selftest",
+      "--middle-selftest", "--offline-selftest", "--mmiotrace-selftest",
       "--vbios-info", "--vbios-init-info", "--compare-cubin"))
   if OSX and not offline:
     # Proven TinyGPU classic BAR1 + literal PRAMIN path (Night41ay/bc).
@@ -14223,11 +15414,12 @@ def main():
             "hardware launch refused: set KEPLER_LIVE_ACK=completion-abort-risk "
             "(or unset it — that is now the live default) for an authorized "
             "TinyGPU test; set KEPLER_LIVE_ACK=0 to keep refusing")
-      if not os.environ.get("KEPLER_RPC_TRACE"):
-        raise SystemExit("hardware launch refused: KEPLER_RPC_TRACE is required")
-      os.makedirs(os.path.dirname(os.path.abspath(
-          os.environ["KEPLER_RPC_TRACE"])) or ".", exist_ok=True)
-      _ensure_tinygpu_server()
+      if mac_factory is not None and mac_factory.uses_socket:
+        if not os.environ.get("KEPLER_RPC_TRACE"):
+          raise SystemExit("hardware launch refused: KEPLER_RPC_TRACE is required")
+        os.makedirs(os.path.dirname(os.path.abspath(
+            os.environ["KEPLER_RPC_TRACE"])) or ".", exist_ok=True)
+        _ensure_tinygpu_server()
   needs_hardware = backend != "software" and (bool(live_probe_flags.intersection(sys.argv)) or
                                                 "--middle-selftest" not in sys.argv)
   if (needs_hardware and os.environ.get("KEPLER_NO_AUTO_SUDO") != "1" and
@@ -14411,20 +15603,24 @@ def main():
     except (RuntimeError, ValueError, KeyError, struct.error) as e:
       print(f"hardware launch refused: {e}", file=sys.stderr)
       sys.exit(2)
-  # The bring-up contains intentionally verbose register diagnostics. Keep
-  # normal live launches readable; DEBUG=1 remains the opt-in trace mode (and
-  # is rejected above for hardware crash-isolation runs).
-  quiet_buf = io.StringIO() if backend != "software" else None
+  # Trace-enabled runs must stream progress: S6 can spend tens of seconds in
+  # USB MMIO, and retaining stdout until completion makes a healthy run look
+  # hung.  Only trace-disabled live runs keep the compact buffered health-check
+  # output.  DEBUG=1 remains the invasive diagnostic mode rejected above.
+  quiet_buf = io.StringIO() if backend != "software" and not TRACE else None
   quiet_ctx = contextlib.redirect_stdout(quiet_buf) if quiet_buf is not None else contextlib.nullcontext()
   init_err = None
   run_err = None
   dev = None
 
-  def _emit_quiet_diagnostics(prefix="[kepler]", also=("hardware_demo=", "[nvbios]")):
+  def _emit_quiet_diagnostics(
+      prefixes=("[kepler]", "[transport]", "[pcie]", "[phase]", "[hw]", "[mem]",
+                "[wait]", "[reg]", "[S"),
+      also=("hardware_demo=", "[nvbios]")):
     if quiet_buf is None:
       return
     for line in quiet_buf.getvalue().splitlines():
-      if line.startswith(prefix) or any(line.startswith(a) for a in also):
+      if line.startswith(prefixes) or any(line.startswith(a) for a in also):
         print(line, flush=True)
 
   def _one_live_pass():
@@ -14440,6 +15636,7 @@ def main():
         dev = NVDevice("NV", backend=backend)
       except (NotImplementedError, OSError, RuntimeError) as e:
         init_err = e
+        stage_fail(f"{type(e).__name__}: {e}")
       if init_err is None and dev is not None:
         try:
           if backend == "software":
@@ -14448,6 +15645,7 @@ def main():
             run_hardware_demo(dev, cubin)
         except Exception as e:
           run_err = e
+          stage_fail(f"{type(e).__name__}: {e}")
         finally:
           try:
             dev.close()
@@ -14480,27 +15678,20 @@ def main():
     raise run_err
   if quiet_buf is not None:
     _keep = (
-        "[kepler] output:",
+        "[transport]",
+        "[pcie]",
+        "[phase]",
+        "[hw]",
+        "[mem]",
+        "[wait]",
+        "[reg]",
+        "[S",
         "hardware_demo=",
-        "[kepler] GR ctx runtime physical-zero",
-        "[kepler] GR ctx golden physical-zero",
-        "[kepler] attrib physical-zero",
-        "[kepler] BAR1 top R/W",
-        "[kepler] Nouveau-order BAR1",
-        "[kepler] reclock-after-ok",
-        "[kepler] experimental pstate",
-        "[kepler] gk104_clk_prog",
-        "[kepler] clk before experimental",
-        "[kepler] clk after experimental",
-        "[kepler] BAR1 after POST",
-        "[kepler] BAR1 identity clamped",
-        "[kepler] ctx copy via",
-        "[kepler] PTE stabilize:",
-        "[kepler] launch N=",
-        "[kepler] channel window",
-        "[kepler] kernel_time_ms=",
-        "[kepler] kernel_time_total_ms=",
     )
+    if TRACE:
+      _keep += ("[kepler]", "[nvbios]")
+    else:
+      _keep += ("[kepler] output:",)
     for line in quiet_buf.getvalue().splitlines():
       if any(line.startswith(p) for p in _keep):
         print(line, flush=True)

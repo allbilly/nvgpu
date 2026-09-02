@@ -10,7 +10,7 @@ one-shot env defaults.  No hardware / root / pagemap required.
 
 Run::
 
-  python3 examples_kepler/add.py --mmiotrace-selftest
+  python3 examples_kepler/add_770.py --mmiotrace-selftest
 """
 from __future__ import annotations
 
@@ -27,8 +27,11 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 # Golden fixtures (extracted from nouveau_gk104_mmiotrace.txt.gz, BAR0@0xfb…)
 # ---------------------------------------------------------------------------
 
-GOLDEN_MMIOTRACE = pathlib.Path(__file__).resolve().parent / "nouveau_gk104_mmiotrace.txt.gz"
-GOLDEN_COLD_SLICE = pathlib.Path(__file__).resolve().parent / "golden_gk104_cold_slice.json"
+DIAGNOSTICS_DIR = pathlib.Path(__file__).resolve().parent
+KEPLER_DIR = DIAGNOSTICS_DIR.parent
+RUNTIME_DIR = KEPLER_DIR / "runtime"
+GOLDEN_MMIOTRACE = RUNTIME_DIR / "nouveau_gk104_mmiotrace.txt.gz"
+GOLDEN_COLD_SLICE = RUNTIME_DIR / "golden_gk104_cold_slice.json"
 GOLDEN_BAR0 = 0xFB000000
 
 # R 0x101000 @ t+0.000s
@@ -88,7 +91,7 @@ GOLDEN_RAMMAP_PHASE_LEN = 20
 GOLDEN_TRAIN_PHASE_LEN = 1506
 GOLDEN_ZBC_BODY_LEN = 105
 
-MACOS_WRAPPER = pathlib.Path(__file__).resolve().parent / "add.py"
+MACOS_WRAPPER = KEPLER_DIR / "add_770.py"
 # Canonical self-contained GK104 stack (formerly split across kepler + pcie).
 STANDALONE_ADD = MACOS_WRAPPER
 
@@ -132,12 +135,27 @@ _GOLDEN_CACHE: Optional[GoldenColdPhases] = None
 
 def load_golden_cold_phases(
     mmiotrace_path: pathlib.Path = GOLDEN_MMIOTRACE) -> GoldenColdPhases:
-  """Parse the checked-in mmiotrace once; return exact cold-phase write streams."""
+  """Return exact cold-phase streams, using the compact JSON when the raw trace is absent."""
   global _GOLDEN_CACHE
   if _GOLDEN_CACHE is not None and mmiotrace_path == GOLDEN_MMIOTRACE:
     return _GOLDEN_CACHE
   if not mmiotrace_path.is_file():
-    raise AssertionError(f"missing golden mmiotrace: {mmiotrace_path}")
+    if mmiotrace_path != GOLDEN_MMIOTRACE:
+      raise AssertionError(f"missing golden mmiotrace: {mmiotrace_path}")
+    writes, meta = load_golden_cold_slice()
+    ram_end = GOLDEN_RAMMAP_PHASE_LEN
+    train_end = ram_end + GOLDEN_TRAIN_PHASE_LEN
+    # The JSON is the exact carved cold stream: RAMMAP, training, one FB keep
+    # write, ZBC, then four LTC programming writes.
+    phases = GoldenColdPhases(
+        strap=int(meta["strap_101000"]), parts=GOLDEN_LTC_PARTS,
+        mask=GOLDEN_LTC_MASK, rammap=tuple(writes[:ram_end]),
+        train=tuple(writes[ram_end:train_end]),
+        zbc=tuple(writes[train_end + 1:train_end + 1 + GOLDEN_ZBC_BODY_LEN]),
+        ltc_prog=tuple(writes[-4:]),
+        host_forbidden_counts=tuple((reg, 0) for reg in GOLDEN_HOST_NEVER_WRITES_EARLY))
+    _GOLDEN_CACHE = phases
+    return phases
   pat = re.compile(
       r"^(R|W)\s+(\d+)\s+([\d.]+)\s+\d+\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)")
   t0 = None
@@ -486,7 +504,7 @@ def test_00b_cold_slice_fixture_matches_gz() -> None:
 def test_00d_perf_pstates_palit_gtx770() -> None:
   """Palit GTX770 PERF v0x40 exposes four pstates with GPC+mem domains."""
   import nvbios_init
-  rom = pathlib.Path(__file__).resolve().parent / "Palit.GTX770.4096.131216.rom"
+  rom = RUNTIME_DIR / "Palit.GTX770.4096.131216.rom"
   image = nvbios_init.find_vbios_image(rom.read_bytes())
   pstates = nvbios_init.parse_perf_pstates(image)
   assert len(pstates) == 4, pstates
@@ -809,14 +827,14 @@ def test_12_macos_replug_preflight() -> None:
   assert 'setdefault("KEPLER_FAST_ZERO", "1")' in src, \
       "macOS live path must default BAR1 fast GR-ctx zero"
   assert 'setdefault("KEPLER_LIVE_ACK", "completion-abort-risk")' in src, \
-      "macOS live path must default LIVE_ACK so bare add.py launches"
+      "macOS live path must default LIVE_ACK so bare add_770.py launches"
   assert 'setdefault("KEPLER_RPC_TRACE"' in src, \
       "macOS live path must default KEPLER_RPC_TRACE under logs/"
   assert 'setdefault("KEPLER_RAM_MEMX_WR", "1")' in src
   assert "_ensure_tinygpu_server" in src, \
       "macOS live path must auto-start TinyGPU when the socket is missing"
   assert "--mmiotrace-selftest" in src, \
-      "standalone add.py must treat --mmiotrace-selftest as an offline flag"
+      "standalone add_770.py must treat --mmiotrace-selftest as an offline flag"
   # TinyGPU classic-BAR1 defaults are macOS-gated; Linux does not take them.
   assert "if OSX and not offline:" in src, \
       "TinyGPU live defaults must stay behind an OSX gate"
@@ -1051,7 +1069,7 @@ def test_21_replug_runbook_in_wrappers() -> None:
   assert "KEPLER_POST_SCRIPT_PREFIX" in mac
   assert "KEPLER_NVINIT_STOP_OFFSET" in mac
   assert "Night41t retired mid-POST 0x1700 sampling" in mac
-  assert "stop_before" in pathlib.Path(__file__).resolve().parent.joinpath("nvbios_init.py").read_text(encoding="utf-8")
+  assert "stop_before" in RUNTIME_DIR.joinpath("nvbios_init.py").read_text(encoding="utf-8")
   pcie_src = STANDALONE_ADD.read_text(encoding="utf-8")
   assert "--mmiotrace-selftest" in pcie_src
   assert "--probe-post-ownership" in pcie_src
@@ -1140,6 +1158,11 @@ def run_mmiotrace_selftest(hooks: KeplerMMIOHooks, *, verbose: bool = True) -> i
     ("21_replug_runbook",
      lambda: test_21_replug_runbook_in_wrappers()),
   ]
+  if not GOLDEN_MMIOTRACE.is_file():
+    tests = [(name, fn) for name, fn in tests
+             if name not in ("00b_cold_slice_fixture_gz", "18_every_cold_write_locked")]
+    if verbose:
+      print("mmiotrace_selftest: raw .txt.gz absent; JSON-equivalent gates used")
   failed = 0
   for name, fn in tests:
     try:
@@ -1198,9 +1221,8 @@ def build_hooks_from_add_module(add_mod, vbios_path: Optional[str] = None) -> Ke
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
   argv = list(argv if argv is not None else sys.argv[1:])
-  # Prefer the standalone GK104 stack in examples_kepler/add.py.
-  here = pathlib.Path(__file__).resolve().parent
-  sys.path.insert(0, str(here))
+  # Prefer the standalone GK104 stack in examples_kepler/add_770.py.
+  sys.path.insert(0, str(KEPLER_DIR))
   import add as add_mod  # type: ignore
   hooks = build_hooks_from_add_module(add_mod)
   return run_mmiotrace_selftest(hooks)

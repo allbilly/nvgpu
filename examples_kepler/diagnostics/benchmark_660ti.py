@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live GK104 add/mul benchmark for add_660ti.py (TinyGPU USB4 path).
+"""Live GK104 add/mul benchmark for add_660ti.py (TinyGPU socket path).
 
 Sweeps N from 1 to 524288, measuring wall time and host-measured kernel time
 (GP_PUT → semaphore done).  Reports per-window breakdown for windowed runs.
@@ -9,11 +9,9 @@ The benchmark respects KEPLER_MAX_WINDOWS=64 (the H25 sysmem leak fix allows
 
 Examples::
 
-  python3 examples_kepler/benchmark_660ti.py
-  python3 examples_kepler/benchmark_660ti.py --op add --quick
-  python3 examples_kepler/benchmark_660ti.py --op add --repeat 3
-  python3 examples_kepler/benchmark_660ti.py --op mul --n 256,4096,16384
-  python3 examples_kepler/benchmark_660ti.py --boost --compare-boost --quick
+  python3 examples_kepler/diagnostics/benchmark_660ti.py
+  python3 examples_kepler/diagnostics/benchmark_660ti.py --op add --quick
+  python3 examples_kepler/diagnostics/benchmark_660ti.py --op mul --n 256,4096,16384
 
 Requires TinyGPU at /tmp/tinygpu.sock (or KEPLER_TINYGPU_SOCK).
 """
@@ -29,9 +27,11 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-ADD_PY = SCRIPT_DIR / "add_660ti.py"
-LOG_DIR = REPO_ROOT / "logs"
+KEPLER_DIR = SCRIPT_DIR.parent
+REPO_ROOT = KEPLER_DIR.parent
+ADD_PY = KEPLER_DIR / "add_660ti.py"
+RUNTIME_DIR = KEPLER_DIR / "runtime"
+LOG_DIR = SCRIPT_DIR / "logs"
 
 # N values for the full sweep.  Covers single-CTA, multi-CTA, and windowed.
 FULL_N_VALUES = [1, 8, 256, 1024, 4096, 8192, 16384, 32768, 65536, 131072,
@@ -161,9 +161,9 @@ def run_case(op: str, n: int, extra: dict[str, str], *,
     env = {**os.environ, **BASE_ENV, **extra,
            "KEPLER_OPERATION": op, "KEPLER_N": str(n)}
     if op == "mul":
-        env["KEPLER_CUBIN"] = str(SCRIPT_DIR / "mul_kepler.cubin")
+        env["KEPLER_CUBIN"] = str(RUNTIME_DIR / "mul_kepler.cubin")
     else:
-        env["KEPLER_CUBIN"] = str(SCRIPT_DIR / "add_kepler.cubin")
+        env["KEPLER_CUBIN"] = str(RUNTIME_DIR / "add_kepler.cubin")
     t0 = time.time()
     with open(log_path, "w") as logf, open(err_path, "w") as errf:
         proc = subprocess.run(

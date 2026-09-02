@@ -115,7 +115,7 @@ old test hangs
 | --- | --- |
 | Recovery helper | `examples_kepler_pcie/add.py` → `_gk104_ensure_bar0_mmio()` |
 | Cold bring-up | `NVDevice._init_hardware()` (phase `map-bars`) |
-| macOS probe | `examples_kepler/add.py` → `_probe()` |
+| macOS probe | `examples_kepler/add_770.py` → `_probe()` |
 | TinyGPU CFG/MAP/RESET RPC | `APLRemotePCIDevice.read_config` / `write_config` / `bar_info` / `reset` |
 | Offline FakeHW | `kepler_selftest()` — MSE-off, config-lost, reset recovery |
 
@@ -136,12 +136,12 @@ without reading config first.
 /Applications/TinyGPU.app/Contents/MacOS/TinyGPU server /tmp/tinygpu.sock
 
 # 2) Diagnose (uses MSE recovery)
-python3 examples_kepler/add.py --probe
+python3 examples_kepler/add_770.py --probe
 
 # 3) If PMC_BOOT_0 chip_id is 0xe4, cold add:
 export KEPLER_LIVE_ACK=completion-abort-risk
 export KEPLER_RPC_TRACE=logs/rpc-$(date +%Y%m%d-%H%M%S).log
-python3 -u examples_kepler/add.py
+python3 -u examples_kepler/add_770.py
 ```
 
 ### How to read logs
@@ -172,7 +172,7 @@ Preferred DEXT / client order:
 ## Offline gate
 
 ```bash
-python3 examples_kepler/add.py --mmiotrace-selftest
+python3 examples_kepler/add_770.py --mmiotrace-selftest
 # FakeHW MSE / config-lost / reset cases also run under --middle-selftest
 ```
 

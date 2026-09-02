@@ -7,10 +7,8 @@ kernel_time_ms is what to compare for GPC boost experiments.
 
 Examples::
 
-  python3 examples_kepler/benchmark.py --op add --quick
-  python3 examples_kepler/benchmark.py --op add --quick --boost
-  python3 examples_kepler/benchmark.py --op add --compare-boost --quick
-  python3 examples_kepler/benchmark.py --op add --compare-boost --quick --repeat 10
+  python3 examples_kepler/diagnostics/benchmark.py --op add --quick
+  python3 examples_kepler/diagnostics/benchmark.py --op add --quick --boost
 
 Requires TinyGPU at /tmp/tinygpu.sock (or KEPLER_TINYGPU_SOCK).
 """
@@ -26,9 +24,11 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-ADD_PY = SCRIPT_DIR / "add.py"
-LOG_DIR = REPO_ROOT / "logs"
+KEPLER_DIR = SCRIPT_DIR.parent
+REPO_ROOT = KEPLER_DIR.parent
+ADD_PY = KEPLER_DIR / "add_770.py"
+RUNTIME_DIR = KEPLER_DIR / "runtime"
+LOG_DIR = SCRIPT_DIR / "logs"
 
 # (label, env overrides).  Empty MULTI_CTA → auto.
 CASES = [
@@ -174,9 +174,9 @@ def run_case(op: str, label: str, extra: dict[str, str], *,
   err_path = LOG_DIR / f"bench-{slug}.err"
   env = {**os.environ, **BASE_ENV, **extra, "KEPLER_OPERATION": op}
   if op == "mul":
-    env["KEPLER_CUBIN"] = str(SCRIPT_DIR / "mul_kepler.cubin")
+    env["KEPLER_CUBIN"] = str(RUNTIME_DIR / "mul_kepler.cubin")
   else:
-    env["KEPLER_CUBIN"] = str(SCRIPT_DIR / "add_kepler.cubin")
+    env["KEPLER_CUBIN"] = str(RUNTIME_DIR / "add_kepler.cubin")
   t0 = time.time()
   with open(log_path, "w") as logf, open(err_path, "w") as errf:
     proc = subprocess.run(

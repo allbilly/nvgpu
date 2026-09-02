@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Generate pgraph_mmio_gk104.py from the Linux kernel gk104.c / gf100*.c init lists."""
-import os, re, glob
+import os, re, glob, pathlib
 
-REPO = "/Users/yeren/Desktop/nvgpu"
-SRC_DIR = os.path.join(REPO, "ref/linux/drivers/gpu/drm/nouveau/nvkm/engine/gr")
-OUT = os.path.join(REPO, "examples_kepler/pgraph_mmio_gk104.py")
+REPO = str(pathlib.Path(__file__).resolve().parents[2])
+SRC_DIR = os.environ.get(
+    "NOUVEAU_GR_DIR",
+    os.path.join(REPO, "drivers/gpu/drm/nouveau/nvkm/engine/gr"))
+OUT = os.path.join(REPO, "examples_kepler/runtime/pgraph_mmio_gk104.py")
 
 # Parse the gk104_gr_pack_mmio array to get ordered list of init array names.
 with open(os.path.join(SRC_DIR, "gk104.c")) as f:

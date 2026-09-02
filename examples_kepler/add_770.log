@@ -1,0 +1,273 @@
+[transport] USB3 3801:0001 10Gb/s, GPU=10de:1184 bus=2, BAR0=0x10000000/0x1000000 BAR1=0x800000000/0x8000000 BAR3=0x808000000/0x2000000
+[pcie] Chestnut LTSSM=0x78->0x78 link=up retrained=no
+[pcie] bus0-bridge id=1b21:2464 type=upstream-port max=Gen1/2.5GT/sx1 negotiated=Gen1/2.5GT/sx1 training=no dll=inactive aspm=0x0 lnksta=0x1011
+[pcie] bus1-bridge id=1b21:2464 type=downstream-port max=Gen3/8.0GT/sx4 negotiated=Gen1/2.5GT/sx2 training=no dll=active aspm=0x0 lnksta=0xf021
+[pcie] bus2-gpu id=10de:1184 type=endpoint max=Gen3/8.0GT/sx16 negotiated=Gen1/2.5GT/sx2 training=no dll=inactive aspm=0x0 lnksta=0x1021
+[S1] CALL[NVDevice._init_hardware] PCIe/Transport — connect PCI transport and map GK104 BARs
+  [S1.1] RETURN[ChestnutPCIDevice.set_phase] connect: done duration_ms=16.012
+  [S1.2] CALL[ChestnutPCIDevice.set_phase] map-bars: begin
+  [kepler] BAR0 recover: id=0x118410de cmd=0x0407->0x0403 mse_was=True reset=False PMC_BOOT_0=0x0e4040a2
+  [hw] transport=ChestnutPCIDevice id=0x118410de pci_command=0x0407 boot0=0x0e4040a2 bar0=0x10000000/0x1000000 bar1=0x800000000/0x8000000 staging_only=True
+[S1] RETURN[NVDevice._init_hardware] PCIe/Transport — done duration_ms=1.654
+[S2] CALL[NVDevice._init_hardware] GPU Discovery+MMU — identify GK104 topology and prepare GMMU aperture
+  [S2.1] RETURN[ChestnutPCIDevice.set_phase] map-bars: done duration_ms=1.661
+  [S2.2] CALL[ChestnutPCIDevice.set_phase] vbios-devinit: begin
+  [kepler] DMEM probe [boot state]: DMEM[0x100]=0xabcd16b2 (wrote 0xabcd16b2) OK
+  [kepler] PGRAPH_STATUS at boot: 0xbadf1000
+  [kepler] POST ownership: 0x2240c=0x00000002 firmware_posted_bit=True 0x1700=0x00000010 PRAMIN_live=True
+  [kepler] GPC topology(0x409604)=0x40004 PRAMIN_live=True — card is POSTed
+  [hw] discovery boot0=0x0e4040a2 pgraph=0xbadf1000 gpc_topology=0x00040004 gpc_awake=True pramin_live=True posted=True devinit_marker=0x00000002 pramin_window=0x00000010
+[S2] RETURN[NVDevice._init_hardware] GPU Discovery+MMU — done duration_ms=3.967
+[S3] CALL[NVDevice._init_hardware] Firmware+Clock Prep — run VBIOS devinit and hardware clock/power setup
+  [kepler] FECS already ready (0x409800=0x80000000) — skipping firmware reload
+  [kepler] DMEM probe [after PMC_ENABLE]: DMEM[0x100]=0xabcd33f8 (wrote 0xabcd33f8) OK
+  [kepler] PGRAPH_STATUS after PMC_ENABLE: 0xbadf1000
+  [kepler] GR clkgate+pwr disabled: 0x20200=0x27722454
+  [hw] clock-power pmc_enable=0xfc37b1ff gpc_pll=0x00030005 gpc_clock=0x00000000 gr_engine=0x00010001 pgraph=0xbadf1000 clkgate=0x27722454
+[S3] RETURN[NVDevice._init_hardware] Firmware+Clock Prep — done duration_ms=131.296
+[S4] CALL[NVDevice._init_hardware] Legacy Falcon Boot — load and start legacy PMU/FECS/GPCCS Falcons
+  [S4.1] RETURN[ChestnutPCIDevice.set_phase] vbios-devinit: done duration_ms=135.302
+  [S4.2] CALL[ChestnutPCIDevice.set_phase] firmware-load: begin
+  [kepler] skipping PMU/PGOB (FECS already ready)
+  [mem] policy posted=True devinit=False ram_init=skip reason=already-posted ram_program=disabled mode=0 target_mhz=648
+  [mem] status=skipped:already-posted strap=0x80405096 parts_raw=0x4 pmask=0x0 selector=0x1 refpll=0x32301/0xa3e1000 mc=0x2cf9800 train_ctl=0x8020000/0x8020000 train_nibbles=[p0=0x0,p1=0x0,p2=0x0,p3=0x0]
+  [S4.3] CALL[_gk104_post_ram_fb_ltc] begin
+    [kepler] LTC init: ltc_nr=4 lts_nr=4 parts=4 mask=0x0 lpg128=True tag_base=0x0
+    [kepler] post-RAM LTC settle: 0x100c80=0x208000 (bigpage16=False) 0x110974=0x0 0x111974=0x0
+  [S4.3] RETURN[_gk104_post_ram_fb_ltc] done duration_ms=24.961
+  [kepler] FECS BAR1 bootstrap embedded at 0xb20..0xbe0
+  [kepler] clock diag: PMC_ENABLE=0xfc37b1ff PWR_GATE=0x40110068 SRCSEL=0x0 GPC_PLL=0x30005 GPC_DIVSRC=0x3 ROP_PLL=0x10000 ROP_DIVSRC=0x20000003 HUB_PLL=0x10000 HUB_DIVSRC=0x20000003 PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001
+  [kepler] PGRAPH access test: 0x400080=0x1881c2 0x400000=0xbadf1000 0x400500=0x10001
+  [kepler] PGRAPH sub-domains: 0x400700=0x0(OK) 0x404000=0x80000000(OK) 0x4041f0=0x0(OK) 0x404200=0x0(OK) 0x404600=0x80000000(OK) 0x405840=0x80000000(OK) 0x407020=0x0(OK) 0x408030=0x80000000(OK)
+  [kepler] BLCG main: skipping 0x4041f0 write (was 0x0; KEPLER_PGRAPH_BLCG=0)
+  [kepler] after PGRAPH init: PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001 PGRAPH_INTR=0x0
+  [kepler] DMEM probe [after PGRAPH init (before 2nd pgob)]: DMEM[0x100]=0xabcd22db (wrote 0xabcd22db) OK
+  [kepler] FECS_CTRL after PGRAPH init: 0x10
+  [kepler] after pgob in init: PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001 FE_PWR=0x0 PWR_GATE=0x40110068 RED_SWITCH=0x770
+  [kepler] PGRAPH sub-domains after FE_PWR restore: 0x400700=0x0(OK) 0x404000=0x80000000(OK) 0x404200=0x0(OK) FE_PWR=0x2 PGRAPH_STATUS_MAIN=0xbadf1000
+  [kepler] GR post-init: gpc=4 tpc=[2, 2, 2, 2] rop=4 FECS_EXC=0xf0001
+  [kepler] DMEM probe [after pgob + PGRAPH_CTRL re-enable]: DMEM[0x100]=0xabcd21f4 (wrote 0xabcd21f4) OK
+  [kepler] after pgob+ctrl: PGRAPH_CTRL=0x10001 PGRAPH_INTR=0x0 FE_PWR=0x2
+  [kepler] BLCG disabled: skipped (KEPLER_PGRAPH_BLCG=0)
+  [kepler] before falcon load: FECS_CTRL=0x10 GPCCS_CTRL=0x10 PGRAPH_CTRL=0x10001 PGRAPH_STATUS=0xbadf1000 RED_SWITCH=0x770
+  [kepler] FECS stuck (PC=0x0 CPUCTL=0x10), resetting falcon
+  [kepler] After falcon reset: PC=0x0 CPUCTL=0x10
+  [kepler] ITLB: cleared 80 code TLB entries (all clean)
+  [kepler] FECS IMEM verify: read=['0x39b0ef5', '0x9800d898', '0x86f001d9', '0x489b808'] expected=['0x39b0ef5', '0x9800d898', '0x86f001d9', '0x489b808'] match=True
+  [kepler] FECS IMEM FULL verify: all 768 words match
+  [kepler] FECS DMEM verify: read=['0x300', '0x3cc', '0x0', '0x0'] expected=['0x300', '0x304', '0x0', '0x0'] match=False
+  [kepler] FECS CPUCTL before start: 0x00000010
+  [kepler] FECS CPUCTL after write 0: 0x00000010
+  [kepler] FECS CPUCTL after W1C HALT: 0x00000010
+  [kepler] FECS started immediately after DMEM+csdata load
+  [kepler] after FECS start: FECS_CTRL=0x00000020 FECS_SIGNAL=0x00000200 GPCCS_CTRL=0x00000020 FECS_MMIO_BASE=0x00000000 FECS_MMIO_CTRL=0x40404170 ACCESS_EN=0x00000002 INTR=0x00000000 IRQMSET=0x00000000 IRQMASK=0x00008704 HWCFG2=0x00000000 CPUSTAT=0x000f027f XFER_STATUS=0x00000010
+  [kepler] FE_PWR after FECS start: 0x0
+  [kepler] FECS PC samples after start: ['0x567', '0x567', '0x567', '0x567', '0x567', '0x567', '0x567', '0x567', '0x567', '0x567']
+  [kepler] GPC0 fuc: CTRL=0x20 ENTRY=0x0 SCRATCH0=0x80000000 SCRATCH1=0x8e00 BLOCK=0x0
+  [kepler] GPC1 fuc: CTRL=0x20 ENTRY=0x0 SCRATCH0=0x80000000 SCRATCH1=0x8e00 BLOCK=0x0
+  [kepler] GPC2 fuc: CTRL=0x20 ENTRY=0x0 SCRATCH0=0x80000000 SCRATCH1=0x8e00 BLOCK=0x0
+  [kepler] GPC3 fuc: CTRL=0x20 ENTRY=0x0 SCRATCH0=0x80000000 SCRATCH1=0x8e00 BLOCK=0x0
+  [wait] S4 _init_hardware: FECS ready (0x409800 bit31): met after 1 polls / 0.174 ms value=True
+  [kepler] FE_PWR after FECS ready: 0x2 idle_filter=0x0
+  [S4.4] CALL[_gk104_post_ram_fb_ltc] begin
+  [S4.4] RETURN[_gk104_post_ram_fb_ltc] done duration_ms=0.002
+  [hw] falcons pmu_ctl=0x00000020 pmu_stat=0x00000000 fecs_ctl=0x00000020 fecs_stat=0x000f027f fecs_mailbox0=0x80000000 gpccs_ctl=0x00000020 gpccs_stat=0x000f027f gpccs_mailbox0=0x80000000 fe_power=0x00000002 bar1_vmm=0x80000040
+[S4] RETURN[NVDevice._init_hardware] Legacy Falcon Boot — done duration_ms=921.936
+[S5] N/A[NVDevice._init_hardware] GSP/RM Online — GK104 has no GSP; this file is the userspace RM
+[kepler] RNG seed=42
+[kepler] launch N=8 chunks=1 chunk=8 channel_windows=1 window_chunks=19 (single-CTA each)
+[kepler] VMM map: a_dev va=0x1000 pa=0x400000 pgd[0]=0x10600000000 pte=0x4001
+[kepler] VMM map: b_dev va=0x2000 pa=0x401000 pgd[0]=0x10600000000 pte=0x4011
+[kepler] VMM map: out_dev va=0x3000 pa=0x402000 pgd[0]=0x10600000000 pte=0x4021
+[kepler] VMM map: code_dev va=0x5000 pa=0x504000 pgd[0]=0x10600000000 pte=0x5041
+[kepler] VMM map: cbuf0 va=0x6000 pa=0x505000 pgd[0]=0x10600000000 pte=0x5051
+[kepler] VMM map: cwd0 va=0x7000 pa=0x506000 pgd[0]=0x10600000000 pte=0x5061
+[kepler] VMM map: signal va=0x4000 pa=0x403000 pgd[0]=0x10600000000 pte=0x4031
+[kepler] VMM map: temp_dev va=0x100000 pa=0x404000 pgd[0]=0x10600000000 pte=0x4041
+[kepler] FE_PWR before launch: 0x2 RED_SWITCH=0x770 PGRAPH_STATUS=0xbadf1000 FECS_CTRL=0x20
+[S6] CALL[submit_launch] Golden GR Context — build GK104 golden/runtime GR context
+  [S6.1] RETURN[ChestnutPCIDevice.set_phase] firmware-load: done duration_ms=923.601
+  [S6.2] CALL[ChestnutPCIDevice.set_phase] channel-build: begin
+  [kepler] bit19-safe attrib shrink: attrib_nr_max=0x2aa alpha_nr_max=0x556 tpc=8
+  [kepler] GR buffer VAs: pagepool=0x20000+0x8000 bundle=0x28000+0x3000 attrib=0x300000+0x80000 mmio=0xd000+0x1000
+  [kepler] VRAM inst: grctx_runtime=0x500000 grctx_golden=0x600000 attrib=0x800000+0x80000 bit19_safe=True
+  [S6.3] CALL[_gk104_init_bar1_identity] begin
+    [kepler] BAR1 top R/W ok va=0x7fff000 size=0x8000000 via=BAR1
+  [S6.3] RETURN[_gk104_init_bar1_identity] done duration_ms=21615.228
+  [S6.4] CALL[falcon_stop] begin
+    [wait] S6 falcon_stop: falcon stop at 0x409000: met after 1 polls / 0.152 ms value=True
+  [S6.4] RETURN[falcon_stop] done duration_ms=0.342
+  [kepler] halted FECS before GR/instance zero
+  [S6.5] RETURN[ChestnutPCIDevice.set_phase] channel-build: done duration_ms=22978.759
+  [S6.6] CALL[ChestnutPCIDevice.set_phase] channel-build-repair-zero-gr-ctx-runtime: begin
+  [kepler] GR ctx runtime physical-zero verified; BAR1 sample=0000000000000000000000000000000000000000000000000000000000000000 (0.00s fast_zero=True rewrote=0 chunk=0x40000 verify=sample)
+  [S6.7] RETURN[ChestnutPCIDevice.set_phase] channel-build-repair-zero-gr-ctx-runtime: done duration_ms=1.258
+  [S6.8] CALL[ChestnutPCIDevice.set_phase] channel-build-repair-zero-gr-ctx-golden: begin
+  [kepler] GR ctx golden physical-zero verified; BAR1 sample=0000000000000000000000000000000000000000000000000000000000000000 (0.00s fast_zero=True rewrote=0 chunk=0x40000 verify=sample)
+  [S6.9] RETURN[ChestnutPCIDevice.set_phase] channel-build-repair-zero-gr-ctx-golden: done duration_ms=0.989
+  [S6.10] CALL[ChestnutPCIDevice.set_phase] channel-build-repair-zero-pagepool: begin
+  [kepler] pagepool physical-zero verified; BAR1 sample=0000000000000000000000000000000000000000000000000000000000000000 (0.00s fast_zero=True rewrote=0 chunk=0x40000 verify=sample)
+  [S6.11] RETURN[ChestnutPCIDevice.set_phase] channel-build-repair-zero-pagepool: done duration_ms=0.932
+  [S6.12] CALL[ChestnutPCIDevice.set_phase] channel-build-repair-zero-bundle: begin
+  [kepler] bundle physical-zero verified; BAR1 sample=0000000000000000000000000000000000000000000000000000000000000000 (0.00s fast_zero=True rewrote=0 chunk=0x40000 verify=sample)
+  [S6.13] RETURN[ChestnutPCIDevice.set_phase] channel-build-repair-zero-bundle: done duration_ms=0.861
+  [S6.14] CALL[ChestnutPCIDevice.set_phase] channel-build-repair-zero-attrib: begin
+  [kepler] attrib physical-zero verified; BAR1 sample=0000000000000000000000000000000000000000000000000000000000000000 (0.00s fast_zero=True rewrote=0 chunk=0x40000 verify=sample)
+  [kepler] VMM map: mmio_list va=0xd000 pa=0x900000
+  [S6.15] RETURN[ChestnutPCIDevice.set_phase] channel-build-repair-zero-attrib: done duration_ms=640.866
+  [S6.16] CALL[ChestnutPCIDevice.set_phase] golden-context-vmm-clone: begin
+  [S6.17] CALL[_gk104_clone_vmm_to_vram] begin
+  [S6.17] RETURN[_gk104_clone_vmm_to_vram] done duration_ms=285.488
+  [kepler] VRAM mirror: va=0x1000 pa=0xb10000 size=0x20 chunks=1
+  [kepler] VRAM mirror: va=0x2000 pa=0xb11000 size=0x20 chunks=1
+  [kepler] VRAM mirror: va=0x3000 pa=0xb12000 size=0x20 chunks=1
+  [kepler] VRAM mirror: va=0x100000 pa=0xc00000 size=0x100000 chunks=2
+  [kepler] VRAM mirror: va=0x5000 pa=0xe00000 size=0x100 chunks=1
+  [kepler] VRAM mirror: va=0x6000 pa=0xe01000 size=0x200 chunks=1
+  [kepler] VRAM mirror: va=0x7000 pa=0xe02000 size=0x100 chunks=1
+  [kepler] VRAM VMM: pgd_pa=0x923000 spts=[(0, '0x933000'), (1, '0xa00000'), (8191, '0xa40000')] join=0x923000 flush=done
+  [kepler] GR ctx buffer: va=0x8080000 pa=0x500000 pgd[1]=0x50600000000 pte[128]=0x6001
+  [kepler] VRAM VMM PTE[128]: lo=0x6003 hi=0x0 (expected lo=0x5001)
+  [S6.18] RETURN[ChestnutPCIDevice.set_phase] golden-context-vmm-clone: done duration_ms=2140.526
+  [S6.19] CALL[ChestnutPCIDevice.set_phase] golden-context: begin
+  [kepler] GR status before PBDMA bind: 0x40060c=0x0 0x2640=0x0 0x400100=0x0 0x409c18=0x0
+  [S6.20] RETURN[ChestnutPCIDevice.set_phase] golden-context: done duration_ms=96.483
+  [S6.21] CALL[ChestnutPCIDevice.set_phase] runlist-submit-golden-channel: begin
+  [S6.22] CALL[_gk104_commit_runlist] begin
+  [S6.22] RETURN[_gk104_commit_runlist] done duration_ms=1.143
+  [S6.23] RETURN[ChestnutPCIDevice.set_phase] runlist-submit-golden-channel: done duration_ms=1.211
+  [S6.24] CALL[ChestnutPCIDevice.set_phase] golden-context: begin
+  [kepler] PBDMA bind+runlist: 0x2640=0x0 ctrl=0x00000001 inst=0x80000921
+  [kepler] FECS golden ctx: inst_tag=0x80000921 inst_phys=0x921000 ramin_pa=0x507000 ramin_vram_pa=0x921000 base=0x0
+  [wait] S6 submit_launch: FE power FORCE_ON: met after 1 polls / 0.177 ms value=True
+  [wait] S6 submit_launch: FE power AUTO: met after 1 polls / 0.159 ms value=True
+  [kepler] grctx reset: RED_SWITCH=0x770 FE_PWR=0x0 SCC=0x0
+  [kepler] GPC MMU: bigpage=0 mmu_wr=0xe04000 mmu_rd=0xe03000 readback={'0x418880': 0, '0x4188a4': 50331648, '0x418888': 0, '0x41888c': 0, '0x418890': 0, '0x418894': 0, '0x4188b4': 57408, '0x4188b8': 57392}
+  [kepler] GPC_BCAST test: 0x418804=0xbadf1000 PWR_GATE=0x40110068 PMC_ENABLE=0xfc37b1ff PGRAPH_CTRL=0x10001
+  [kepler] FECS before golden ctx: CC_SCRATCH0=0x80000000 CPUCTL=0x20 CPUSTAT=0xf027f INTR=0x0 IREN=0x0 PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001 GPC_TOPOLOGY=0x40004 CHAN_ADDR=0x0 CHAN_NEXT=0x0
+  [wait] S6 submit_launch: FECS ctx_chan (cmd 1): met after 1 polls / 0.208 ms value=True
+  [kepler] FECS ctx_chan done: CC_SCRATCH0=0x80000000 CHAN_ADDR=0x80000921 CHAN_NEXT=0x80000921
+  [kepler] GR status after ctx_chan: 0x40060c=0x0 0x400700=0x0 0x400100=0x0 0x409c18=0x0 0x2640=0x0 0x2644=0x0 FECS_ERR=0x00000000 FECS_PC=0x00000567
+  [kepler] grctx_main: gpc_nr=4 tpc_total=8 PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001
+  [S6.25] CALL[_gk104_grctx_main] begin
+    [kepler] grctx_main pre-check: 0x404154=0x400 0x400100=0x0 0x405b00=0x0 0x40060c=0x0
+    [kepler] grctx after mmio_packs: 0x40060c=0x0 idle=True ctrl=0x10001
+    [kepler] grctx buffer regs: pagepool=0x200/0x200 expected=0x200 bundle=0x280/0x280 expected=0x280
+    [kepler] grctx_main GPC/TPC: wrote 0x804 readback 0x804
+    [kepler] grctx after step9: 0x40060c=0x0 ctrl=0x10001
+    [kepler] grctx after icmd: 0x40060c=0x0 ctrl=0x10001
+    [kepler] grctx after mthd: 0x40060c=0x0 ctrl=0x10001
+    [kepler] grctx after step13: 0x40060c=0x0 idle=True ctrl=0x10001
+    [kepler] grctx topology: tpc_nr=[2, 2, 2, 2] ppc_masks=['0x3', '0x3', '0x3', '0x3'] row=3 tile=[0, 1, 2, 3, 0, 1, 2, 3]
+  [S6.25] RETURN[_gk104_grctx_main] done duration_ms=416.653
+  [kepler] grctx_main done
+  [kepler] post-grctx_main: PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001
+  [kepler] WARNING: GR inaccessible after grctx_main (false positive: 0xbadf1000 is normal idle)
+  [S6.26] RETURN[ChestnutPCIDevice.set_phase] golden-context: done duration_ms=675.297
+  [S6.27] CALL[ChestnutPCIDevice.set_phase] golden-context-save: begin
+  [kepler] golden save: IREN=0x0 PC=0x567 CPUCTL=0x20 CHAN_ADDR=0x80000921 CHAN_NEXT=0x80000921
+  [kepler] CHSW trigger: INTR=0x0 CHAN_ADDR=0x921 CHAN_NEXT=0x921 PC=0x567
+  [kepler] FECS golden save done: CHAN_ADDR=0x921 CHAN_NEXT=0x921 IREN=0x0 head=['0x0', '0x0', '0x0', '0x0']
+  [kepler] RAMFC after golden save: 0x84=0x60400000 0x94=0x30000001 0x9c=0x100 0xac=0x0 0xe8=0x1
+  [kepler] FECS ready after golden save: SCRATCH0=0x80000000 CPUCTL=0x20
+  [wait] S6 submit_launch: FE power FORCE_ON after golden save: met after 1 polls / 0.156 ms value=True
+  [kepler] FE_PWR+ctxctl after golden save: FE_PWR=0x2 ctxctl=0x0 FECS_CTRL=0x20 RED_SWITCH=0x70 PWR_GATE=0x40110068 idle_filter=0x0
+  [S6.28] RETURN[ChestnutPCIDevice.set_phase] golden-context-save: done duration_ms=16.876
+  [S6.29] CALL[ChestnutPCIDevice.set_phase] golden-context-ctx-copy: begin
+  [kepler] ctx copy via BAR1: 0.273s FECS=0x20
+  [kepler] runtime GR ctx verify: mismatches=0 sample=[]
+  [kepler] FECS check points: [('after_bar_flush', '0x20', '0xbadf1000', '0x40110068'), ('after_verify', '0x20', '0xbadf1000', '0x40110068'), ('after_mmio_list_write', '0x20', '0xbadf1000', '0x40110068'), ('after_ramin_ctx_write', '0x20', '0xbadf1000', '0x40110068'), ('after_head_read', '0x20', '0xbadf1000', '0x40110068')]
+  [kepler] runtime GR ctx: size=0x2c400 va=0x8000004 head=['0x18', '0xd0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0']
+  [kepler] cleared stale GR traps: trap=0x0 gpcs=0x0 intr=0x0 -> 0x0/0x0/0x0
+  [kepler] pre-runlist GR: PGRAPH_STATUS=0xbadf1000 GPC_TOPOLOGY=0x40004 PGRAPH_CTRL=0x10001 FECS_CTRL=0x20
+  [kepler] strict single-thread RPC mode: FECS helper disabled
+  [kepler] FECS check points2: [('after_runtime_ctx_print', '0x20'), ('after_stale_trap_read', '0x20'), ('after_gpc_clear', '0x20'), ('after_pgraph_ctrl', '0x20'), ('after_pre_runlist_read', '0x20'), ('after_snapshot', '0x20')]
+  [kepler] pre-bind power: 0x20200=0x27722454 0x020004=0x40110068 FE_PWR=0x2 ctxctl=0x0
+  [kepler] PWR_GATE cleared: 0x020004=0x40110068
+  [kepler] FECS before bind: CPUCTL=0x20 (gated=no)
+  [kepler] after un-gate attempt: FECS_CTRL=0x20 PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001 FE_PWR=0x2 PWR_GATE=0x40110068
+  [kepler] PGRAPH sub-domains after pgob: 0x400700=0x0(OK) 0x404000=0x80000000(OK) 0x404200=0x0(OK)
+  [kepler] FE_PWR before bind: 0x2 PGRAPH_STATUS=0xbadf1000 PGRAPH_CTRL=0x10001 FECS_CTRL=0x20
+  [S6.30] RETURN[ChestnutPCIDevice.set_phase] golden-context-ctx-copy: done duration_ms=337.116
+  [S6.31] CALL[ChestnutPCIDevice.set_phase] golden-context-pte-stabilize: begin
+  [kepler] PTE stabilize: entries=694 pages=7 fast_pte=True
+  [S6.32] RETURN[ChestnutPCIDevice.set_phase] golden-context-pte-stabilize: done duration_ms=92.137
+  [S6.33] CALL[ChestnutPCIDevice.set_phase] golden-context-mirror-stabilize: begin
+  [kepler] post-bind FECS: CPUCTL=0x20 SCRATCH0=0x80000000 CHAN_ADDR=0x921 CHAN_NEXT=0x921 subch4=0x0
+  [kepler] RED_SWITCH pre-set: 0x70 -> 0x770
+  [kepler] TOP device list: 16 non-zero entries
+    TOP[00]: 0x8006183e (ENUM)
+    TOP[01]: 0x00000003 (ENGINE_TYPE)
+    TOP[02]: 0x90828c3e (ENUM)
+    TOP[03]: 0x00000007 (ENGINE_TYPE)
+    TOP[04]: 0x94a30e3e (ENUM)
+    TOP[05]: 0x0000000b (ENGINE_TYPE)
+    TOP[06]: 0x9c03aa3e (ENUM)
+    TOP[07]: 0x0000000f (ENGINE_TYPE)
+    TOP[08]: 0x8428a23e (ENUM)
+    TOP[09]: 0x00000023 (ENGINE_TYPE)
+    TOP[0a]: 0x8840023e (ENUM)
+    TOP[0b]: 0x00000027 (ENGINE_TYPE)
+    TOP[0c]: 0x8c679e3e (ENUM)
+    TOP[0d]: 0x0000002b (ENGINE_TYPE)
+    TOP[0e]: 0x98c8243e (ENUM)
+    TOP[0f]: 0x0000002f (ENGINE_TYPE)
+  [kepler] PBDMA_ENGINES pre-runlist: ['0x0', '0x0', '0x0']
+  [kepler] PBDMA enable: lo=0x00000007 hi=0xbad0011f eng_assign=['0xbad0011f', '0xbad0011f', '0xbad0011f', '0xbad0011f', '0xbad0011f', '0xbad0011f']
+  [kepler] PBDMA0: INTR0=0x00000000 INTR0_MASK=0xeffffeff INTR1=0x00000000 CTRL=0xeffffeff CHID=0x00000001
+  [kepler] PBDMA1: INTR0=0x00000000 INTR0_MASK=0xeffffeff INTR1=0x00000000 CTRL=0xeffffeff CHID=0x00000000
+  [kepler] PBDMA2: INTR0=0x00000000 INTR0_MASK=0xeffffeff INTR1=0x00000000 CTRL=0xeffffeff CHID=0x00000000
+  [kepler] USERD BAR1 reg 0x2254=0x10000400
+  [kepler] CHAN_TABLE[1]: CHAN=0x00000000 STATE=0x00000000 (RUNNABLE=False LOADED=False)
+  [kepler] runlist block/allow 0x2630=0x00000000
+  [kepler] PFIFO state: CTRL=0x00000000 SUBFIFO=0x00000007 INTR=0x00000000 RUNLIST_BASE=0x00000922 RUNLISTSubmit=0x00000001 pending=0x00000001
+  [kepler] inst GR ctx ptr: 0x0008000004 valid=True va=0x8000000
+  [S6.34] CALL[_gk104_init_bar1_identity] begin
+    [kepler] BAR1 already classic-posted (0x1704=0x80000040); skipping re-init
+  [S6.34] RETURN[_gk104_init_bar1_identity] done duration_ms=0.180
+  [kepler] BAR1 USERD delayed check: GP_PUT=0
+[S6] RETURN[submit_launch] Golden GR Context — done duration_ms=27783.594
+[S7] CALL[submit_launch] User Channels+GPFIFO — publish RAMIN, USERD, channel, and GPFIFO state
+[S7] RETURN[submit_launch] User Channels+GPFIFO — done duration_ms=0.012
+[S8] CALL[submit_launch] Workload+CWD Prep — stage CWD, push buffers, and compute workload
+[S8] RETURN[submit_launch] Workload+CWD Prep — done duration_ms=0.010
+[S9] CALL[submit_launch] Submit+Execute — commit runlist, ring GP_PUT, and wait for completion
+  [S9.1] RETURN[ChestnutPCIDevice.set_phase] golden-context-mirror-stabilize: done duration_ms=800.427
+  [S9.2] CALL[ChestnutPCIDevice.set_phase] runlist-submit: begin
+  [S9.3] CALL[_gk104_commit_runlist] begin
+  [S9.3] RETURN[_gk104_commit_runlist] done duration_ms=1.096
+  [kepler] guard PTE after VMM flush: wanted=0xb0e1 actual=0xc001
+  [kepler] runtime context armed: CHAN_ADDR=0x921 CHAN_NEXT=0x921
+  [kepler] guard PTE immediately before GP_PUT: 0xb0e1
+  [S9.4] RETURN[ChestnutPCIDevice.set_phase] runlist-submit: done duration_ms=20355.891
+  [S9.5] CALL[ChestnutPCIDevice.set_phase] semaphore-poll: begin
+  [kepler] kernel_time_ms=0.698 total_ms=0.698 sem=2 ibs=1
+[S9] RETURN[submit_launch] Submit+Execute — done duration_ms=20356.308
+[S10] CALL[run_hardware_demo] Result Validation — read and validate 8 add results
+  [S10.1] RETURN[ChestnutPCIDevice.set_phase] semaphore-poll: done duration_ms=0.556
+  [S10.2] CALL[ChestnutPCIDevice.set_phase] output-read: begin
+  [kepler] GPU output read from VRAM pa=0xb12000
+  [kepler] output: first 8 actual=[0.1227, -1.8904, -1.0127, -0.5429, -0.474, -0.2489, 1.0841, -0.7362] expected=[0.1227, -1.8904, -1.0127, -0.5429, -0.474, -0.2489, 1.0841, -0.7362] mismatches=0/8
+  [S10.3] RETURN[ChestnutPCIDevice.set_phase] output-read: done duration_ms=0.394
+  [S10.4] CALL[ChestnutPCIDevice.set_phase] host-helper-stop: begin
+  [kepler] host helper stopped (output-read-complete): zero endpoint teardown RPC
+[S10] RETURN[run_hardware_demo] Result Validation — done duration_ms=0.607
+hardware_demo=ok N=8 operation=add
+[kepler] kernel_time_total_ms=0.698
+[S10.5] RETURN[ChestnutPCIDevice.set_phase] host-helper-stop: done duration_ms=0.201
+[S10.6] CALL[ChestnutPCIDevice.set_phase] client-close: begin
+
+==============================================================
+                      NVIDIA KEPLER RUN                       
+==============================================================
+[S1] PCIe/Transport               OK       1.654 ms  ChestnutPCIDevice; BAR0/BAR1 mapped; PCI bus master enabled
+[S2] GPU Discovery+MMU            OK       3.967 ms  GK104 detected; GPC topology=0x40004; PRAMIN=True
+[S3] Firmware+Clock Prep          OK     131.296 ms  VBIOS/devinit and pre-Falcon clock/power initialization complete
+[S4] Legacy Falcon Boot           OK     921.936 ms  PMU and FECS/GPCCS initialized; FECS ready
+[S5] GSP/RM Online                N/A      0.000 ms  GK104 has no GSP; this file is the userspace RM
+[S6] Golden GR Context            OK   27783.594 ms  golden GR context generated, saved, and attached
+[S7] User Channels+GPFIFO         OK       0.012 ms  channel 1; runlist 0; 1 GPFIFO entries
+[S8] Workload+CWD Prep            OK       0.010 ms  156 push bytes; 1 indirect buffers
+[S9] Submit+Execute               OK   20356.308 ms  completion semaphore=2; 1 IBs retired
+[S10] Result Validation            OK       0.607 ms  add matched 8/8
+==============================================================
