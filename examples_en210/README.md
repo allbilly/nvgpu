@@ -59,11 +59,28 @@ Run from the repository root:
 python3 examples_en210/add.py          # add (default)
 python3 examples_en210/add.py mul      # multiply
 python3 examples_en210/add.py --offline-selftest
+python3 examples_en210/add.py --trace-selftest
 ```
 
-The trace uses the same S1–S10 lifecycle as `examples/add.py`. On Tesla,
+The trace uses the same S1–S10 lifecycle and visual hierarchy as
+`examples/add.py`, including numbered subsections, indented child details,
+and caller-attributed `CALL`, `RETURN`, and `CTX` records. On Tesla,
 S3 reports the real VBIOS clock/devinit work; only S4 (secure firmware boot)
 and S5 (GSP/RM) are marked N/A because GT218 predates those subsystems.
+
+The default `EN210_TRACE=1` streams stage completion and elapsed time,
+transport phase durations, summarized hardware waits, Chestnut LTSSM/retrain
+state, every PCIe hop's maximum and negotiated speed/width, and read-only
+hardware/memory/GR/FIFO snapshots. GT218 memory setup is owned by its VBIOS
+devinit scripts; the trace reports that policy and the resulting PFB/strap/TLB
+state rather than claiming a separate Kepler-style RAM-training operation.
+
+Set `EN210_TRACE=2` to add changed BAR0 register reads and every BAR0 register
+write, annotated with the active S-stage, transport phase, and caller. Use
+`EN210_TRACE=0` for compact output. Individual semantic groups can be hidden
+with `EN210_PCIE_TRACE=0`, `EN210_PHASE_TRACE=0`, `EN210_HW_TRACE=0`, or
+`EN210_MEM_TRACE=0`. These trace controls do not enable PCIe retraining or
+change VBIOS/memory initialization policy.
 
 ## Bring-up chain (all steps completed)
 

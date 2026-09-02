@@ -12,6 +12,7 @@ Environment variables:
   EN210_BLOCK   Block dimension (default: N)
   EN210_IFACE   AUTO (default), USB, or SOCKET
   EN210_USBDEV  Optional Chestnut USB VID:PID override
+  EN210_TRACE   0=compact, 1=semantic lifecycle (default), 2=register I/O
 
 Binary data files (in runtime/):
   en210.rom     GT218 VBIOS dump (64KB)
@@ -23,48 +24,148 @@ If ptxas 6.5 is available (EN210_PTXAS env var or tools/cuda65-bin/ptxas), it
 will compile the embedded PTX source instead. runtime/add_sass.bin is optional.
 """
 from __future__ import annotations
-import contextlib, ctypes, enum, functools, os, socket, struct, sys, time
+import builtins, contextlib, ctypes, enum, functools, io, os, socket, struct, sys, threading, time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path: sys.path.insert(0, REPO_ROOT)
 from autogen import libusb, pci
 
 TRACE = int(os.environ.get('EN210_TRACE', os.environ.get('NV_TRACE', '1')) or 0)
+_trace_last_reg_read = {}
+_trace_tls = threading.local()
+_raw_print = builtins.print
+
+def _trace_depth(): return getattr(_trace_tls, 'depth', 0)
+def _trace_set_depth(depth): _trace_tls.depth = max(0, int(depth))
+
+def print(*args, **kwargs):
+  """Module-local print that indents narrative output inside trace scopes."""
+  depth = _trace_depth() if TRACE else 0
+  if depth and args:
+    prefix, first = '  ' * depth, args[0]
+    first = prefix + (first.replace('\n', '\n' + prefix) if isinstance(first, str) else str(first))
+    args = (first, *args[1:])
+  return _raw_print(*args, **kwargs)
+
+_TRACE_PLUMBING = frozenset({
+    '_trace_caller', '_trace_emit', 'trace_note', 'trace_call_scope',
+    'stage_set', 'stage_done', 'stage_skip', 'stage_fail', 'print',
+    '__enter__', '__exit__', '<lambda>',
+})
+
+def _trace_caller():
+  frame = sys._getframe(1)
+  while frame is not None:
+    name = frame.f_code.co_name
+    if name not in _TRACE_PLUMBING:
+      owner = frame.f_locals.get('self')
+      return f'{type(owner).__name__}.{name}' if owner is not None else name
+    frame = frame.f_back
+  return '?'
+
+def _trace_emit(stage_label, tag, caller, message, *, depth=None):
+  if not TRACE: return
+  prefix = '  ' * (_trace_depth() if depth is None else max(0, depth))
+  label = f'[{stage_label}] ' if stage_label else ''
+  lines = str(message).splitlines() or ['']
+  _raw_print(f'{prefix}{label}{tag}[{caller}] {lines[0]}', flush=True)
+  continuation = prefix + (' ' * len(label)) + '  '
+  for line in lines[1:]: _raw_print(f'{continuation}{line}', flush=True)
+
+def _next_subsection():
+  global _stage_subsection
+  _stage_subsection += 1
+  return f'S{_stage_current}.{_stage_subsection}' if _stage_current else ''
+
+def trace_note(message, tag='CTX', caller=None):
+  if TRACE: _trace_emit(_next_subsection(), tag, caller or _trace_caller(), message)
+
+@contextlib.contextmanager
+def trace_call_scope(label, *, caller=None, detail=''):
+  if not TRACE:
+    yield
+    return
+  owner, section = caller or label, _next_subsection()
+  _trace_emit(section, 'CALL', owner, f"begin{f' {detail}' if detail else ''}")
+  old_depth, start_ns = _trace_depth(), time.monotonic_ns()
+  _trace_set_depth(old_depth + 1)
+  try:
+    yield
+  except BaseException as exc:
+    _trace_set_depth(old_depth)
+    _trace_emit(section, 'FAIL', owner, f'{type(exc).__name__}: {exc}')
+    raise
+  else:
+    _trace_set_depth(old_depth)
+    _trace_emit(section, 'RETURN', owner,
+                f'done duration_ms={(time.monotonic_ns() - start_ns) / 1e6:.3f}')
+
+def traced_call(fn):
+  @functools.wraps(fn)
+  def wrapper(*args, **kwargs):
+    with trace_call_scope(fn.__qualname__, caller=fn.__qualname__): return fn(*args, **kwargs)
+  return wrapper
+
 STAGES = ['PCIe/Transport', 'GPU Discovery+MMU', 'Firmware Prep', 'Secure FW Boot',
           'GSP/RM Online', 'Golden GR Context', 'User Channels+GPFIFO',
-          'Workload+QMD Prep', 'Submit+Execute', 'Result Validation']
+          'Workload+Push Prep', 'Submit+Execute', 'Result Validation']
 _stage_status = {}
 _stage_current = 0
+_stage_subsection = 0
 _stage_reported = False
 
+def stage_reset():
+  global _stage_current, _stage_subsection, _stage_reported
+  _stage_status.clear()
+  _stage_current = _stage_subsection = 0
+  _stage_reported = False
+  _trace_set_depth(0)
+
 def stage_set(n, note=''):
-  global _stage_current
-  _stage_current = n
-  _stage_status[n] = {'ok': False, 'note': note}
-  if TRACE: print(f'[S{n}] {STAGES[n - 1]}: {note or "begin"}', flush=True)
+  global _stage_current, _stage_subsection
+  _trace_set_depth(0)
+  _stage_current, _stage_subsection = n, 0
+  _stage_status[n] = {'ok': False, 'note': note, 'start_ns': time.monotonic_ns()}
+  if TRACE:
+    _trace_emit(f'S{n}', 'CALL', _trace_caller(), f'{STAGES[n - 1]} — {note or "begin"}', depth=0)
+    _trace_set_depth(1)
 
 def stage_done(note=''):
   if not _stage_current: return
-  _stage_status.setdefault(_stage_current, {'ok': False, 'note': ''})['ok'] = True
+  st = _stage_status.setdefault(_stage_current, {'ok': False, 'note': '', 'start_ns': time.monotonic_ns()})
+  st['ok'] = True
+  st['duration_ms'] = (time.monotonic_ns() - st['start_ns']) / 1e6
   if note: _stage_status[_stage_current]['note'] = note
+  if TRACE:
+    _trace_set_depth(0)
+    _trace_emit(f'S{_stage_current}', 'RETURN', _trace_caller(),
+                f'{STAGES[_stage_current - 1]} — done duration_ms={st["duration_ms"]:.3f}', depth=0)
 
 def stage_skip(n, note):
-  global _stage_current
-  _stage_current = n
-  _stage_status[n] = {'ok': False, 'na': True, 'note': note}
-  if TRACE: print(f'[S{n}] {STAGES[n - 1]}: N/A ({note})', flush=True)
+  global _stage_current, _stage_subsection
+  _trace_set_depth(0)
+  _stage_current, _stage_subsection = n, 0
+  _stage_status[n] = {'ok': False, 'na': True, 'note': note, 'duration_ms': 0.0}
+  if TRACE: _trace_emit(f'S{n}', 'N/A', _trace_caller(), f'{STAGES[n - 1]} — {note}', depth=0)
 
 def stage_fail(note):
   if not _stage_current: return
-  _stage_status.setdefault(_stage_current, {'ok': False, 'note': ''}).update(failed=True, note=note)
+  st = _stage_status.setdefault(_stage_current, {'ok': False, 'note': '', 'start_ns': time.monotonic_ns()})
+  st.update(failed=True, note=note,
+            duration_ms=(time.monotonic_ns() - st['start_ns']) / 1e6)
+  if TRACE:
+    _trace_set_depth(0)
+    _trace_emit(f'S{_stage_current}', 'FAIL', _trace_caller(),
+                f'{STAGES[_stage_current - 1]} — duration_ms={st["duration_ms"]:.3f} {note}', depth=0)
 
 def stage_summary():
   global _stage_reported
-  if not TRACE or _stage_reported: return
+  if not TRACE or _stage_reported or not _stage_status: return
   _stage_reported = True
-  print('\n' + '=' * 62, flush=True)
-  print(f'{"NVIDIA GPU RUN":^62}', flush=True)
-  print('=' * 62, flush=True)
+  _trace_set_depth(0)
+  _raw_print('\n' + '=' * 62, flush=True)
+  _raw_print(f'{"NVIDIA EN210 RUN":^62}', flush=True)
+  _raw_print('=' * 62, flush=True)
   for i, name in enumerate(STAGES, 1):
     st = _stage_status.get(i)
     if st and st.get('ok'): mark = 'OK  '
@@ -72,9 +173,117 @@ def stage_summary():
     elif st and st.get('na'): mark = 'N/A '
     elif st: mark = '....'
     else: mark = '----'
+    elapsed = (f" {st['duration_ms']:9.3f} ms" if st and
+               st.get('duration_ms') is not None else '             ')
     extra = f"  {st['note']}" if st and st.get('note') else ''
-    print(f'[S{i}] {name:<28} {mark}{extra}', flush=True)
-  print('=' * 62, flush=True)
+    _raw_print(f'[S{i}] {name:<28} {mark}{elapsed}{extra}', flush=True)
+  _raw_print('=' * 62, flush=True)
+
+def _set_transport_phase(obj, phase):
+  phase = str(phase)
+  now = time.monotonic_ns()
+  previous = getattr(obj, '_phase', None)
+  started = getattr(obj, '_phase_started_ns', now)
+  if (os.environ.get('EN210_PHASE_TRACE', '1') != '0' and previous is not None
+      and phase != previous):
+    caller = f'{type(obj).__name__}.set_phase'
+    trace_note(f'{previous} done duration_ms={(now - started) / 1e6:.3f}', tag='RETURN', caller=caller)
+    trace_note(f'{phase} begin', tag='CALL', caller=caller)
+  obj._phase, obj._phase_started_ns = phase, now
+
+def trace_format_selftest():
+  """Exercise trace numbering/indentation without opening USB or the socket."""
+  if not TRACE: raise RuntimeError('--trace-selftest requires EN210_TRACE=1 or 2')
+  stage_reset()
+  capture = io.StringIO()
+  with contextlib.redirect_stdout(capture):
+    stage_set(1, 'exercise trace formatter without hardware')
+    trace_note('numbered semantic subsection')
+    with trace_call_scope('trace_demo.inner', caller='trace_demo.inner'): print('indented child detail')
+    stage_done('trace hierarchy rendered')
+    stage_skip(4, 'expected pre-Falcon EN210 example')
+    stage_summary()
+  rendered = capture.getvalue()
+  required = ('[S1] CALL[trace_format_selftest]', '  [S1.1] CTX[trace_format_selftest]',
+              '  [S1.2] CALL[trace_demo.inner]', '    indented child detail',
+              '  [S1.2] RETURN[trace_demo.inner]', '[S1] RETURN[trace_format_selftest]',
+              '[S4] N/A[trace_format_selftest]')
+  missing = [needle for needle in required if needle not in rendered]
+  if missing: raise AssertionError(f'trace formatter missing records: {missing}')
+  _raw_print(rendered, end='')
+  _raw_print('en210_trace_selftest=ok subsections=2 indentation=2 caller_tags=ok')
+
+def _trace_reg_io(obj, kind, reg, value):
+  if TRACE < 2: return
+  if kind == 'r' and _trace_last_reg_read.get(reg) == value: return
+  if kind == 'r': _trace_last_reg_read[reg] = value
+  arrow = '->' if kind == 'r' else '<-'
+  print(f'[reg] S{_stage_current} phase={getattr(obj, "_phase", "unknown")} '
+        f'{kind} BAR0+{reg:#08x} {arrow} {value & 0xffffffff:#010x} '
+        f'caller={sys._getframe(2).f_code.co_name}', flush=True)
+
+def _trace_registers(dev, tag, label, registers):
+  env = 'EN210_MEM_TRACE' if tag == 'mem' else 'EN210_HW_TRACE'
+  if os.environ.get(env, '1') == '0': return
+  values = ' '.join(f'{name}={dev.read32(reg):#010x}' for name, reg in registers)
+  print(f'[{tag}] {label} {values}', flush=True)
+
+_PCIE_SPEEDS = {
+  1: 'Gen1/2.5GT/s', 2: 'Gen2/5.0GT/s', 3: 'Gen3/8.0GT/s',
+  4: 'Gen4/16GT/s', 5: 'Gen5/32GT/s', 6: 'Gen6/64GT/s',
+}
+_PCIE_TYPES = {
+  pci.PCI_EXP_TYPE_ENDPOINT: 'endpoint',
+  pci.PCI_EXP_TYPE_LEG_END: 'legacy-endpoint',
+  pci.PCI_EXP_TYPE_ROOT_PORT: 'root-port',
+  pci.PCI_EXP_TYPE_UPSTREAM: 'upstream-port',
+  pci.PCI_EXP_TYPE_DOWNSTREAM: 'downstream-port',
+  pci.PCI_EXP_TYPE_PCI_BRIDGE: 'pcie-pci-bridge',
+  pci.PCI_EXP_TYPE_PCIE_BRIDGE: 'pci-pcie-bridge',
+}
+
+def _pcie_find_cap(read_config, cap_id):
+  if not (read_config(pci.PCI_STATUS, 2) & pci.PCI_STATUS_CAP_LIST): return None
+  ptr, seen = read_config(pci.PCI_CAPABILITY_LIST, 1) & 0xfc, set()
+  while ptr and ptr not in seen and 0x40 <= ptr <= 0xfc:
+    seen.add(ptr)
+    if read_config(ptr + pci.PCI_CAP_LIST_ID, 1) == cap_id: return ptr
+    ptr = read_config(ptr + pci.PCI_CAP_LIST_NEXT, 1) & 0xfc
+  return None
+
+def _pcie_link_snapshot(read_config):
+  ident = read_config(pci.PCI_VENDOR_ID, 4)
+  cap = _pcie_find_cap(read_config, pci.PCI_CAP_ID_EXP)
+  if cap is None: return {'ident': ident, 'cap': None}
+  flags = read_config(cap + pci.PCI_EXP_FLAGS, 2)
+  link_cap = read_config(cap + pci.PCI_EXP_LNKCAP, 4)
+  link_ctl = read_config(cap + pci.PCI_EXP_LNKCTL, 2)
+  link_sta = read_config(cap + pci.PCI_EXP_LNKSTA, 2)
+  return {
+    'ident': ident, 'cap': cap,
+    'type': (flags & pci.PCI_EXP_FLAGS_TYPE) >> 4,
+    'max_speed': link_cap & pci.PCI_EXP_LNKCAP_SLS,
+    'max_width': (link_cap & pci.PCI_EXP_LNKCAP_MLW) >> 4,
+    'speed': link_sta & pci.PCI_EXP_LNKSTA_CLS,
+    'width': (link_sta & pci.PCI_EXP_LNKSTA_NLW) >> pci.PCI_EXP_LNKSTA_NLW_SHIFT,
+    'training': bool(link_sta & pci.PCI_EXP_LNKSTA_LT),
+    'dll_active': bool(link_sta & pci.PCI_EXP_LNKSTA_DLLLA),
+    'aspm': link_ctl & pci.PCI_EXP_LNKCTL_ASPMC,
+    'raw_status': link_sta,
+  }
+
+def _format_pcie_link(label, snap):
+  vendor, device = snap['ident'] & 0xffff, snap['ident'] >> 16
+  if snap['cap'] is None:
+    return f'[pcie] {label} id={vendor:04x}:{device:04x} capability=absent'
+  type_name = _PCIE_TYPES.get(snap['type'], f'type-{snap["type"]}')
+  max_speed = _PCIE_SPEEDS.get(snap['max_speed'], f'code{snap["max_speed"]}')
+  speed = _PCIE_SPEEDS.get(snap['speed'], f'code{snap["speed"]}')
+  return (f'[pcie] {label} id={vendor:04x}:{device:04x} type={type_name} '
+          f'max={max_speed}x{snap["max_width"]} negotiated={speed}x{snap["width"]} '
+          f'training={"yes" if snap["training"] else "no"} '
+          f'dll={"active" if snap["dll_active"] else "inactive"} '
+          f'aspm={snap["aspm"]:#x} lnksta={snap["raw_status"]:#06x}')
 
 # ============================================================================
 # VBIOS init script interpreter (ported from Nouveau nvbios_init.c)
@@ -1762,6 +1971,7 @@ def find_vbios_scripts(image: bytes) -> list:
   return scripts
 
 
+@traced_call
 def run_vbios_init(dev, image: bytes, scripts: list | None = None, debug: bool = False) -> None:
   """Execute the VBIOS devinit scripts sequentially."""
   init = NvbiosInit(dev, image, debug=debug)
@@ -1790,6 +2000,7 @@ TINYGPU_SOCK = os.environ.get('EN210_TINYGPU_SOCK', '/tmp/tinygpu.sock')
 class TinyGPUIface:
   """PCIe access through TinyGPU.app's DriverKit Unix socket."""
   def __init__(self):
+    self._phase, self._phase_started_ns = 'connect', time.monotonic_ns()
     self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     self._sock.settimeout(10.0)
     for _ in range(100):
@@ -1812,9 +2023,12 @@ class TinyGPUIface:
     return bytes(buf)
   def read32(self, reg):
     _, _, d = self._rpc(RemoteCmd.MMIO_READ, 0, reg & 0xffffffff, 4, readout=4)
-    return struct.unpack_from('<I', d)[0]
+    value = struct.unpack_from('<I', d)[0]
+    _trace_reg_io(self, 'r', reg, value)
+    return value
   def write32(self, reg, val):
     self._rpc(RemoteCmd.MMIO_WRITE, 0, reg & 0xffffffff, 4, payload=struct.pack('<I', val & 0xffffffff))
+    _trace_reg_io(self, 'w', reg, val)
   def cfg(self, off, sz=4):
     return self._rpc(RemoteCmd.CFG_READ, 0, off, sz)[0]
   def cfg_write(self, off, val, sz=4):
@@ -1822,6 +2036,7 @@ class TinyGPUIface:
   def map_bar(self, bar):
     v1, v2, _ = self._rpc(RemoteCmd.MAP_BAR, bar)
     return v1, v2
+  def set_phase(self, phase): _set_transport_phase(self, phase)
   def close(self):
     try: self._sock.close()
     except: pass
@@ -1928,9 +2143,13 @@ class ChestnutController:
   def __init__(self, usb):
     self.usb = usb
     self.stream_chunk = 512 if libusb.libusb_get_device_speed(usb.dev) <= libusb.LIBUSB_SPEED_HIGH else 1024
-    if self.read(0xb450, 1)[0] != 0x78: self.usb.control_write(0xf3, value=1, timeout=10000)
-    if (ltssm := self.read(0xb450, 1)[0]) != 0x78:
-      raise RuntimeError(f'Chestnut PCIe link not up (LTSSM=0x{ltssm:02x})')
+    self.ltssm_before = self.read(0xb450, 1)[0]
+    self.retrained = self.ltssm_before != 0x78
+    if self.retrained: self.usb.control_write(0xf3, value=1, timeout=10000)
+    self.ltssm_after = self.read(0xb450, 1)[0]
+    if self.ltssm_after != 0x78:
+      raise RuntimeError(f'Chestnut PCIe link not up (LTSSM={self.ltssm_after:#04x}, '
+                         f'before={self.ltssm_before:#04x}, retrained={self.retrained})')
 
   def _f0_out(self, fmt_type, byte_en, address, value, mode=0):
     self.usb.control_write(0xf0, fmt_type | byte_en << 8, mode & 3,
@@ -2003,6 +2222,7 @@ class USB3Iface:
       for dev, _ in visible: libusb.libusb_unref_device(dev)
 
   def __init__(self):
+    self._phase, self._phase_started_ns = 'connect', time.monotonic_ns()
     visible = self.devices()
     if not visible:
       choices = ', '.join(f'{v:04x}:{p:04x}' for v, p in self.candidate_ids())
@@ -2013,8 +2233,11 @@ class USB3Iface:
       self.usb = ChestnutController(transport)
       self.gpu_bus = self._discover_gpu()
       self._bars = self._setup_bars()
-      print(f'[transport] USB3 {transport.describe()}, GPU bus={self.gpu_bus}, '
+      ident = self.cfg(pci.PCI_VENDOR_ID, 4)
+      print(f'[transport] USB3 {transport.describe()}, GPU={ident & 0xffff:04x}:{ident >> 16:04x} '
+            f'bus={self.gpu_bus}, '
             + ' '.join(f'BAR{i}={addr:#x}/{size:#x}' for i, (addr, size) in sorted(self._bars.items())))
+      self._trace_pcie_links()
     except Exception:
       transport.close()
       raise
@@ -2073,15 +2296,33 @@ class USB3Iface:
                           value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
     if 0 not in bars: raise RuntimeError('EN210 BAR0 was not discovered')
     return bars
+  def _trace_pcie_links(self):
+    if os.environ.get('EN210_PCIE_TRACE', '1') == '0': return
+    print(f'[pcie] Chestnut LTSSM={self.usb.ltssm_before:#04x}->{self.usb.ltssm_after:#04x} '
+          f'link=up retrained={"yes" if self.usb.retrained else "no"}', flush=True)
+    for bus in range(self.gpu_bus + 1):
+      label = f'bus{bus}-{"gpu" if bus == self.gpu_bus else "bridge"}'
+      try:
+        snap = _pcie_link_snapshot(lambda offset, size, _bus=bus:
+          self.usb.pcie_cfg_req(offset, bus=_bus, size=size))
+        print(_format_pcie_link(label, snap), flush=True)
+      except Exception as e:
+        print(f'[pcie] {label} link-state unavailable: {e}', flush=True)
   def cfg(self, off, sz=4): return self.usb.pcie_cfg_req(off, bus=self.gpu_bus, size=sz)
   def cfg_write(self, off, val, sz=4): self.usb.pcie_cfg_req(off, bus=self.gpu_bus, value=val, size=sz)
   def map_bar(self, bar): return self._bars[bar]
   def read8(self, reg): return self.usb.pcie_request(0x00, self._bars[0][0] + reg, size=1)
   def write8(self, reg, val): self.usb.pcie_request(0x40, self._bars[0][0] + reg, value=val, size=1)
-  def read32(self, reg): return self.usb.pcie_request(0x00, self._bars[0][0] + reg, size=4)
-  def write32(self, reg, val): self.usb.pcie_request(0x40, self._bars[0][0] + reg, value=val & 0xffffffff, size=4)
+  def read32(self, reg):
+    value = self.usb.pcie_request(0x00, self._bars[0][0] + reg, size=4)
+    _trace_reg_io(self, 'r', reg, value)
+    return value
+  def write32(self, reg, val):
+    self.usb.pcie_request(0x40, self._bars[0][0] + reg, value=val & 0xffffffff, size=4)
+    _trace_reg_io(self, 'w', reg, val)
   def read_block(self, reg, size): return self.usb.pcie_mem_read(self._bars[0][0] + reg, size)
   def write_block(self, reg, data): self.usb.pcie_mem_write(self._bars[0][0] + reg, data)
+  def set_phase(self, phase): _set_transport_phase(self, phase)
   def close(self): self.usb.usb.close()
 
 class Dev:
@@ -2236,6 +2477,25 @@ INST_PUSH_OFF   = 0xFFE0
 # GMMU page table (1MB PGT in VRAM, identity-mapped for push buffer region)
 PGT_ADDR = VRAM_BASE + 0x30000  # 1MB PGT at VRAM 0x130000
 
+def _wait_reg_clear(dev, reg, mask, timeout_ms, label, interval_s=0.001):
+  start_ns, iters, value = time.monotonic_ns(), 0, None
+  deadline = time.monotonic() + timeout_ms / 1000.0
+  while time.monotonic() < deadline:
+    iters += 1
+    value = dev.read32(reg)
+    if not (value & mask):
+      if TRACE:
+        print(f'[wait] S{_stage_current} {label}: met after {iters} polls / '
+              f'{(time.monotonic_ns() - start_ns) / 1e6:.3f} ms '
+              f'value={value:#010x}', flush=True)
+      return True
+    time.sleep(interval_s)
+  if TRACE:
+    print(f'[wait] S{_stage_current} {label}: TIMEOUT after {iters} polls / '
+          f'{(time.monotonic_ns() - start_ns) / 1e6:.3f} ms '
+          f'value={value!r} mask={mask:#x}', flush=True)
+  return False
+
 def setup_gmmu(vram, inst_addr):
   """Set up a minimal GMMU page table for identity-mapped VRAM pages.
 
@@ -2285,12 +2545,11 @@ def setup_gmmu(vram, inst_addr):
   # Flush GMMU TLB for all known engine IDs
   for eng_id in [0x00, 0x01, 0x06, 0x08, 0x09, 0x0a, 0x0d]:
     vram.dev.write32(0x100c80, (eng_id << 16) | 1)
-    for _ in range(2000):
-      if not (vram.dev.read32(0x100c80) & 0x00000001):
-        break
-      time.sleep(0.001)
+    _wait_reg_clear(vram.dev, 0x100c80, 0x00000001, 2000,
+                    f'GMMU TLB engine={eng_id:#x}')
   print('[gmmu] TLB flushed')
 
+@traced_call
 def fifo_init(dev):
   """nv50_fifo_init."""
   print('[fifo] Init...')
@@ -2312,6 +2571,7 @@ def fifo_init(dev):
 
 CHIPSET = 0xa8  # GT218
 
+@traced_call
 def gr_init(dev, ctxprog=None, ctxvals=None, ctxvals_size=0):
   """nv50_gr_init for GT218 (chipset 0xa8).
   ctxprog: list of 32-bit instructions (from ctxnv50.py)
@@ -2400,6 +2660,7 @@ def gr_bind_context(dev, vram, chan_id, inst_addr, ctx_addr, ctx_size):
   vram.write32(eng_addr + ptr0 + 0x14, 0)
   print(f'[gr] GR context: addr=0x{ctx_addr:x} size={ctx_size} limit=0x{limit:x}')
 
+@traced_call
 def create_channel(dev, vram, push_words=None, setup_fn=None):
   """Create a G84_CHANNEL_GPFIFO channel and submit push words via GPFIFO.
   setup_fn(vram, inst_addr) is called after RAMFC+GMMU setup, before channel bind.
@@ -2455,6 +2716,7 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
 
   stage_done(f'channel {chan_id}, GMMU and RAMFC ready')
   stage_set(8, 'stage push buffer, GPFIFO entry, and GR context')
+  if hasattr(dev, 'set_phase'): dev.set_phase('workload-stage')
 
   # Write push buffer data
   for i, w in enumerate(push_words):
@@ -2483,9 +2745,8 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
   vram.write32(runlist_addr, chan_id)
   dev.write32(0x0032f4, runlist_addr >> 12)
   dev.write32(0x0032ec, 1)
-  for _ in range(100):
-    if not (dev.read32(0x0032ec) & 0x00000100): break
-    time.sleep(0.01)
+  _wait_reg_clear(dev, 0x0032ec, 0x00000100, 1000,
+                  'PFIFO runlist commit', interval_s=0.01)
   print(f'[chan] Runlist committed, 0x0032ec=0x{dev.read32(0x0032ec):08x}')
 
   # Start channel: set bit 31
@@ -2496,6 +2757,7 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
   dev.write32(0x002100, 0xffffffff)
   stage_done(f'{len(push_words)} push words, channel {chan_id} runnable')
   stage_set(9, 'ring GPPut and wait for GPGet')
+  if hasattr(dev, 'set_phase'): dev.set_phase('submit')
 
   # Set GPPut to trigger GPFIFO processing
   userd = USERD_BASE + chan_id * USERD_SIZE
@@ -2512,6 +2774,7 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
   print(f'[chan] Wrote GPPut=1 (entry index)')
 
   # Poll for completion
+  _submit_start_ns = time.monotonic_ns()
   for attempt in range(200):
     time.sleep(0.02)
     gp_get = dev.read32(userd + 0x88)
@@ -2519,6 +2782,12 @@ def create_channel(dev, vram, push_words=None, setup_fn=None):
     fifo_intr = dev.read32(0x002100)
     if gp_get == gp_put or fifo_intr != 0:
       break
+
+  if TRACE:
+    print(f'[wait] S{_stage_current} GPFIFO GPGet/GPPut: '
+          f'{"met" if gp_get == gp_put else "stopped"} after {attempt + 1} polls / '
+          f'{(time.monotonic_ns() - _submit_start_ns) / 1e6:.3f} ms '
+          f'GPGet={gp_get:#x} GPPut={gp_put:#x} PFIFO_INTR={fifo_intr:#x}', flush=True)
 
   print(f'[chan] After poll ({attempt+1} iterations):')
   print(f'  GPGet=0x{gp_get:08x} GPPut=0x{gp_put:08x}')
@@ -2951,10 +3220,8 @@ def extend_gmmu(vram, inst_addr, vaddr_start, vaddr_end):
     # Flush GMMU TLB
     for eng_id in [0x00, 0x01, 0x06, 0x08, 0x09, 0x0a, 0x0d]:
         vram.dev.write32(0x100c80, (eng_id << 16) | 1)
-        for _ in range(2000):
-            if not (vram.dev.read32(0x100c80) & 0x00000001):
-                break
-            time.sleep(0.001)
+        _wait_reg_clear(vram.dev, 0x100c80, 0x00000001, 2000,
+                        f'GMMU extended TLB engine={eng_id:#x}')
     print(f'[gmmu] Extended mapping: 0x{vaddr_start:06x}-0x{vaddr_end:06x}')
 
 # ============================================================================
@@ -3079,33 +3346,61 @@ def run_add(op='add'):
     try:
         stage_set(1, f'select transport for {op}')
         dev = Dev()
+        if hasattr(dev, 'set_phase'): dev.set_phase('map-bars')
         # Enable MSE
         cmd_reg = dev.cfg(0x04, 2)
         if not (cmd_reg & 0x0002):
             dev.cfg_write(0x04, cmd_reg | 0x0002, 2)
-        dev.map_bar(0)
+        bar0_addr, bar0_size = dev.map_bar(0)
         dev.write32(0x000200, 0xffffffff)
         print(f'PMC_ENABLE = 0x{dev.read32(0x000200):08x}')
         pci_id = dev.cfg(0x00, 4)
         if pci_id != 0x0a6510de: raise RuntimeError(f'expected EN210 10de:0a65, got {pci_id:#010x}')
+        if (not isinstance(dev, USB3Iface) and
+            os.environ.get('EN210_PCIE_TRACE', '1') != '0'):
+            try:
+                print(_format_pcie_link('socket-gpu', _pcie_link_snapshot(dev.cfg)), flush=True)
+            except Exception as e:
+                print(f'[pcie] socket-gpu link-state unavailable: {e}', flush=True)
+        if os.environ.get('EN210_HW_TRACE', '1') != '0':
+            print(f'[hw] transport={type(dev).__name__} id={pci_id:#010x} '
+                  f'pci_command={dev.cfg(0x04, 2):#06x} '
+                  f'bar0={bar0_addr:#x}/{bar0_size:#x}', flush=True)
         stage_done(f'{type(dev).__name__}, PCI 10de:0a65, BAR0 mapped')
 
         stage_set(2, 'identify GT218 and verify PRAMIN access')
+        if hasattr(dev, 'set_phase'): dev.set_phase('discovery')
         boot0 = dev.read32(0x000000)
         chipset = (boot0 >> 20) & 0xfff
         if chipset != 0xa8: raise RuntimeError(f'expected GT218 chipset 0xa8, got {chipset:#x}')
+        _trace_registers(dev, 'hw', 'discovery', (
+            ('boot0', 0x000000), ('pmc_enable', 0x000200),
+            ('units', 0x001540), ('disable', 0x00154c)))
+        _trace_registers(dev, 'mem', 'discovery', (
+            ('pfb_status', 0x100000), ('strap', 0x101000),
+            ('pramin_window', PRAMIN_WINDOW_REG), ('tlb', 0x100c80)))
         stage_done('GT218 detected; GMMU tables are staged with the channel in S7')
 
         stage_set(3, 'load VBIOS/context assets and execute legacy clock/devinit scripts')
+        if hasattr(dev, 'set_phase'): dev.set_phase('vbios-devinit')
 
         # VBIOS devinit
         rom_path = os.path.join(os.path.dirname(__file__), 'runtime', 'en210.rom')
         with open(rom_path, 'rb') as f:
             image = f.read()
         scripts = find_vbios_scripts(image)
+        if os.environ.get('EN210_MEM_TRACE', '1') != '0':
+            print(f'[mem] policy devinit=execute scripts={len(scripts)} '
+                  f'training=vbios-script-owned separate_host_training=no', flush=True)
         for s in scripts:
             run_vbios_init(dev, image, scripts=[s], debug=False)
         print('Devinit complete.')
+        _trace_registers(dev, 'hw', 'after-devinit', (
+            ('pmc_enable', 0x000200), ('units', 0x001540),
+            ('timer_ctrl', 0x009120), ('gr_ctrl', 0x400500)))
+        _trace_registers(dev, 'mem', 'after-devinit', (
+            ('pfb_status', 0x100000), ('strap', 0x101000),
+            ('pramin_window', PRAMIN_WINDOW_REG), ('tlb', 0x100c80)))
 
         ctxprog_globals = {}
         with open(os.path.join(os.path.dirname(__file__), 'runtime', 'ctxprog.py')) as f:
@@ -3120,6 +3415,7 @@ def run_add(op='add'):
         stage_skip(4, 'GT218 has no secure Falcon/GSP boot chain')
         stage_skip(5, 'legacy FIFO/GR is programmed directly; no GSP/RM')
         stage_set(6, 'initialize VRAM, FIFO, PGRAPH, and golden GR context program')
+        if hasattr(dev, 'set_phase'): dev.set_phase('legacy-init')
 
         # Verify VRAM
         vram = VRAM(dev)
@@ -3132,6 +3428,13 @@ def run_add(op='add'):
 
         # GR init
         gr_init(dev, ctxprog=ctxprog, ctxvals=ctxvals, ctxvals_size=ctxvals_size)
+        _trace_registers(dev, 'hw', 'fifo-gr-ready', (
+            ('pfifo_enable', 0x002500), ('pfifo_intr', 0x002100),
+            ('pgraph_intr', 0x400100), ('pgraph_trap', 0x400108),
+            ('pgraph_ctrl', 0x400500), ('ctxprog_index', 0x400324)))
+        _trace_registers(dev, 'mem', 'vram-ready', (
+            ('pfb_status', 0x100000), ('strap', 0x101000),
+            ('pramin_window', PRAMIN_WINDOW_REG), ('tlb', 0x100c80)))
         stage_done(f'VRAM verified; FIFO online; {len(ctxprog)}-word ctxprog uploaded')
 
         # Upload kernel SASS to VRAM
@@ -3175,15 +3478,22 @@ def run_add(op='add'):
         print('\n=== Compute Launch ===')
         setup_fn = make_setup_fn(ctxvals, ctxvals_size)
         stage_set(7, 'construct legacy G84 channel, GMMU, and RAMFC')
+        if hasattr(dev, 'set_phase'): dev.set_phase('channel-build')
         t_kern0 = time.time()
         create_channel(dev, vram, push_words=push, setup_fn=setup_fn)
         t_kern1 = time.time()
         kernel_ms = (t_kern1 - t_kern0) * 1000.0
         print(f'[en210] kernel_time_ms={kernel_ms:.3f} op={op} N={N} block={block_dim} grid={grid_dim}')
+        _trace_registers(dev, 'hw', 'after-submit', (
+            ('pfifo_enable', 0x002500), ('pfifo_intr', 0x002100),
+            ('runlist', 0x0032ec), ('pgraph_intr', 0x400100),
+            ('pgraph_trap', 0x400108), ('pgraph_ctrl', 0x400500)))
 
         # Read back results
         stage_set(10, f'read and validate {N} {op} results')
+        if hasattr(dev, 'set_phase'): dev.set_phase('output-read')
         print('\n=== Result Readback ===')
+        if TRACE: print('[wait] S10 result-settle: fixed delay 500.000 ms', flush=True)
         time.sleep(0.5)
 
         # Check GR/FIFO status — print trap diagnostics only on error
@@ -3248,7 +3558,9 @@ def run_add(op='add'):
         stage_fail(f'{type(e).__name__}: {e}')
         raise
     finally:
-        if dev is not None: dev.close()
+        if dev is not None:
+            if hasattr(dev, 'set_phase'): dev.set_phase('client-close')
+            dev.close()
 
 def offline_selftest():
     """Exercise both kernels, assets, stages, and USB packet logic without a GPU."""
@@ -3265,7 +3577,28 @@ def offline_selftest():
     if ctrl.pcie_request(0x00, 0x1001, size=1) != 0x22: raise AssertionError('F0 byte read')
     ctrl.pcie_request(0x40, 0x1002, value=0xab, size=1)
     if ctrl.usb.out[-1][1] != 0x440: raise AssertionError('F0 byte-enable encoding')
-    stage_done('F0 config/MMIO byte access encoded')
+    cfg = bytearray(256)
+    struct.pack_into('<I', cfg, pci.PCI_VENDOR_ID, 0x0a6510de)
+    struct.pack_into('<H', cfg, pci.PCI_STATUS, pci.PCI_STATUS_CAP_LIST)
+    cfg[pci.PCI_CAPABILITY_LIST] = 0x50
+    cfg[0x50 + pci.PCI_CAP_LIST_ID] = pci.PCI_CAP_ID_EXP
+    struct.pack_into('<H', cfg, 0x50 + pci.PCI_EXP_FLAGS,
+                     pci.PCI_EXP_TYPE_ENDPOINT << 4)
+    struct.pack_into('<I', cfg, 0x50 + pci.PCI_EXP_LNKCAP, 2 | (16 << 4))
+    struct.pack_into('<H', cfg, 0x50 + pci.PCI_EXP_LNKSTA,
+                     1 | (1 << pci.PCI_EXP_LNKSTA_NLW_SHIFT) |
+                     pci.PCI_EXP_LNKSTA_DLLLA)
+    snap = _pcie_link_snapshot(
+        lambda off, size: int.from_bytes(cfg[off:off + size], 'little'))
+    if snap['max_speed'] != 2 or snap['speed'] != 1 or snap['width'] != 1:
+        raise AssertionError(f'PCIe capability decode {snap}')
+    if os.environ.get('EN210_PCIE_TRACE', '1') != '0':
+        print(_format_pcie_link('offline-gpu', snap), flush=True)
+    class PhaseProbe: pass
+    phase_probe = PhaseProbe()
+    phase_probe._phase, phase_probe._phase_started_ns = 'offline-connect', time.monotonic_ns()
+    _set_transport_phase(phase_probe, 'offline-map-bars')
+    stage_done('F0 config/MMIO byte access and PCIe link decode validated')
 
     stage_set(2, 'offline PRAMIN window boundary model')
     class FakeDev:
@@ -3296,7 +3629,13 @@ def offline_selftest():
 
     stage_set(6, 'validate legacy GR context metadata')
     if ctx['ctxvals_size'] != 0x4ba00: raise AssertionError('ctxvals size')
-    stage_done('ctxprog and golden context dimensions match GT218')
+    class WaitDev:
+        def __init__(self): self.values = [1, 0]
+        def read32(self, _reg): return self.values.pop(0)
+    if not _wait_reg_clear(WaitDev(), 0x100c80, 1, 100,
+                           'offline GMMU completion', interval_s=0):
+        raise AssertionError('wait trace model')
+    stage_done('ctxprog, golden context dimensions, and wait tracing match GT218')
 
     stage_set(7, 'validate GPFIFO/channel encodings')
     entry = gp_entry(0x110000, 186)
@@ -3329,7 +3668,11 @@ def offline_selftest():
     print('offline_selftest=ok add_sass=88 mul_sass=88 stages=10 usb3_mock=ok')
 
 def main():
+    stage_reset()
     try:
+        if '--trace-selftest' in sys.argv:
+            trace_format_selftest()
+            return
         if '--offline-selftest' in sys.argv:
             offline_selftest()
             return
@@ -3337,15 +3680,18 @@ def main():
             stage_set(1, 'probe selected transport')
             dev = Dev()
             try:
+                if hasattr(dev, 'set_phase'): dev.set_phase('probe-config')
                 ven_dev = dev.cfg(0x00, 4)
                 print(f"PCI_ID={ven_dev:#010x}")
                 dev.map_bar(0)
                 stage_done(f'{type(dev).__name__}, PCI {ven_dev & 0xffff:04x}:{ven_dev >> 16:04x}')
                 stage_set(2, 'read chipset identity')
+                if hasattr(dev, 'set_phase'): dev.set_phase('probe-mmio')
                 boot0 = dev.read32(0x000000)
                 print(f"PMC_BOOT_0={boot0:#010x} chip_id={(boot0>>20)&0xFFF:#05x}")
                 stage_done(f'chipset={(boot0 >> 20) & 0xfff:#x}')
             finally:
+                if hasattr(dev, 'set_phase'): dev.set_phase('client-close')
                 dev.close()
             return
         args = [arg for arg in sys.argv[1:] if not arg.startswith('-')]

@@ -6,7 +6,7 @@ Based on nouveau nv50.c / g84.c channel layout.
 """
 from __future__ import annotations
 import sys, os, struct, socket, time, enum
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'examples_kepler'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'examples_kepler', 'runtime'))
 from nvbios_init import find_vbios_scripts, run_vbios_init
 
 # ============================================================================
