@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Kepler ``mul`` smoke test and launcher.
 
-Uses the checked-in ``examples_kepler/mul_kepler.cubin`` (or assembles from
+Uses the checked-in ``examples_kepler/runtime/mul_kepler.cubin`` (or assembles from
 PTX with CUDA 10.2 ``ptxas``).  Hardware launch reuses the shared add launcher
 with ``KEPLER_OPERATION=mul``.
 """

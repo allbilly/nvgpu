@@ -1,7 +1,7 @@
 # examples_kepler_pcie
 
 Linux raw-MMIO userspace driver for GTX 770 (Kepler GK104, sm_30) over PCIe.
-Port of `examples_kepler/add.py` (macOS TinyGPU socket transport) to direct
+Port of `examples_kepler/add_770.py` (macOS TinyGPU socket transport) to direct
 BAR0/BAR1 mmap via sysfs (`/sys/bus/pci/devices/<bdf>/resourceN`).
 
 ## Running the OpenCL add (reference working path)
@@ -130,8 +130,8 @@ sudo KEPLER_LIVE_ACK=raw-mmio-risk PYTHONPATH=../ref:$PYTHONPATH python3 add.py 
 
 # Full hardware add (needs cubin + vbios + firmware)
 sudo KEPLER_LIVE_ACK=raw-mmio-risk \
-     KEPLER_CUBIN=../examples_kepler/add_kepler.cubin \
-     KEPLER_VBIOS=../examples_kepler/Palit.GTX770.4096.131216.rom \
+     KEPLER_CUBIN=../examples_kepler/runtime/add_kepler.cubin \
+     KEPLER_VBIOS=../examples_kepler/runtime/Palit.GTX770.4096.131216.rom \
      PYTHONPATH=../ref:$PYTHONPATH python3 add.py
 ```
 
@@ -157,4 +157,4 @@ initial value. Even an immediate-exit kernel stalls. The GR golden context
 image is generated via `_gk104_grctx_main()` but the compute launch path
 (SET_OBJECT → LAUNCH → semaphore) does not produce a semaphore update.
 
-See `../examples_kepler/progress.md` for the full bring-up history.
+See `../examples_kepler/docs/progress.md` for the full bring-up history.

@@ -1,17 +1,17 @@
 # Progress — GTX 770 / GK104 PCIe bring-up (`examples_kepler_pcie/add.py`)
 
-Linux port of `examples_kepler/add.py` using raw MMIO via sysfs resourceN mmap
+Linux port of `examples_kepler/add_770.py` using raw MMIO via sysfs resourceN mmap
 instead of macOS TinyGPU socket transport. Target: `out[i]=a[i]+b[i]` compute
 kernel on the GTX 770 (GK104) at PCI 09:00.0 (unbound, no driver).
 
-Parent progress: `examples_kepler/progress.md` (TinyGPU/macOS path).
+Parent progress: `examples_kepler/docs/progress.md` (TinyGPU/macOS path).
 
 ## Hardware
 
 - RTX 3080 Ti at 04:00.0 (bound to nvidia 595, /dev/nvidia0)
 - GTX 770 (GK104) at 09:00.0 — UNBOUND, no driver
 - GK104 falcon firmware in `firmware/gk104/` (extracted via `firmware/gk104/extract_fw.py`)
-- VBIOS: `examples_kepler/Palit.GTX770.4096.131216.rom`
+- VBIOS: `examples_kepler/runtime/Palit.GTX770.4096.131216.rom`
 
 ## Verified working
 
@@ -115,7 +115,7 @@ causes issues (though the interrupt-masking fix helps).
 ## 2026-07-15 — full progress and golden-reference audit
 
 - Read both repository progress logs in full: this PCIe log and all 2,595
-  lines of `examples_kepler/progress.md`.  The PCIe implementation must retain
+  lines of `examples_kepler/docs/progress.md`.  The PCIe implementation must retain
   the Linux raw-MMIO transport while reconciling the mature GR/FIFO work from
   the TinyGPU path; previously ruled-out experiments are not being replayed.
 - Classified the reference captures.  `opencl_{ioctl,strace,rm_sequence}` is
@@ -641,7 +641,7 @@ causes issues (though the interrupt-masking fix helps).
   complete post-Nouveau workflow: GTX 770 Rusticl/OpenCL health PASS, unbind
   without reset, guarded raw probe, then raw-MMIO add PASS.  Next port the
   proven TEMP sizing (and only shared source-backed fixes) to
-  `examples_kepler/add.py`, update its progress log, and run both offline
+  `examples_kepler/add_770.py`, update its progress log, and run both offline
   verification suites before claiming the port complete.
 - Final offline verification passes for both implementations: `py_compile`,
   each `--middle-selftest`, each `NV_BACKEND=software` vector add, and scoped
@@ -701,7 +701,7 @@ causes issues (though the interrupt-masking fix helps).
   `cubin_compare=byte-identical` (1,768 bytes); mul SHA-256 is
   `edde9272ed2b6e5a98c47cd52c18cfdfec40670af77383ab14d59762bb77fbd8`.
 - Final layout check: `examples_kepler_pcie/add.py` is 8,196 lines and
-  `examples_kepler/add.py` is 389 lines, matching the recovered cleanup target.
+  `examples_kepler/add_770.py` is 389 lines, matching the recovered cleanup target.
 - Final repeat after the documentation/count adjustment: py_compile, both
   middle self-tests, the software demo, both cubin comparisons, and
   `git diff --check` all pass.
@@ -722,4 +722,3 @@ causes issues (though the interrupt-masking fix helps).
   No copy is present or recoverable; only source-code/progress references
   remain. A fresh Nouveau MMIO capture must therefore be made and compressed
   (for example, `gzip -9 nouveau_gk104_mmiotrace.txt`).
-

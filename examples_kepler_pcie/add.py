@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Linux entrypoint for the GK104 stack.
 
-The full self-contained implementation lives in ``examples_kepler/add.py``
+The full self-contained implementation lives in ``examples_kepler/add_770.py``
 (same shape as ``examples/add.py``).  This file re-exports that module so
 existing ``from examples_kepler_pcie import add`` / ``python3
 examples_kepler_pcie/add.py`` callers keep working.  On Linux the standalone
@@ -14,12 +14,11 @@ import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEPLER_DIR = os.path.join(REPO_ROOT, "examples_kepler")
-TINYGRAD_ROOT = os.path.join(REPO_ROOT, "ref")
-for _path in (REPO_ROOT, TINYGRAD_ROOT, KEPLER_DIR):
+for _path in (REPO_ROOT, KEPLER_DIR):
   if _path not in sys.path:
     sys.path.insert(0, _path)
 
-_IMPL_PATH = os.path.join(KEPLER_DIR, "add.py")
+_IMPL_PATH = os.path.join(KEPLER_DIR, "add_770.py")
 _spec = importlib.util.spec_from_file_location("examples_kepler_add", _IMPL_PATH)
 if _spec is None or _spec.loader is None:
   raise ImportError(f"cannot load GK104 stack from {_IMPL_PATH}")
