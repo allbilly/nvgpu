@@ -44,6 +44,35 @@ objects are copied and remapped into physical VRAM before submission.
 The GTX 660 Ti entry point uses the same macOS selection contract: direct
 Chestnut USB3 when present, with TinyGPU.app's socket as the fallback. Both
 board entry points accept `KEPLER_USBDEV=VID:PID` for a non-default controller.
+Its seven-TPC GR context keeps Nouveau's native attribute geometry
+(`0x324/0x7ff` allocation strides and `0x218/0x648` active counts). The
+logical 0x9c000-byte attribute buffer is mapped across two bit-19-safe physical
+VRAM banks. Compute TLS is kept above VA `0x200000`, clear of the FECS guard
+leaf at `0x100000`; the preserved historical allocation sequence places the
+default workload at `0x280000`. Although the add/mul SASS itself uses only CB0
+and global memory, the 660-labeled `bc12d25` candidate used the 47-word
+Mesa-style stream with valid TIC/TSC bases and a zeroed CB7 alias; that is the
+default again. No retained `10de:1183` S10 log proves that candidate worked.
+`KEPLER_MESA_TEX_AUX=0` retains the unverified 39-word GTX 770-shaped A/B
+control. The USB path omits the final two LTC context-list entries by default
+because they previously parked the slow FECS walk; `KEPLER_LTC_MMIO_LIST=1`
+restores the trace-exact native-PCIe list. After replacing the temporary golden
+GR-context pointer, the direct-USB path recommits the channel with the sanitized
+`0x2270/0x2274` sequence used by the S10-passing GTX 770 log and the unverified
+660-labeled historical candidate;
+`KEPLER_RECOMMIT_RUNLIST=0` keeps the failed Nouveau capture's no-recommit
+ordering as an A/B control. Its completion packet disables WFI after
+`NV50_GRAPH_SERIALIZE`, because seven-TPC PGRAPH can remain sticky-busy; only
+the final numerical comparison is accepted as compute success. Small mirror
+uploads and small result snapshots use BAR0 PRAMIN by default, matching the
+historical 660-labeled candidates. Because the no-WFI semaphore proves
+PBDMA progress rather than shader completion, the direct-USB path waits locally
+for `KEPLER_OUT_SETTLE_MS` (500 ms by default), then takes exactly one snapshot;
+it does not poll the output. Results above `KEPLER_MIRROR_PRAMIN_MAX` (64 KiB by
+default), or `KEPLER_MIRROR_COPY=bar1`, use one final BAR1 read instead. The
+warmed lines are kept through the doorbell by default;
+`KEPLER_SKIP_FINAL_LTC_INV=0` opts into the older experimental pre-`GP_PUT`
+invalidate.
 
 ## S1-S10 trace
 
@@ -55,7 +84,7 @@ board entry points accept `KEPLER_USBDEV=VID:PID` for a non-default controller.
 6. golden and runtime GR context construction
 7. RAMIN, USERD, channel, runlist, and GPFIFO setup
 8. cubin, CWD, constants, and push-buffer preparation
-9. runlist commit, GP_PUT, and completion wait
+9. recommit the runtime runlist, GP_PUT, and completion wait
 10. output validation
 
 The default `KEPLER_TRACE=1` reports the semantic bring-up checkpoints, wait

@@ -45,7 +45,6 @@ BASE_ENV = {
     "KEPLER_SEED": "42",
     "KEPLER_AUTO_WARM_CONTINUE": "1",
     "KEPLER_LIVE_ACK": "completion-abort-risk",
-    "KEPLER_RAMCFG_STRAP": "5",
     "KEPLER_MAX_WINDOWS": "64",
 }
 

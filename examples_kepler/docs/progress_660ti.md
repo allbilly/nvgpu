@@ -1,9 +1,137 @@
-# Progress — GTX 770 / GK104 add_660ti.py bring-up
+# Progress — GTX 660 Ti / GK104 add_660ti.py bring-up
 
 Live status of getting a Kepler `sm_30` `out[i]=a[i]+b[i]` (and `mul`) kernel
-running on the GTX 770 (GK104) eGPU over USB4 via TinyGPU.
+running on the seven-TPC GTX 660 Ti (GK104) eGPU over Chestnut USB3.
 
-## Current state (2026-07-20)
+## Current 660 Ti state (2026-09-04)
+
+The direct-USB path boots GK104, discovers topology `[2,2,2,1]`, and builds the
+golden/runtime context. The latest physical run reached `GP_GET=1` and the
+no-WFI completion semaphore reached 2, but all eight output words remained the
+original `0x7fc00001` NaN poison. That proves PBDMA consumed the IB; without a
+WFI bit, only S10 numerical validation can prove that GR executed it. Add and
+mul are therefore still unverified on this board.
+
+A history audit found no retained successful GTX 660 Ti run. Commit `bc12d25`
+claims “660 add works” in its subject, but its only checked-in S10 log identifies
+PCI device `10de:1184`, topology `[2,2,2,2]`, and is therefore the GTX 770. The
+newly added `progress_660ti.md` at that revision also says the live device was a
+GTX 770 over USB4. No reachable log combines `10de:1183`, topology `[2,2,2,1]`,
+and `mismatches=0`, so `bc12d25` is an unverified 660-labeled A/B candidate,
+not a working oracle.
+
+The first exact direct-USB rerun of detached `bc12d25` on a freshly replugged
+660 Ti was manually interrupted after 90 seconds. It had completed S1-S8
+(`S6=65.0 s`) and was still reading the entire `0x29b00`-byte runtime context
+one dword per USB request before exposing `GP_PUT`; therefore it produced no
+compute result and is inconclusive, rather than a demonstrated failure. It also
+reported the power-gated sentinel `0xbadf1200` as an S2-successful topology,
+confirming that the historical posted-state check was unsound. The current
+stack rejects that sentinel. Live `KEPLER_TRACE=1` output now bypasses the
+health-check buffer so long S6/S9 operations stream instead of appearing hung.
+Any second historical run must allow the full verification to finish and set
+`KEPLER_AUTO_WARM_CONTINUE=0` so one requested run cannot silently become two.
+
+The complete 175,274,772-byte `mmiotrace_660ti.txt` has now been parsed: all
+4,372,128 recorded events are present (`97,450` reads, `4,274,552` writes,
+63 maps, and 63 unmaps; no dropped entries). The trace is not a successful
+compute reference. Its accompanying Nouveau/OpenCL run failed while creating
+the M2MF PGRAPH context with a HUB/FE PDE fault at VA `0x34d000`, killed
+channel 2, and never published a compute `GP_PUT`. It is nevertheless an
+authoritative reference through cold init, Falcon load, golden-context build,
+RAMFC construction, and the attempted runtime-context transition.
+
+The comparison rules out the large bring-up components:
+
+- The unmodified stock PMU/FECS/GPCCS instruction images reconstruct the trace
+  at every loaded dword (768/768, 768/768, and 448/448 respectively); PMU data
+  is 896/896. The direct-USB live images intentionally differ from stock at 59
+  PMU and 48 FECS dwords (wait-branch and autonomous BAR1 helper patches in
+  stock-zero padding); live GPCCS remains 448/448 exact. Those USB patches were
+  already present in commit `bc12d25`, so they predate the later WIP revision;
+  history does not independently prove them on a successful 660 Ti run.
+- Both FECS DMEM sessions match all 243 reconstructed dwords, including all
+  50 hub csdata words. Both GPCCS sessions match all 79 dwords, including GPC,
+  TPC, PPC csdata, and pointer words.
+- The 140-write GK104 PGRAPH pack is exact. The generated golden-context
+  sequence has 3,033 aligned exact writes; the trace alone has an empty ICMD
+  enable/disable pair and this stack alone has a trailing `0x419cb8=0`.
+- The 24-entry runtime MMIO list, native seven-TPC attribute values, GPC MMU
+  setup, RAMFC field meanings, FECS mailbox1 size `0x29b00`, and context-pointer
+  lifecycle all match.
+- Replaying the onboard ROM with trace RAMCFG group 6 matches 1,635 of 1,636
+  cold writes; the sole intentional difference is compression-tag backing at
+  `0x17e8d4` (Nouveau allocated tag RAM, this uncompressed stack uses zero).
+
+The checked-in `runtime/golden_gk104_cold_slice.json` and its 23-checkpoint
+`--mmiotrace-selftest` are the earlier Palit/GTX 770 cold baseline. They remain
+useful regression coverage, but a pass must not be interpreted as validation
+against this newly supplied 660 Ti capture; the exact 660 comparison above was
+performed independently against all relevant records in the full trace.
+
+The full trace exposed three incorrect assumptions in the current 660 path.
+Healthy runlist commits now issue only `0x2270/0x2274`, rather than preempting
+and unblocking runlist 0 first. The failed Nouveau capture reuses its admitted
+list after STOP/KICK and runtime-context-pointer replacement, but it never
+reaches compute. The retained S10-passing GTX 770 log and the unverified
+660-labeled `bc12d25` candidate both perform a second runtime commit, while the
+latest no-recommit 660 run consumed the IB without producing shader stores. The
+sanitized `0x2270/0x2274` recommit remains the next direct-USB experiment;
+`KEPLER_RECOMMIT_RUNLIST=0` preserves the failed trace's ordering for A/B.
+The offline runtime-context header was also corrected to the live/trace format:
+pair count at dword 0 and MMIO-list VA shifted by eight at dword 1.
+
+The add/mul cubins contain only CB0 loads and global LD/ST, but commit
+`543b4f3` replaced the 660-specific 47-word TIC/TSC+CB7 launch state with the
+770's 39-word stream and changed the tree's stated status from working to not
+working. The earlier 660-labeled candidate also used a privileged FECS guard leaf,
+pre-launch floorsweep re-arm, no LTC entries in the slow USB FECS context
+walk, and FE-power reinforcement during submit. Those defaults are restored;
+the 39-word stream and trace-exact LTC list remain explicit A/B controls.
+An offline byte comparison against `bc12d25` now also confirms that the current
+add cubin, 512-byte CUDA parameter buffer, 256-byte CWD, and complete 47-word
+method stream are exact; the method stream includes the same no-WFI semaphore.
+The cleaned-up direct 2-MiB TLS alignment had nevertheless changed the actual
+default address map. The historical candidate's allocator sequence is restored
+and locked offline: TLS/TXC/push/GR-context are again
+`0x280000/0x360000/0x160000/0x400000`; the native segmented attribute buffer
+retains its trace-derived contents at the same `0x500000` VA.
+BAR1 L2 warming is no longer followed by a default invalidate. Since the
+no-WFI completion value only proves PBDMA progress, the path preserves the
+historical candidate's 500 ms output-settle budget as a local sleep, then takes
+one result snapshot. Small results follow its BAR0
+PRAMIN path; `KEPLER_MIRROR_COPY=bar1` and results above the configured PRAMIN
+cap retain the single BAR1 read. It performs no speculative output polling or
+post-snapshot MMIO. The USB transport's PMU nowait patch and long-context-build
+power keepalive remain in place because a fast Linux PCIe trace cannot validate
+those transport-specific requirements.
+
+One board-state discrepancy remains pending live verification: this trace read
+`0x101000=0x80404c9a` (RAMCFG group 6), whereas the latest direct-Mac run read
+`0x80405096` (group 5). Group 5 and group 6 differ at 196 RAM-init writes.
+The live path now samples and caches `0x101000` immediately after BAR0 becomes
+readable and before BIT-I POST can rewrite strap state, matching Nouveau's
+ordering. A valid sample selects its own group for both POST and RAM training;
+zero/`bad*` samples retain group 5 as the direct-Mac fallback, and an explicit
+`KEPLER_RAMCFG_STRAP` still takes precedence for controlled A/B tests. Physical
+verification of this selection remains required.
+
+The lossless Nouveau capture `mmiotrace_660ti.txt.gz` records native attribute
+state `0x405830=0x02180648`, `0x4064c4=0x0192ffff`, and the four PPC pairs. The
+old raw path instead shrank the seven-TPC geometry to fit one 512-KiB bank.
+`add_660ti.py` now keeps the native 0x9c000-byte logical attribute buffer and
+maps it over `0x80000 + 0x1c000` bit-19-safe physical segments. All golden,
+critical, and live PTE construction uses the same segmented-offset helper.
+
+Seven MPs require `0xe0000` TLS in total, still exactly `0x20000` per MP. TLS
+is kept above a VA floor of `0x200000`; preserving the historical allocator
+sequence places the default workload at `0x280000` and leaves the separately
+backed FECS guard leaf at VA `0x100000`. Compilation, add/mul offline selftests, add/mul software runs,
+the trace-format test, exact captured attribute-register assertions,
+segmented-PTE tests, and the final BAR1-read transport guard pass offline.
+Physical S10 result validation remains the completion gate.
+
+## GTX 770 baseline (2026-07-20)
 
 **add and mul work for N = 1 to 1048576 with 0 mismatches.** N=1048576 (64
 channel windows) previously crashed macOS on the second run due to a sysmem
@@ -93,8 +221,8 @@ lines with correct VRAM data. This "warms" L2 so the SM hits correct data.
   (default ON).
 - L2-constrained windowing (line ~13712): `KEPLER_L2_MAX_ELEMENTS=16384`
   controls multi-CTA vs windowed threshold.
-- Pre-GP_PUT final LTC invalidate (line ~13068): `KEPLER_SKIP_FINAL_LTC_INV=1`
-  to skip (for testing).
+- Pre-GP_PUT final LTC invalidate is skipped by default so BAR1-warmed lines
+  survive to execution; `KEPLER_SKIP_FINAL_LTC_INV=0` restores the experiment.
 
 ## Hypothesis board
 
@@ -104,7 +232,7 @@ lines with correct VRAM data. This "warms" L2 so the SM hits correct data.
 |----|-----------|----------|
 | H1 | FECS hub MMIO dump while stuck | Diagnostic in SET_OBJECT hang path |
 | H2 | SET_OBJECT hang clears GPC1/2 TPC_NR | Floorsweep re-arm logic |
-| H9 | FECS discover_image_size via method 0x10 | Mailbox 0x409804 can be stale |
+| H9 | FECS image size is ready-time mailbox1 | Removed unsupported host command 0x10; trace and 770 read 0x409804 directly |
 | H10 | SET_OBJECT hang: FECS_MMIO_CTRL WRITE to LTC | LTC mmio-list omitted by default |
 | H14 | train-status strict must abort | Raises on failure |
 | H16 | eng-ctx hang: GPC3 PPC+0xe4 shrunk | PPC mmio-list omitted |
