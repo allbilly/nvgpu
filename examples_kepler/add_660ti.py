@@ -1218,6 +1218,11 @@ def _format_pcie_link(label, snap):
 def _usb_check(rc, name):
   if rc < 0:
     err = ctypes.string_at(libusb.libusb_strerror(rc)).decode("utf-8", errors="replace")
+    if rc == libusb.LIBUSB_ERROR_ACCESS:
+      raise PermissionError(
+          f"{name}: Chestnut USB permission denied; install "
+          "examples_kepler/70-chestnut-usb.rules with the one-time setup "
+          "documented in examples_kepler/README.md")
     raise RuntimeError(f"{name}: {err} ({rc})")
   return rc
 
@@ -1481,6 +1486,10 @@ class ChestnutPCIDevice(RemotePCIDevice):
   """
   staging_only = True
   _single_thread_rpc = True
+  # The controller can stream contiguous BAR0 accesses.  PRAMIN helpers use
+  # this marker instead of selecting the transport by class name so offline
+  # models can exercise the same bounded path.
+  pramin_bulk_stream = True
 
   @staticmethod
   def candidate_ids():
@@ -1505,6 +1514,8 @@ class ChestnutPCIDevice(RemotePCIDevice):
   def __init__(self, name="NV", transport=None, dev_id=0):
     super().__init__(name, transport or "usb3")
     self.dev_id = dev_id
+    self._usb_profile_enabled = os.environ.get("KEPLER_USB_PROFILE", "0") == "1"
+    self._usb_profile = {}
     self._fini_done = False
     self._phase = "connect"
     self._phase_started_ns = time.monotonic_ns()
@@ -1663,8 +1674,28 @@ class ChestnutPCIDevice(RemotePCIDevice):
       trace_note(f"{previous}: done duration_ms={(now - started) / 1e6:.3f}",
                  tag="RETURN", caller=caller)
       trace_note(f"{phase}: begin", tag="CALL", caller=caller)
+    if (getattr(self, "_usb_profile_enabled", False) and
+        previous is not None and phase != previous):
+      stats = self._usb_profile.get(previous)
+      if stats:
+        print(f"[usb-profile] {previous}: "
+              f"reads={stats['read_calls']} calls/{stats['read_bytes']} bytes/"
+              f"{stats['read_ms']:.3f} ms "
+              f"writes={stats['write_calls']} calls/{stats['write_bytes']} bytes/"
+              f"{stats['write_ms']:.3f} ms", flush=True)
     self._phase = phase
     self._phase_started_ns = now
+
+  def _record_usb_profile(self, operation, size, started_ns):
+    if not getattr(self, "_usb_profile_enabled", False):
+      return
+    stats = self._usb_profile.setdefault(
+        self._phase,
+        {"read_calls": 0, "read_bytes": 0, "read_ms": 0.0,
+         "write_calls": 0, "write_bytes": 0, "write_ms": 0.0})
+    stats[f"{operation}_calls"] += 1
+    stats[f"{operation}_bytes"] += int(size)
+    stats[f"{operation}_ms"] += (time.monotonic_ns() - started_ns) / 1e6
 
   def arm_final_output_read(self, bar, offset, size):
     if self._frozen:
@@ -1682,6 +1713,7 @@ class ChestnutPCIDevice(RemotePCIDevice):
     return self._bars.get(bar, (0, 0))
 
   def mmio_read(self, bar, offset, size):
+    started_ns = time.monotonic_ns() if self._usb_profile_enabled else 0
     self._guard(bar, offset, size, read=True)
     base, bar_size = self.bar_info(bar)
     if offset < 0 or offset + size > bar_size:
@@ -1689,7 +1721,9 @@ class ChestnutPCIDevice(RemotePCIDevice):
     if not size:
       return b""
     if not (offset & 3) and not (size & 3):
-      return self.usb.pcie_mem_read(base + offset, size)
+      result = self.usb.pcie_mem_read(base + offset, size)
+      self._record_usb_profile("read", size, started_ns)
+      return result
     out = bytearray()
     pos = 0
     while pos < size:
@@ -1699,7 +1733,9 @@ class ChestnutPCIDevice(RemotePCIDevice):
           base + offset + pos, size=take)
       out += int(value).to_bytes(take, "little")
       pos += take
-    return bytes(out)
+    result = bytes(out)
+    self._record_usb_profile("read", size, started_ns)
+    return result
 
   def mmio_read32(self, bar, offset):
     return struct.unpack("<I", self.mmio_read(bar, offset, 4))[0]
@@ -1711,6 +1747,7 @@ class ChestnutPCIDevice(RemotePCIDevice):
 
   def mmio_write(self, bar, offset, data):
     data = bytes(data)
+    started_ns = time.monotonic_ns() if self._usb_profile_enabled else 0
     self._guard(bar, offset, len(data), read=False)
     base, bar_size = self.bar_info(bar)
     if offset < 0 or offset + len(data) > bar_size:
@@ -1719,6 +1756,7 @@ class ChestnutPCIDevice(RemotePCIDevice):
       return
     if not (offset & 3) and not (len(data) & 3):
       self.usb.pcie_mem_write(base + offset, data)
+      self._record_usb_profile("write", len(data), started_ns)
       return
     pos = 0
     while pos < len(data):
@@ -1728,6 +1766,7 @@ class ChestnutPCIDevice(RemotePCIDevice):
                             value=int.from_bytes(data[pos:pos + take], "little"),
                             size=take)
       pos += take
+    self._record_usb_profile("write", len(data), started_ns)
 
   def mmio_write32(self, bar, offset, value):
     self.mmio_write(bar, offset, struct.pack("<I", value & 0xffffffff))
@@ -1780,6 +1819,8 @@ class ChestnutPCIDevice(RemotePCIDevice):
   def probe(cls):
     try:
       return cls()
+    except PermissionError:
+      raise
     except (OSError, RuntimeError, ValueError):
       return None
 
@@ -1817,6 +1858,9 @@ class _LinuxPCIDeviceFactory:
   @property
   def uses_socket(self):
     return False
+  @property
+  def needs_root(self):
+    return self.choice == "PCI"
   def __call__(self, dev_id=0, **kwargs):
     if self.choice == "USB":
       return ChestnutPCIDevice(dev_id=dev_id)
@@ -1886,9 +1930,11 @@ def _chestnut_transport_selftest():
     os.environ["KEPLER_IFACE"] = "SOCKET"
     assert _MacPCIDeviceFactory().choice == "SOCKET"
     os.environ["KEPLER_IFACE"] = "USB"
-    assert _LinuxPCIDeviceFactory().choice == "USB"
+    linux_usb = _LinuxPCIDeviceFactory()
+    assert linux_usb.choice == "USB" and not linux_usb.needs_root
     os.environ["KEPLER_IFACE"] = "PCI"
-    assert _LinuxPCIDeviceFactory().choice == "PCI"
+    linux_pci = _LinuxPCIDeviceFactory()
+    assert linux_pci.choice == "PCI" and linux_pci.needs_root
   finally:
     if saved is None: os.environ.pop("KEPLER_IFACE", None)
     else: os.environ["KEPLER_IFACE"] = saved
@@ -2703,7 +2749,7 @@ class NVDevice:
         print(f"[kepler] post-POST fixed-PA probe skipped: {e}", flush=True)
       if (not _gk104_pramin_word_is_stub(_pa_word) and
           _pa_word not in (0, 0xffffffff)):
-        _map = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x8000000"), 0)
+        _map = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x1000000"), 0)
         print(f"[kepler] Nouveau-order BAR1 after POST "
               f"(fixed-PA={_pa_word:#x}, map={_map:#x})", flush=True)
         _saved = {k: os.environ.get(k) for k in (
@@ -8673,6 +8719,73 @@ def _gk104_pramin_write_memx(dev, pa, data) -> None:
     print(f"[kepler] PRAMIN via MEMX: pa={pa:#x} bytes={len(data)} execs={execs}", flush=True)
 
 
+def _gk104_pramin_stream_hw(dev):
+  """Return a transport that safely streams the BAR0 PRAMIN aperture."""
+  hw = getattr(getattr(dev, "dev_impl", None), "hw", None)
+  if (os.environ.get("KEPLER_PRAMIN_BULK", "1") == "0" or
+      not getattr(hw, "pramin_bulk_stream", False)):
+    return None
+  return hw
+
+
+def _gk104_pramin_chunks(pa: int, size: int):
+  """Split at both the PBUS 1 MiB window and the proven 128 KiB read bound."""
+  off = 0
+  while off < size:
+    addr = pa + off
+    window_left = 0x100000 - (addr & 0xfffff)
+    take = min(size - off, window_left, 0x20000)
+    yield off, addr, take
+    off += take
+
+
+def _gk104_pramin_write_literal_bulk(dev, pa, data) -> bool:
+  """Stream literal dwords through BAR0 PRAMIN when the transport supports it."""
+  hw = _gk104_pramin_stream_hw(dev)
+  if hw is None:
+    return False
+  data = memoryview(data).cast("B")
+  if (pa & 3) or (len(data) & 3):
+    raise ValueError("bulk PRAMIN write must be dword aligned")
+  for off, addr, take in _gk104_pramin_chunks(pa, len(data)):
+    dev.write32(0x001700, (addr & 0xffffff00000) >> 16)
+    hw.mmio_write(
+        0, 0x700000 + (addr & 0xfffff), data[off:off + take])
+  return True
+
+
+def _gk104_pramin_read(dev, pa, size, *, force_bar0=False) -> bytes:
+  """Read contiguous framebuffer bytes without one USB RPC per dword."""
+  pa, size = int(pa), int(size)
+  if (pa & 3) or (size & 3):
+    raise ValueError("PRAMIN read must be dword aligned")
+  hw = getattr(getattr(dev, "dev_impl", None), "hw", None)
+  if not force_bar0 and getattr(dev, "_bar1_identity_ready", False):
+    return b"".join(
+        bytes(hw.mmio_read(1, addr, take))
+        for _off, addr, take in _gk104_pramin_chunks(pa, size))
+  stream_hw = _gk104_pramin_stream_hw(dev)
+  if stream_hw is not None:
+    out = bytearray()
+    for _off, addr, take in _gk104_pramin_chunks(pa, size):
+      dev.write32(0x001700, (addr & 0xffffff00000) >> 16)
+      out.extend(stream_hw.mmio_read(
+          0, 0x700000 + (addr & 0xfffff), take))
+    return bytes(out)
+  out = bytearray(size)
+  window = None
+  for off in range(0, size, 4):
+    addr = pa + off
+    base = addr & 0xffffff00000
+    if base != window:
+      dev.write32(0x001700, base >> 16)
+      window = base
+    struct.pack_into(
+        "<I", out, off,
+        dev.read32(0x700000 + (addr & 0xfffff)) & 0xffffffff)
+  return bytes(out)
+
+
 def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
   """Store framebuffer words through BAR0 PRAMIN and verify each result.  On the un-POSTed card, writes through 0x700000 sometimes behave as XOR updates against the old framebuffer word (an uncleared 0xffffffff plus value V becomes ~V).  Use current^wanted first, which is the correct delta for that path, then fall back to a literal store if the aperture is behaving normally.  Never return with silently inverted channel data.  When BAR1 identity is up, the default path substitutes verified BAR1 stores (faster on TinyGPU).  That substitute left mantissa bit15 sticky on compute mirror `b` (pre-GP_PUT xor=0x8000).  Pass force_bar0=True for eng-ctx / compute mirrors that must use the real 0x1700/0x700000 aperture."""
   # TinyGPU: once BAR0 is all-ones, 0x1700/0x700000 pokes hang the USB4 path.
@@ -8695,6 +8808,14 @@ def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
   # Night41ap: warm POSTed FB is a literal aperture. XOR-first then corrupts (e.g. 0x4001→0x4000) and, with macOS KEPLER_PRAMIN_LITERAL=0, never recovers. Virgin GDDR still reads 0xffffffff and needs XOR compensation.
   force_literal_first = os.environ.get("KEPLER_PRAMIN_LITERAL_FIRST", "") == "1"
   force_xor_first = os.environ.get("KEPLER_PRAMIN_LITERAL_FIRST", "") == "0"
+  # Warm/POSTed Chestnut is a literal aperture.  Stream once, require exact
+  # bulk readback, and preserve the proven word-at-a-time recovery below for
+  # cold/XOR-like or drifting framebuffer state.
+  if force_literal_first and _gk104_pramin_write_literal_bulk(dev, pa, data):
+    actual = _gk104_pramin_read(dev, pa, len(data), force_bar0=True)
+    _gk104_require_bar0_live(dev, f"after bulk PRAMIN store @{pa:#x}")
+    if actual == data.tobytes():
+      return
   for off in range(0, len(data), 4):
     addr = pa + off
     base = addr & 0xffffff00000
@@ -8735,11 +8856,8 @@ def _gk104_pramin_write(dev, pa, data, *, force_bar0=False):
       raise RuntimeError(f"PRAMIN store failed at {addr:#x}: wanted={wanted:#x} actual={actual:#x}{stub}")
 
 def _gk104_pramin_read32(dev, pa, *, force_bar0=False):
-  if (not force_bar0 and getattr(dev, "_bar1_identity_ready", False)):
-    return _gk104_bar1_read32(dev, pa)
-  base = pa & 0xffffff00000
-  dev.write32(0x001700, base >> 16)
-  return dev.read32(0x700000 + (pa & 0xfffff))
+  return struct.unpack(
+      "<I", _gk104_pramin_read(dev, pa, 4, force_bar0=force_bar0))[0]
 
 
 def _gk104_host_pramin_literal_probe(dev, pa: int = 0x30200,
@@ -8783,6 +8901,8 @@ def _gk104_pramin_write_literal(dev, pa, data):
   data = memoryview(data).cast("B")
   if len(data) & 3:
     raise ValueError("literal PRAMIN write must be 4-byte aligned")
+  if _gk104_pramin_write_literal_bulk(dev, pa, data):
+    return
   for off in range(0, len(data), 4):
     addr = pa + off
     dev.write32(0x001700, (addr & 0xffffff00000) >> 16)
@@ -10532,15 +10652,15 @@ def _gk104_atomic_bar1_bootstrap(
         f"bytes={transferred:#x} PMC_BOOT_0={boot0:#x}", flush=True)
 
 @traced_call
-def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
+def _gk104_init_bar1_identity(dev, mapped_size=0x01000000, bus_base=0,
                               map_vram=True, userd_alias_pa=None):
   """Bootstrap an identity BAR1 mapping for GK104 VRAM.
 
   Maps the low ``mapped_size`` bytes of the sysmem-backed "VRAM" 1:1 through
   the BAR1 VMM, matching what gf100_bar_oneinit()+gf100_bar_bar1_init()
-  create on a properly POSTed card.  The default 128 MiB covers the full
-  BAR1 aperture on the GTX 770, including all channel VMM page tables
-  and FIFO buffers allocated from the 0x400000+ heap.
+  create on a properly POSTed card.  The demo defaults to 16 MiB, which covers
+  its physical channel objects while avoiding 56 unused SPT pages.  Set
+  KEPLER_BAR1_MAP_SIZE=0x8000000 for the full 128 MiB PCI BAR1 aperture.
 
   By default this maps BAR1 virtual addresses to the same VRAM offsets.  That
   is the mapping PFIFO's GK104 USERD polling path requires.  ``map_vram=False``
@@ -10558,7 +10678,7 @@ def _gk104_init_bar1_identity(dev, mapped_size=0x08000000, bus_base=0,
   if os.environ.get("KEPLER_BAR1_MAP_SIZE"):
     mapped_size = int(os.environ["KEPLER_BAR1_MAP_SIZE"], 0)
   elif os.environ.get("KEPLER_PRAMIN_MEMX", "0") == "1":
-    mapped_size = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x8000000"), 0)
+    mapped_size = int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x1000000"), 0)
   if mapped_size > 0x8000000:
     mapped_size = 0x8000000
     print(f"[kepler] BAR1 identity clamped to {mapped_size:#x} (PCI BAR1)",
@@ -11305,9 +11425,12 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       print(f"[kepler] bar1_vmm decode error: {type(e).__name__}: {e}")
   # Do not allocate from low framebuffer memory: VBIOS/instmem/display reserve
   # portions of it, and writes at the old 4-MiB cursor returned alternating
-  # stale dwords on this card.  Keep the bring-up heap inside the 128-MiB BAR1
-  # aperture but above those bootstrap objects.
+  # stale dwords on this card.  Keep the bring-up heap inside the configured
+  # BAR1 identity map but above those bootstrap objects.
   bar1_cursor = int(os.environ.get("KEPLER_VRAM_HEAP_BASE", "0x400000"), 0)
+  bar1_alloc_limit = min(
+      dev.dev_impl.bar1_size,
+      int(os.environ.get("KEPLER_BAR1_MAP_SIZE", "0x1000000"), 0))
   # Incomplete GDDR address train on this eGPU aliases pa ^= 0x80000 (bit19).
   # Default: only allocate in the low half of each 1 MiB bank.
   bit19_safe = os.environ.get("KEPLER_VRAM_BIT19_SAFE", "1") != "0"
@@ -11330,8 +11453,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
       bar1_cursor = round_up(bar1_cursor, align)
     pa = bar1_cursor
     bar1_cursor += size
-    if bar1_cursor > dev.dev_impl.bar1_size:
-      raise MemoryError("BAR1-backed instance allocation exceeds aperture")
+    if bar1_cursor > bar1_alloc_limit:
+      raise MemoryError(
+          f"BAR1-backed allocation exceeds identity map {bar1_alloc_limit:#x}; "
+          "increase KEPLER_BAR1_MAP_SIZE (up to 0x8000000)")
     return pa
   def bar1_alloc_segments(size, align=0x1000):
     """Allocate contiguous logical storage across alias-safe physical banks."""
@@ -11366,10 +11491,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   def vram_load(pa, n):
     if _gk104_mirror_transfer_kind(n) == "bar1":
       return bytes(dev.dev_impl.hw.mmio_read(1, pa, n))
-    out = bytearray(n)
-    for off in range(0, n, 4):
-      struct.pack_into("<I", out, off, _gk104_pramin_read32(dev, pa + off, force_bar0=True))
-    return bytes(out)
+    return _gk104_pramin_read(dev, pa, n, force_bar0=True)
   _bar1_xfer = {"chunk": 0x1000}
   ctx_alias_ptes = []
   fault_guard_pte_addr = None
@@ -14305,15 +14427,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           raise TimeoutError(
               "GK104 LTC invalidate for pre-GP_PUT context did not complete")
         time.sleep(0.005)
-        _ctx_actual = bytearray(ctx_size)
-        for _off in range(0, ctx_size, 4):
-          struct.pack_into("<I", _ctx_actual, _off,
-                           _gk104_pramin_read32(dev, grctx_vram_pa + _off))
-        _mmio_actual = bytearray(len(mmio_blob))
-        for _off in range(0, len(mmio_blob), 4):
-          struct.pack_into("<I", _mmio_actual, _off,
-                           _gk104_pramin_read32(
-                               dev, mmio_list_vram_pa + _off))
+        _ctx_actual = _gk104_pramin_read(dev, grctx_vram_pa, ctx_size)
+        _mmio_actual = _gk104_pramin_read(
+            dev, mmio_list_vram_pa, len(mmio_blob))
         if (_ctx_actual == runtime_ctx_expected and
             _mmio_actual == mmio_blob):
           break
@@ -16282,7 +16398,7 @@ def main():
     os.environ.setdefault("KEPLER_PGRAPH_PACK", "1")
     os.environ.setdefault("KEPLER_BAR1_MEMX_LITERAL", "1")
     os.environ.setdefault("KEPLER_BAR1_DIRECT_PHYS", "1")
-    os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x8000000")
+    os.environ.setdefault("KEPLER_BAR1_MAP_SIZE", "0x1000000")
     os.environ.setdefault("KEPLER_RAM_HOST_PROG0", "0")
     os.environ.setdefault("KEPLER_AUTO_WARM_CONTINUE", "1")
     os.environ.setdefault("KEPLER_RPC_LIGHT", "1")
@@ -16311,12 +16427,13 @@ def main():
         _ensure_tinygpu_server()
   needs_hardware = backend != "software" and (
       bool(live_probe_flags.intersection(sys.argv)) or not _offline_selftest)
-  if (needs_hardware and os.environ.get("KEPLER_NO_AUTO_SUDO") != "1" and
+  needs_root = linux_factory is not None and linux_factory.needs_root
+  if (needs_hardware and needs_root and
+      os.environ.get("KEPLER_NO_AUTO_SUDO") != "1" and
       hasattr(os, "geteuid") and os.geteuid() != 0):
-    # Raw sysfs BAR mmap and detaching a kernel USB driver normally require
-    # root.  Re-exec the exact interpreter so `python3 file.py` is the only
-    # command the user has to remember.
-    print("[kepler] live PCI/USB access needs privilege; requesting sudo...", flush=True)
+    # Only raw sysfs BAR mmap requires root.  Direct Chestnut USB runs as the
+    # invoking user once its udev rule grants the plugdev group access.
+    print("[kepler] raw PCIe access needs privilege; requesting sudo...", flush=True)
     os.execvp("sudo", ["sudo", "--", sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
   if "--probe" in sys.argv:
     if OSX:

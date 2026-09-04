@@ -8,6 +8,17 @@ Kepler has no GSP; only S5 is skipped for that reason.
 
 ## Usage
 
+On Linux, install the Chestnut USB permission rule once. After reconnecting
+the controller (or rebooting), live USB runs do not use sudo:
+
+```sh
+sudo install -m 0644 examples_kepler/70-chestnut-usb.rules \
+  /etc/udev/rules.d/70-chestnut-usb.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=3801 \
+  --attr-match=idProduct=0001
+```
+
 ```sh
 # Offline, no GPU access
 python3 -S examples_kepler/add_770.py --offline-selftest
@@ -18,10 +29,14 @@ NV_BACKEND=software python3 -S examples_kepler/add_770.py add
 NV_BACKEND=software python3 -S examples_kepler/add_770.py mul
 
 # Live, only while the intended GK104 eGPU is connected
+# Direct Chestnut USB runs as the invoking user; raw PCI may request sudo.
 python3 examples_kepler/add_770.py
 python3 examples_kepler/add_770.py mul
 python3 examples_kepler/add_660ti.py
 python3 examples_kepler/add_660ti.py mul
+
+# Optional Chestnut per-phase USB call/byte timings
+KEPLER_USB_PROFILE=1 python3 examples_kepler/add_660ti.py
 
 # Transport overrides
 KEPLER_IFACE=USB python3 examples_kepler/add_770.py
