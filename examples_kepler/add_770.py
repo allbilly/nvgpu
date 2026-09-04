@@ -5030,11 +5030,11 @@ def _gk104_reclock_after_ok(dev) -> None:
 
 
 def nvkm_mask(dev, addr, mask, val):
-  """nouveau nvkm_mask: (r & ~mask) | (val & mask)."""
-  r = dev.read32(addr)
-  r = (r & ~mask) | (val & mask)
-  dev.write32(addr, r)
-  return r
+  """Nouveau ``nvkm_mask``: write the masked value and return the old one."""
+  before = dev.read32(addr)
+  after = (before & ~mask) | (val & mask)
+  dev.write32(addr, after)
+  return before
 
 
 def _set_native_thread_name(name):
@@ -5090,7 +5090,12 @@ def gk104_pmu_pgob(dev, war00c800=True, settle_s=0.05):
   War00C800_0 0xc800 pokes also need the PMU; if the PMU is not running they
   simply time out (2s each) and proceed.  Runs TWICE in nouveau (oneinit +
   gr_init_); the un-gate is sticky, so once before ctxctl suffices for bring-up."""
-  # fuse 0x31c bit0 gate skipped (set on real GK104).
+  # Match Nouveau's board fuse gate.  Some GK104 boards do not advertise the
+  # PGOB sequence and must retain their existing GR/BLG power state.
+  _pgob_fuse = nvkm_fuse_read_31c(dev)
+  if not (_pgob_fuse & 0x00000001):
+    print(f"[kepler] PGOB skipped: fuse 0x31c={_pgob_fuse:#x}", flush=True)
+    return
   nvkm_mask(dev, 0x000200, 0x00001000, 0x00000000)   # clear GR reset (bit12)
   dev.read32(0x000200)                                # posted
   nvkm_mask(dev, 0x000200, 0x08000000, 0x08000000)   # set bit27

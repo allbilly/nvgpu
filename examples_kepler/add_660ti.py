@@ -1803,6 +1803,28 @@ class _MacPCIDeviceFactory:
     return (ChestnutPCIDevice.probe() if self.choice == "USB" else
             APLRemotePCIDevice.probe())
 
+
+class _LinuxPCIDeviceFactory:
+  """Select direct Chestnut USB or raw sysfs PCI on Linux."""
+  def __init__(self):
+    choice = os.environ.get("KEPLER_IFACE", "AUTO").upper()
+    if choice not in ("AUTO", "USB", "PCI"):
+      raise ValueError(
+          f"KEPLER_IFACE must be AUTO, USB, or PCI on Linux, got {choice!r}")
+    self.choice = ("USB" if choice == "USB" or
+                   (choice == "AUTO" and ChestnutPCIDevice.available()) else
+                   "PCI")
+  @property
+  def uses_socket(self):
+    return False
+  def __call__(self, dev_id=0, **kwargs):
+    if self.choice == "USB":
+      return ChestnutPCIDevice(dev_id=dev_id)
+    return LinuxPCIDevice(dev_id=dev_id)
+  def probe(self):
+    return (ChestnutPCIDevice.probe() if self.choice == "USB" else
+            LinuxPCIDevice.probe())
+
 def _chestnut_transport_selftest():
   """Validate direct-USB addressing and guards without opening libusb."""
   class FakeChestnutController:
@@ -1863,6 +1885,10 @@ def _chestnut_transport_selftest():
     assert _MacPCIDeviceFactory().choice == "USB"
     os.environ["KEPLER_IFACE"] = "SOCKET"
     assert _MacPCIDeviceFactory().choice == "SOCKET"
+    os.environ["KEPLER_IFACE"] = "USB"
+    assert _LinuxPCIDeviceFactory().choice == "USB"
+    os.environ["KEPLER_IFACE"] = "PCI"
+    assert _LinuxPCIDeviceFactory().choice == "PCI"
   finally:
     if saved is None: os.environ.pop("KEPLER_IFACE", None)
     else: os.environ["KEPLER_IFACE"] = saved
@@ -2252,11 +2278,42 @@ GK104_TEMP_SIZE = GK104_MP_COUNT * GK104_TEMP_PER_MP
 KEPLER_DMA_COPY_A       = 0xa0b5
 
 
+def _gk104_tpc_counts_override(gpc_nr=None):
+  """Parse an opt-in reduced TPC topology used for scheduler isolation.
+
+  Values are per-GPC active counts (for example ``1,1,1,1``).  The live
+  reader below additionally proves that no requested count exceeds the
+  silicon count, so this knob can only hide TPCs; it cannot address fused-off
+  units.
+  """
+  raw = os.environ.get("KEPLER_TPC_COUNTS_OVERRIDE", "").strip()
+  if not raw:
+    return None
+  try:
+    counts = [int(part.strip(), 0) for part in raw.split(",")]
+  except ValueError as exc:
+    raise ValueError(
+        "KEPLER_TPC_COUNTS_OVERRIDE must be comma-separated integers") from exc
+  if not counts or any(count < 0 or count > 8 for count in counts):
+    raise ValueError(
+        "KEPLER_TPC_COUNTS_OVERRIDE counts must each be between 0 and 8")
+  if gpc_nr is not None and len(counts) != gpc_nr:
+    raise ValueError(
+        f"KEPLER_TPC_COUNTS_OVERRIDE has {len(counts)} GPCs; hardware has "
+        f"{gpc_nr}")
+  if not sum(counts):
+    raise ValueError("KEPLER_TPC_COUNTS_OVERRIDE must keep at least one TPC")
+  return counts
+
+
 def _gk104_mp_count_for(dev=None, default=GK104_MP_COUNT) -> int:
   """Return the live SM/MP count (sum of per-GPC TPC enables).  Mesa's nve4_compute_setup uses screen->mp_count from GRAPH_UNITS, not a hard-coded 8.  GTX 660 Ti fuse maps commonly report 7 TPCs; programming TEMP as if there were 8 SMs mismatches SKED's view of the floorswept topology."""
   env = os.environ.get("KEPLER_MP_COUNT", "").strip()
   if env:
     return max(1, int(env, 0))
+  override = _gk104_tpc_counts_override()
+  if override is not None:
+    return sum(override)
   if dev is not None:
     cached = getattr(dev, "_gk104_mp_count", None)
     if cached:
@@ -4713,126 +4770,295 @@ def program_gk104_gpc_pll(dev, target_khz=300000, ref_khz=810000):
   return actual, locked
 
 
-def _gk104_clk_calc_gpc_info(dev, target_khz: int, crystal_khz: int = 27_000):
-  """Nouveau ``calc_clk`` for GPC (idx 0): pick closest divider vs PLL path."""
-  # Fixed sources (calc_src).
-  if target_khz in (27_000, 108_000):
-    dsrc = 0x00030000 if target_khz == 108_000 else 0
-    return {"freq": target_khz, "dsrc": dsrc, "ddiv": 0, "mdiv": 0,
-            "ssel": 0, "coef": 0}
-  if target_khz == 100_000:
-    return {"freq": target_khz, "dsrc": 2, "ddiv": 0, "mdiv": 0,
-            "ssel": 0, "coef": 0}
+GK104_CLK_DOMAINS = (
+  # name, hardware clock index, PERF secondary-entry index
+  ("gpc",    0x00, 0x00),
+  ("rop",    0x01, 0x02),
+  ("hubk07", 0x02, 0x01),
+  ("hubk06", 0x07, 0x04),
+  ("hubk01", 0x08, 0x05),
+  ("pmu",    0x0c, 0x07),
+  ("vdec",   0x0e, 0x06),
+)
 
-  def read_pll(pll: int) -> int:
-    ctrl = dev.read32(pll) & 0xffffffff
-    coef = dev.read32(pll + 4) & 0xffffffff
-    if not (ctrl & 1):
-      return 0
-    p = (coef >> 16) & 0x3f
-    n = (coef >> 8) & 0xff
-    m = coef & 0xff or 1
-    if pll in (0x00e800, 0x00e820):
-      return crystal_khz * n // (m * (p or 1))
+
+def _gk104_clk_read_pll(dev, pll: int, crystal_khz: int = 27_000) -> int:
+  """Port of Nouveau gk104.c ``read_pll()`` (integer clock domains)."""
+  ctrl = dev.read32(pll) & 0xffffffff
+  coef = dev.read32(pll + 4) & 0xffffffff
+  if not (ctrl & 1):
     return 0
+  p = (coef >> 16) & 0x3f
+  n = (coef >> 8) & 0xff
+  m = coef & 0xff
+  fn = 0xf000
+  if pll in (0x00e800, 0x00e820):
+    source, p = crystal_khz, 1
+  elif pll == 0x132000:
+    source = _gk104_clk_read_pll(dev, 0x132020, crystal_khz)
+    p = 2 if (coef & 0x10000000) else 1
+  elif pll == 0x132020:
+    source = _gk104_clk_read_div(
+        dev, 0, 0x137320, 0x137330, crystal_khz)
+    fn = (dev.read32(pll + 0x10) >> 16) & 0xffff
+  elif pll in (0x137000, 0x137020, 0x137040, 0x1370e0):
+    source = _gk104_clk_read_div(
+        dev, (pll & 0xff) // 0x20, 0x137120, 0x137140, crystal_khz)
+  else:
+    return 0
+  if not source or not m:
+    return 0
+  p = p or 1
+  # C's (u16)(fN + 4096) intentionally wraps 0xf000 to zero.
+  source = source * n + ((((fn + 4096) & 0xffff) * source) >> 13)
+  return source // (m * p)
 
-  def read_vco() -> int:
-    ssrc = dev.read32(0x137160) & 0xffffffff
-    return read_pll(0x00e820 if (ssrc & 0x100) else 0x00e800)
 
-  def calc_div(ref: int, freq: int) -> tuple[int, int]:
-    div = min(max((ref * 2) // max(freq, 1), 2), 65)
-    return (ref * 2) // div, div - 2
+def _gk104_clk_read_vco(dev, dsrc: int,
+                        crystal_khz: int = 27_000) -> int:
+  source = dev.read32(dsrc) & 0xffffffff
+  pll = 0x00e820 if (source & 0x00000100) else 0x00e800
+  return _gk104_clk_read_pll(dev, pll, crystal_khz)
 
-  vco = read_vco() or crystal_khz
-  clk0, div0 = calc_div(vco, target_khz)
-  clk0, div1d = calc_div(clk0, target_khz)
-  dsrc = 3
-  ddiv = (0x80000000 | div0) if div0 else 0
-  mdiv_div = (0x80000000 | div1d) if div1d else 0
 
-  # PLL path (calc_pll / program_gk104_gpc_pll search).
+def _gk104_clk_read_div(dev, doff: int, dsrc: int, dctl: int,
+                        crystal_khz: int = 27_000) -> int:
+  source = dev.read32(dsrc + doff * 4) & 0xffffffff
+  control = dev.read32(dctl + doff * 4) & 0xffffffff
+  select = source & 3
+  if select == 0:
+    return 108_000 if (source & 0x00030000) == 0x00030000 else crystal_khz
+  if select == 2:
+    return 100_000
+  if select != 3:
+    return 0
+  clock = _gk104_clk_read_vco(dev, dsrc + doff * 4, crystal_khz)
+  if control & 0x80000000:
+    return (clock * 2) // ((control & 0x3f) + 2)
+  return clock
+
+
+def _gk104_clk_read(dev, idx: int, crystal_khz: int = 27_000) -> int:
+  """Port of Nouveau gk104.c ``read_clk()``."""
+  sctl = dev.read32(0x137250 + idx * 4) & 0xffffffff
+  if idx < 7:
+    if dev.read32(0x137100) & (1 << idx):
+      sclk = _gk104_clk_read_pll(
+          dev, 0x137000 + idx * 0x20, crystal_khz)
+      sdiv = 1
+    else:
+      sclk = _gk104_clk_read_div(
+          dev, idx, 0x137160, 0x1371d0, crystal_khz)
+      sdiv = 0
+  else:
+    ssrc = dev.read32(0x137160 + idx * 4) & 0xffffffff
+    sclk = _gk104_clk_read_div(
+        dev, idx, 0x137160, 0x1371d0, crystal_khz)
+    sdiv = 0
+    if (ssrc & 3) == 3 and (ssrc & 0x100):
+      if ssrc & 0x40000000:
+        sclk = _gk104_clk_read_pll(dev, 0x1370e0, crystal_khz)
+      sdiv = 1
+  if sctl & 0x80000000:
+    div = (((sctl >> 8) & 0x3f) if sdiv else (sctl & 0x3f)) + 2
+    return (sclk * 2) // div
+  return sclk
+
+
+def _gk104_clk_calc_div(ref: int, freq: int) -> tuple[int, int]:
+  div = min((ref * 2) // freq, 65)
+  div = max(div, 2)
+  return (ref * 2) // div, div - 2
+
+
+def _gk104_gt215_pll_calc(limits: dict, refclk: int,
+                          freq: int) -> tuple[int, int]:
+  """Integer-only ``gt215_pll_calc()`` result as ``(clock, coefficient)``."""
+  if not refclk or not freq:
+    return 0, 0
+  p = int(limits["max_freq"]) // freq
+  p = max(int(limits["min_p"]), min(int(limits["max_p"]), p))
+  if not p:
+    return 0, 0
+  low_m = (refclk + int(limits["max_inputfreq"])) // int(limits["max_inputfreq"])
+  low_m = max(low_m, int(limits["min_m"]))
+  high_m = (refclk + int(limits["min_inputfreq"])) // int(limits["min_inputfreq"])
+  high_m = min(high_m, int(limits["max_m"]))
+  low_m = min(low_m, high_m)
   best = None
-  ref = vco
-  for p in range(1, 64):
-    for m in range(17, 33):
-      for n in range(8, 256):
-        vco_n = ref * n // m
-        if not 1_100_000 <= vco_n <= 2_404_000:
-          continue
-        out = vco_n // p
-        cand = (abs(out - target_khz), out, p, n, m)
-        if best is None or cand < best:
-          best = cand
-  clk1 = coef = 0
-  div1p = 0
-  if best is not None and best[1]:
-    _, clk1_raw, p, n, m = best
-    coef = (p << 16) | (n << 8) | m
-    clk1, div1p = calc_div(clk1_raw, target_khz)
+  for m in range(low_m, high_m + 1):
+    tmp = freq * p * m
+    n, rem = divmod(tmp, refclk)
+    if rem >= refclk // 2:
+      n += 1
+    if n < int(limits["min_n"]):
+      continue
+    if n > int(limits["max_n"]):
+      break
+    actual = refclk * n // m // p
+    err = abs(freq - actual)
+    if best is None or err < best[0]:
+      best = (err, actual, n, m)
+  if best is None:
+    return 0, 0
+  _err, actual, n, m = best
+  return actual, (p << 16) | (n << 8) | m
+
+
+def _gk104_clk_wait_mask(dev, reg: int, mask: int, want: int,
+                         timeout_s: float = 2.0) -> bool:
+  deadline = time.monotonic() + timeout_s
+  while time.monotonic() < deadline:
+    if (dev.read32(reg) & mask) == want:
+      return True
+    time.sleep(0.001)
+  return (dev.read32(reg) & mask) == want
+
+
+def _gk104_clk_calc_info(dev, target_khz: int, idx: int, image: bytes,
+                         hubk06_khz: int = 0,
+                         crystal_khz: int = 27_000) -> dict:
+  """Port of Nouveau gk104.c ``calc_clk()`` for one hardware domain."""
+  target_khz = int(target_khz)
+  if target_khz <= 0:
+    return {"freq": 0, "dsrc": 0, "ddiv": 0, "mdiv": 0,
+            "ssel": 0, "coef": 0}
+  if target_khz in (27_000, 108_000):
+    src0 = 0x00030000 if target_khz == 108_000 else 0
+    clk0, div0 = target_khz, 0
+  elif target_khz == 100_000:
+    src0, clk0, div0 = 2, target_khz, 0
+  else:
+    src0 = 3
+    clk0 = _gk104_clk_read_vco(
+        dev, 0x137160 + idx * 4, crystal_khz)
+    div0 = 0
+    if idx < 7:
+      clk0, div0 = _gk104_clk_calc_div(clk0, target_khz)
+  clk0, div1d = _gk104_clk_calc_div(clk0, target_khz)
+
+  clk1 = coef = div1p = 0
+  if clk0 != target_khz and (0x0000ff87 & (1 << idx)):
+    if idx <= 7:
+      limits = nvbios_init.NvbiosInit(dev, image).pll_limits(
+          reg=0x137000 + idx * 0x20)
+      refclk = _gk104_clk_read_div(
+          dev, idx, 0x137120, 0x137140, crystal_khz)
+      if limits is not None:
+        clk1, coef = _gk104_gt215_pll_calc(limits, refclk, target_khz)
+    else:
+      clk1 = int(hubk06_khz)
+    if clk1:
+      clk1, div1p = _gk104_clk_calc_div(clk1, target_khz)
 
   if abs(target_khz - clk0) <= abs(target_khz - clk1):
-    return {"freq": clk0, "dsrc": dsrc, "ddiv": ddiv, "mdiv": mdiv_div,
-            "ssel": 0, "coef": 0}
-  mdiv_pll = (0x80000000 | (div1p << 8)) if div1p else 0
-  return {"freq": clk1, "dsrc": 0x40000100, "ddiv": 0, "mdiv": mdiv_pll,
-          "ssel": 1, "coef": coef}
+    return {
+      "freq": clk0, "dsrc": src0,
+      "ddiv": (0x80000000 | div0) if div0 else 0,
+      "mdiv": (0x80000000 | div1d) if div1d else 0,
+      "ssel": 0, "coef": 0,
+    }
+  return {
+    "freq": clk1, "dsrc": 0x40000100, "ddiv": 0,
+    "mdiv": (0x80000000 | (div1p << 8)) if div1p else 0,
+    "ssel": 1 << idx, "coef": coef,
+  }
 
 
-def gk104_clk_prog_gpc(dev, target_khz: int) -> dict:
-  """Program GPC domain via Nouveau ``gk104_clk_prog`` stages (idx 0 only)."""
-  info = _gk104_clk_calc_gpc_info(dev, int(target_khz))
-  idx = 0
-  # stage0: div programming
-  if not info["ssel"]:
-    nvkm_mask(dev, 0x1371d0 + idx * 4, 0x8000003f, info["ddiv"])
-    dev.write32(0x137160 + idx * 4, info["dsrc"])
-  # stage1_0: select div mode
-  nvkm_mask(dev, 0x137100, 1 << idx, 0)
-  t0 = time.time()
-  while time.time() - t0 < 2.0:
-    if not (dev.read32(0x137100) & (1 << idx)):
-      break
-    time.sleep(0.001)
-  # stage2: maybe program pll
-  addr = 0x137000 + idx * 0x20
-  nvkm_mask(dev, addr, 0x00000004, 0)
-  nvkm_mask(dev, addr, 0x00000001, 0)
-  if info["coef"]:
-    dev.write32(addr + 4, info["coef"])
-    nvkm_mask(dev, addr, 0x00000001, 0x00000001)
-    nvkm_mask(dev, addr, 0x00000010, 0)
-    t0 = time.time()
-    while time.time() - t0 < 2.0:
-      if dev.read32(addr) & 0x00020000:
-        break
-      time.sleep(0.001)
-    nvkm_mask(dev, addr, 0x00000010, 0x00000010)
-    nvkm_mask(dev, addr, 0x00000004, 0x00000004)
-  # stage3: final divider
-  if info["ssel"]:
-    nvkm_mask(dev, 0x137250 + idx * 4, 0x00003f00, info["mdiv"])
-  else:
-    nvkm_mask(dev, 0x137250 + idx * 4, 0x0000003f, info["mdiv"])
-  # stage4_0: maybe select pll mode
-  if info["ssel"]:
-    nvkm_mask(dev, 0x137100, 1 << idx, info["ssel"])
-    t0 = time.time()
-    while time.time() - t0 < 2.0:
-      if (dev.read32(0x137100) & (1 << idx)) == info["ssel"]:
-        break
-      time.sleep(0.001)
-  print(f"[kepler] gk104_clk_prog GPC target={target_khz} "
-        f"actual={info['freq']} ssel={info['ssel']} coef={info['coef']:#x}",
-        flush=True)
-  return info
+def _gk104_clk_calc_gpc_info(dev, target_khz: int,
+                              crystal_khz: int = 27_000,
+                              image: bytes | None = None):
+  """Compatibility wrapper for the GPC-domain ``calc_clk()`` port."""
+  if image is None:
+    image = pathlib.Path(os.environ.get(
+        "KEPLER_VBIOS", ONBOARD_VBIOS_CACHE)).read_bytes()
+  return _gk104_clk_calc_info(
+      dev, target_khz, 0, image, crystal_khz=crystal_khz)
+
+
+def gk104_clk_prog(dev, targets: dict[int, int], image: bytes) -> dict:
+  """Program GK104 clock domains in Nouveau ``gk104_clk_prog()`` order."""
+  targets = {int(idx): int(freq) for idx, freq in targets.items() if int(freq)}
+  hubk06_khz = targets.get(0x07, 0)
+  infos = {idx: _gk104_clk_calc_info(
+      dev, freq, idx, image, hubk06_khz=hubk06_khz)
+      for idx, freq in targets.items()}
+
+  # The masks and order are literal gk104_clk_prog() stages.
+  for idx, info in infos.items():                 # stage 0
+    if (0x007f & (1 << idx)) and not info["ssel"]:
+      nvkm_mask(dev, 0x1371d0 + idx * 4, 0x8000003f, info["ddiv"])
+      dev.write32(0x137160 + idx * 4, info["dsrc"])
+  for idx in infos:                               # stage 1_0
+    if 0x007f & (1 << idx):
+      nvkm_mask(dev, 0x137100, 1 << idx, 0)
+      if not _gk104_clk_wait_mask(
+          dev, 0x137100, 1 << idx, 0, timeout_s=2.0):
+        raise TimeoutError(f"clock idx {idx} did not select divider mode")
+  for idx in infos:                               # stage 1_1
+    if 0xff80 & (1 << idx):
+      nvkm_mask(dev, 0x137160 + idx * 4, 0x00000100, 0)
+  for idx, info in infos.items():                 # stage 2
+    if not (0x00ff & (1 << idx)):
+      continue
+    addr = 0x137000 + idx * 0x20
+    nvkm_mask(dev, addr, 0x00000004, 0)
+    nvkm_mask(dev, addr, 0x00000001, 0)
+    if info["coef"]:
+      dev.write32(addr + 4, info["coef"])
+      nvkm_mask(dev, addr, 0x00000001, 0x00000001)
+      nvkm_mask(dev, addr, 0x00000010, 0)
+      if not _gk104_clk_wait_mask(
+          dev, addr, 0x00020000, 0x00020000, timeout_s=2.0):
+        raise TimeoutError(f"clock idx {idx} PLL did not lock")
+      nvkm_mask(dev, addr, 0x00000010, 0x00000010)
+      nvkm_mask(dev, addr, 0x00000004, 0x00000004)
+  for idx, info in infos.items():                 # stage 3
+    if 0xff80 & (1 << idx):
+      if info["ssel"]:
+        nvkm_mask(dev, 0x137250 + idx * 4, 0x00003f00, info["mdiv"])
+      else:
+        nvkm_mask(dev, 0x137250 + idx * 4, 0x0000003f, info["mdiv"])
+  for idx, info in infos.items():                 # stage 4_0
+    if (0x007f & (1 << idx)) and info["ssel"]:
+      nvkm_mask(dev, 0x137100, 1 << idx, info["ssel"])
+      if not _gk104_clk_wait_mask(
+          dev, 0x137100, 1 << idx, info["ssel"], timeout_s=2.0):
+        raise TimeoutError(f"clock idx {idx} did not select PLL mode")
+  for idx, info in infos.items():                 # stage 4_1
+    if (0xff80 & (1 << idx)) and info["ssel"]:
+      nvkm_mask(dev, 0x137160 + idx * 4, 0x40000000, 0x40000000)
+      nvkm_mask(dev, 0x137160 + idx * 4, 0x00000100, 0x00000100)
+
+  for idx, target in targets.items():
+    actual = _gk104_clk_read(dev, idx)
+    planned = infos[idx]["freq"]
+    tolerance = max(2_000, target // 100)
+    print(f"[kepler] gk104_clk_prog idx={idx} target={target} "
+          f"planned={planned} readback={actual} ssel={infos[idx]['ssel']:#x} "
+          f"coef={infos[idx]['coef']:#x}", flush=True)
+    if not actual or abs(actual - planned) > tolerance:
+      raise RuntimeError(
+          f"clock idx {idx} readback {actual}kHz != planned "
+          f"{planned}kHz (tolerance {tolerance}kHz)")
+  return infos
+
+
+def gk104_clk_prog_gpc(dev, target_khz: int,
+                       image: bytes | None = None) -> dict:
+  """Program only GPC through the full Nouveau-derived stage engine."""
+  if image is None:
+    image = pathlib.Path(os.environ.get(
+        "KEPLER_VBIOS", ONBOARD_VBIOS_CACHE)).read_bytes()
+  return gk104_clk_prog(dev, {0: int(target_khz)}, image)[0]
 
 
 def _gk104_experimental_pstate(dev) -> None:
-  """Nouveau ``nvkm_pstate_prog`` order: ram calc/prog, then GPC clk_prog.
+  """Nouveau ``nvkm_pstate_prog`` order: RAM, then all GK104 clocks.
 
-  Experimental only.  Voltage/fan/PCIe and full multi-domain clk are out of
-  scope.  Aborts if GDDR train nibbles leave the clear state.
+  Experimental only.  Voltage/fan/PCIe changes remain out of scope, so the
+  default P7 state is the only safe automatic target.  Aborts if GDDR train
+  nibbles leave the clear state or a clock readback misses its plan.
   """
   vbios_path = os.environ.get("KEPLER_VBIOS", DEFAULT_VBIOS)
   image, _, _ = vbios_init_info(vbios_path)
@@ -4848,13 +5074,29 @@ def _gk104_experimental_pstate(dev) -> None:
   gpc_khz = int(os.environ.get("KEPLER_PSTATE_GPC_KHZ", "0"), 0) or ps["gpc_khz"]
   do_mem = os.environ.get("KEPLER_EXPERIMENTAL_PSTATE_MEM", "1") != "0"
   do_clk = os.environ.get("KEPLER_EXPERIMENTAL_PSTATE_CLK", "1") != "0"
+  clock_scope = os.environ.get(
+      "KEPLER_EXPERIMENTAL_PSTATE_CLK_DOMAINS", "all").lower()
+  if clock_scope not in ("all", "gpc"):
+    raise ValueError(
+        "KEPLER_EXPERIMENTAL_PSTATE_CLK_DOMAINS must be all or gpc")
+  if idx != 0 and os.environ.get("KEPLER_PSTATE_ALLOW_NO_VOLTAGE", "0") != "1":
+    raise RuntimeError(
+        f"experimental pstate {idx} requires a voltage transition that this "
+        "userspace path does not implement; use idx=0 or explicitly set "
+        "KEPLER_PSTATE_ALLOW_NO_VOLTAGE=1")
   print(f"[kepler] experimental pstate idx={idx} id={ps['pstate']:#x} "
         f"mem={mem_khz}kHz gpc={gpc_khz}kHz mem_prog={do_mem} "
-        f"clk_prog={do_clk}", flush=True)
+        f"clk_prog={do_clk} clock_scope={clock_scope}", flush=True)
   before = _gk104_sample_clk_regs(dev)
   print("[kepler] clk before experimental-pstate: " + " ".join(
       f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
       for r, v in before.items()), flush=True)
+  before_domains = {
+      name: _gk104_clk_read(dev, hw_idx)
+      for name, hw_idx, _bios_idx in GK104_CLK_DOMAINS}
+  print("[kepler] domain clocks before experimental-pstate: " + " ".join(
+      f"{name}={freq}kHz" for name, freq in before_domains.items()),
+      flush=True)
   if do_mem:
     if not mem_khz:
       raise RuntimeError("experimental pstate: mem domain frequency is 0")
@@ -4870,11 +5112,24 @@ def _gk104_experimental_pstate(dev) -> None:
   if do_clk:
     if not gpc_khz:
       raise RuntimeError("experimental pstate: gpc domain frequency is 0")
-    gk104_clk_prog_gpc(dev, gpc_khz)
+    if clock_scope == "gpc":
+      targets = {0: gpc_khz}
+    else:
+      targets = {
+          hw_idx: int(ps["domains_khz"].get(bios_idx, 0))
+          for _name, hw_idx, bios_idx in GK104_CLK_DOMAINS}
+      targets[0] = gpc_khz
+    gk104_clk_prog(dev, targets, image)
   after = _gk104_sample_clk_regs(dev)
   print("[kepler] clk after experimental-pstate: " + " ".join(
       f"{r:#x}={v if isinstance(v, Exception) else f'{v:#x}'}"
       for r, v in after.items()), flush=True)
+  after_domains = {
+      name: _gk104_clk_read(dev, hw_idx)
+      for name, hw_idx, _bios_idx in GK104_CLK_DOMAINS}
+  print("[kepler] domain clocks after experimental-pstate: " + " ".join(
+      f"{name}={freq}kHz" for name, freq in after_domains.items()),
+      flush=True)
   if do_mem and not _gk104_train_nibbles_clear(dev):
     raise RuntimeError(
         "experimental pstate: train nibbles non-zero after clk_prog")
@@ -4939,11 +5194,11 @@ def _gk104_reclock_after_ok(dev) -> None:
 
 
 def nvkm_mask(dev, addr, mask, val):
-  """nouveau nvkm_mask: (r & ~mask) | (val & mask)."""
-  r = dev.read32(addr)
-  r = (r & ~mask) | (val & mask)
-  dev.write32(addr, r)
-  return r
+  """Nouveau ``nvkm_mask``: write the masked value and return the old one."""
+  before = dev.read32(addr)
+  after = (before & ~mask) | (val & mask)
+  dev.write32(addr, after)
+  return before
 
 
 def _set_native_thread_name(name):
@@ -4999,7 +5254,13 @@ def gk104_pmu_pgob(dev, war00c800=True, settle_s=0.05):
   War00C800_0 0xc800 pokes also need the PMU; if the PMU is not running they
   simply time out (2s each) and proceed.  Runs TWICE in nouveau (oneinit +
   gr_init_); the un-gate is sticky, so once before ctxctl suffices for bring-up."""
-  # fuse 0x31c bit0 gate skipped (set on real GK104).
+  # Nouveau only applies PGOB on boards whose fuse 0x31c advertises it.  The
+  # seven-TPC GTX 660 Ti reads zero here; forcing the sequence on that board
+  # unnecessarily power-cycles GR and leaves PMC_ENABLE.BLG disabled.
+  _pgob_fuse = nvkm_fuse_read_31c(dev)
+  if not (_pgob_fuse & 0x00000001):
+    print(f"[kepler] PGOB skipped: fuse 0x31c={_pgob_fuse:#x}", flush=True)
+    return
   nvkm_mask(dev, 0x000200, 0x00001000, 0x00000000)   # clear GR reset (bit12)
   dev.read32(0x000200)                                # posted
   nvkm_mask(dev, 0x000200, 0x08000000, 0x08000000)   # set bit27
@@ -5390,9 +5651,29 @@ def build_launch_words(timeline_addr, wait_value, done_value, launch_desc_addr,
 def _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=None, tic_va=0):
   """Mesa nve4_screen_compute_setup()-shaped methods shared by launch builders."""
   mp_count = int(mp_count or GK104_MP_COUNT)
+  _code_override = os.environ.get("KEPLER_CODE_ADDRESS_OVERRIDE", "").strip()
+  if _code_override:
+    code_va = int(_code_override, 0)
+    if code_va < 0 or code_va >= (1 << 40) or code_va & 0xff:
+      raise ValueError(
+          "KEPLER_CODE_ADDRESS_OVERRIDE must be an aligned 40-bit VA")
+    print(f"[kepler] diagnostic CODE_ADDRESS override={code_va:#x}",
+          flush=True)
   min_temp = mp_count * GK104_TEMP_PER_MP
   assert temp_size >= min_temp and temp_size % mp_count == 0, f"temp_size={temp_size:#x} mp_count={mp_count} min={min_temp:#x}"
   temp_per_mp = temp_size // mp_count
+  # Diagnostic only: a value below the QMD's 0x800-byte CRS requirement for
+  # 64 resident warps should raise SKED TOTAL_TEMP_SIZE.  This lets a live run
+  # prove that LAUNCH fetched and validated the descriptor without changing
+  # the backing allocation or the production default.
+  _temp_override = os.environ.get("KEPLER_TEMP_PER_MP_OVERRIDE", "").strip()
+  if _temp_override:
+    temp_per_mp = int(_temp_override, 0)
+    if temp_per_mp <= 0 or temp_per_mp & 0x7fff:
+      raise ValueError(
+          "KEPLER_TEMP_PER_MP_OVERRIDE must be a positive 0x8000 multiple")
+    print(f"[kepler] diagnostic TEMP_PER_MP override={temp_per_mp:#x}",
+          flush=True)
   # Optional Mesa-style texture descriptor state.  The CUDA add/mul cubins use
   # only global memory and CB0, and the proven GTX 770 path intentionally omits
   # these methods.  Keep support for controlled experiments, but do not make
@@ -5407,7 +5688,8 @@ def _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=None, tic_v
 
 def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
                              code_va=0, temp_va=0, temp_size=GK104_TEMP_SIZE,
-                             batch=None, mp_count=None, tic_va=0):
+                             batch=None, mp_count=None, tic_va=0,
+                             semaphore_op=None):
   """One compute setup + LAUNCH/GRAPH_SERIALIZE pairs + one no-WFI semaphore.
 
   # Live GK104 retires at most ~19 LAUNCHes per channel lifetime (20th leaves
@@ -5421,6 +5703,10 @@ def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
   # pairs followed by one no-WFI release.
   if batch is None:
     batch = int(os.environ.get("KEPLER_LAUNCH_BATCH", "0"), 0)
+  if semaphore_op is None:
+    semaphore_op = (GK104_SEM_RELEASE_WFI
+                    if os.environ.get("KEPLER_COMPUTE_WFI", "0") == "1"
+                    else GK104_SEM_RELEASE_NO_WFI)
   words = _gk104_compute_setup_words(code_va, temp_va, temp_size, mp_count=mp_count, tic_va=tic_va)
   done = done_value
   n = len(launch_desc_addrs)
@@ -5431,7 +5717,7 @@ def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
       *nvm(1, 0x0110, 0),                          # NV50_GRAPH_SERIALIZE
     ])
     if batch > 0 and ((i + 1) % batch == 0 or (i + 1) == n):
-      words.extend([*gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI)])
+      words.extend([*gk104_semaphore(timeline_addr, done, semaphore_op)])
       if (i + 1) < n:
         done += 1
   if batch <= 0:
@@ -5439,15 +5725,15 @@ def build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs,
     # block forever even after GRAPH_SERIALIZE has retired the launch.  The
     # serialize method is the execution barrier; final numerical validation
     # remains the proof that the shader store completed.
-    words.extend([*gk104_semaphore(
-        timeline_addr, done, GK104_SEM_RELEASE_NO_WFI)])
+    words.extend([*gk104_semaphore(timeline_addr, done, semaphore_op)])
   words.extend([*nvm(0, 0x0020, 0)])
   return words, done
 
 
 def build_multi_launch_ibs(timeline_addr, done_value, launch_desc_addrs,
                            code_va=0, temp_va=0, temp_size=GK104_TEMP_SIZE,
-                           ib_max=None, mp_count=None, tic_va=0):
+                           ib_max=None, mp_count=None, tic_va=0,
+                           semaphore_op=None):
   """Split chunk launches across GPFIFO IBs of ≤ib_max LAUNCHes each.
 
   First IB includes compute setup; every IB ends with its own no-WFI semaphore
@@ -5459,8 +5745,12 @@ def build_multi_launch_ibs(timeline_addr, done_value, launch_desc_addrs,
   if ib_max is None:
     ib_max = int(os.environ.get("KEPLER_LAUNCH_IB_MAX", "16"), 0)
   if ib_max <= 0:
-    words, done = build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs, code_va=code_va, temp_va=temp_va, temp_size=temp_size, mp_count=mp_count, tic_va=tic_va)
+    words, done = build_multi_launch_words(timeline_addr, done_value, launch_desc_addrs, code_va=code_va, temp_va=temp_va, temp_size=temp_size, mp_count=mp_count, tic_va=tic_va, semaphore_op=semaphore_op)
     return [words], done
+  if semaphore_op is None:
+    semaphore_op = (GK104_SEM_RELEASE_WFI
+                    if os.environ.get("KEPLER_COMPUTE_WFI", "0") == "1"
+                    else GK104_SEM_RELEASE_NO_WFI)
   batches = []
   done = done_value
   n = len(launch_desc_addrs)
@@ -5479,7 +5769,8 @@ def build_multi_launch_ibs(timeline_addr, done_value, launch_desc_addrs,
     # Live: any WFI after the first IB's completion leaves the next IB's
     # semaphore unretired (GET advances, DMA_GET moves, sem stuck).  All
     # multi-IB semaphores use RELEASE_WFI=DIS; host still stages on the value.
-    words.extend([*gk104_semaphore(timeline_addr, done, GK104_SEM_RELEASE_NO_WFI), *nvm(0, 0x0020, 0)])
+    words.extend([*gk104_semaphore(timeline_addr, done, semaphore_op),
+                  *nvm(0, 0x0020, 0)])
     batches.append(words)
     if not last:
       done += 1
@@ -5600,7 +5891,16 @@ def build_cwd(code_addr, grid, block, shared=0, cbuf_addr=0, cbuf_size=0x200, re
   field(1472, 1495, 0)
   field(1496, 1503, regs & 0xff)
   # Word 47 (0xbc): SHADER_LOCAL_MEMORY_CRS_SIZE=0x800 + SASS_VERSION=0x30.
-  field(1504, 1527, 0x800)
+  # Raising CRS without raising MP_TEMP_SIZE is an opt-in live diagnostic: a
+  # SKED/TEMP stall proves that the engine fetched this CWD rather than a stale
+  # zero descriptor (whose zero raster dimensions would retire as a no-op).
+  _crs_size = int(os.environ.get("KEPLER_QMD_CRS_SIZE_OVERRIDE", "0x800"), 0)
+  if not 0 <= _crs_size < (1 << 24):
+    raise ValueError("KEPLER_QMD_CRS_SIZE_OVERRIDE must fit 24 bits")
+  if "KEPLER_QMD_CRS_SIZE_OVERRIDE" in os.environ:
+    print(f"[kepler] diagnostic QMD CRS size override={_crs_size:#x}",
+          flush=True)
+  field(1504, 1527, _crs_size)
   field(1528, 1535, 0x30)
   return qmd.to_bytes(0x100, "little")
 
@@ -7160,6 +7460,79 @@ def kepler_selftest():
   stage_set(3, "parse VBIOS and validate clock/init assets")
   image = pathlib.Path(DEFAULT_VBIOS).read_bytes()
   assert nvbios_init.find_vbios_image(image), "no VBIOS image found"
+  board_image = pathlib.Path(ONBOARD_VBIOS_CACHE).read_bytes()
+  board_init = nvbios_init.NvbiosInit(object(), board_image)
+  pll_limits = board_init.pll_limits(reg=0x137000)
+  assert pll_limits is not None and (
+      pll_limits["refclk"], pll_limits["min_m"], pll_limits["max_m"],
+      pll_limits["min_n"], pll_limits["max_n"],
+      pll_limits["min_p"], pll_limits["max_p"]
+  ) == (810000, 17, 32, 8, 255, 1, 63), \
+      f"unexpected onboard GPC PLL limits: {pll_limits}"
+  class _OfflineClockRegs:
+    def __init__(self):
+      self.regs = {
+        0x00e800: 0x01030005, 0x00e804: 0x05063c01,
+        0x00e820: 0x01030005, 0x00e824: 0x05063c01,
+        0x137100: 0,
+      }
+      for idx in (0, 1, 2):
+        self.regs[0x137160 + idx * 4] = 3
+        self.regs[0x1371d0 + idx * 4] = 0x81200303
+        self.regs[0x137250 + idx * 4] = 0x81200000
+      self.regs.update({
+        0x137120: 3, 0x137140: 0x81200202,
+        0x13717c: 3, 0x1371ec: 0x81200000,
+        0x13726c: 0x81200303,
+        0x137180: 3, 0x1371f0: 0, 0x137270: 0x81200303,
+        0x137190: 3, 0x137200: 0, 0x137280: 0x81200808,
+        0x137198: 3, 0x137208: 0, 0x137288: 0x81200606,
+      })
+    def read32(self, reg):
+      return self.regs.get(reg, 0)
+  clock_regs = _OfflineClockRegs()
+  assert _gk104_clk_read_pll(clock_regs, 0x00e800) == 1_620_000
+  assert _gk104_clk_read_div(
+      clock_regs, 0, 0x137120, 0x137140) == 810_000
+  assert {_name: _gk104_clk_read(clock_regs, _idx)
+          for _name, _idx, _bios in GK104_CLK_DOMAINS} == {
+      "gpc": 648000, "rop": 648000, "hubk07": 648000,
+      "hubk06": 648000, "hubk01": 648000,
+      "pmu": 324000, "vdec": 405000,
+  }
+  assert _gk104_gt215_pll_calc(
+      pll_limits, 810000, 648000) == (648000, 0x00033014)
+  class _OfflinePgobRegs:
+    def __init__(self, fuse):
+      self.regs = {
+        0x000200: 0xffffffff,
+        0x020004: 0,
+        0x021000: 0x40040000,
+        0x02141c: fuse,
+        0x022400: 0,
+        0x10a78c: 0,
+      }
+      self.writes = []
+    def read32(self, reg):
+      return self.regs.get(reg, 0)
+    def write32(self, reg, val):
+      self.regs[reg] = val & 0xffffffff
+      self.writes.append((reg, val & 0xffffffff))
+  pgob_off = _OfflinePgobRegs(0)
+  assert nvkm_mask(pgob_off, 0x000200, 0x4, 0) == 0xffffffff
+  assert pgob_off.regs[0x000200] == 0xfffffffb
+  pgob_off.writes.clear()
+  gk104_pmu_pgob(pgob_off, war00c800=False, settle_s=0)
+  assert not any(reg in (0x000200, 0x020004, 0x10a78c, 0x00c800)
+                 for reg, _val in pgob_off.writes), \
+      "fuse-disabled GK104 must skip PGOB"
+  assert pgob_off.regs[0x021000] == 0x40040000
+  assert pgob_off.regs[0x022400] == 0
+  pgob_on = _OfflinePgobRegs(1)
+  gk104_pmu_pgob(pgob_on, war00c800=False, settle_s=0)
+  assert any(reg == 0x020004 for reg, _val in pgob_on.writes)
+  assert pgob_on.regs[0x021000] == 0x40040000
+  assert pgob_on.regs[0x022400] == 0
   stage_done(f"{os.path.basename(DEFAULT_VBIOS)} parsed ({len(image)} bytes)")
   stage_set(4, "validate legacy PMU/FECS/GPCCS firmware inputs")
   firmware_assets = (os.path.join(RUNTIME_DIR, "fecs_bar1_bootstrap.fuc3.h"),
@@ -7187,6 +7560,13 @@ def kepler_selftest():
                 if method == 0x0010]
   assert len(fence_args) == 1 and fence_args[0][-1] == GK104_SEM_RELEASE_NO_WFI, \
       f"660 Ti compute completion must follow GRAPH_SERIALIZE without WFI: {fence_args!r}"
+  wfi_words, _ = build_multi_launch_words(
+      0xdeadbeef00001000, 7, [0x2000], code_va=0x3000, batch=0,
+      semaphore_op=GK104_SEM_RELEASE_WFI)
+  wfi_args = [args for _, _, _, method, _, args in decode_words(wfi_words)
+              if method == 0x0010]
+  assert len(wfi_args) == 1 and wfi_args[0][-1] == GK104_SEM_RELEASE_WFI, \
+      f"WFI diagnostic fence encoding drifted: {wfi_args!r}"
   # Exercise the optional full Mesa-style setup as well as the minimal default:
   # seven MPs, 0x20000 TEMP bytes per MP, real TIC/TSC bases, and a distinct
   # auxiliary constant buffer in QMD slot 7.
@@ -7370,6 +7750,14 @@ def _gk104_commit_runlist(dev, runlist_addr, count, target=0,
                           runl_id=GR_RUNLIST_ID, timeout_s=0.2):
   """Commit a GK104 runlist without changing scheduler preempt/block state."""
   _gk104_wait_runlist_idle(dev, runl_id, timeout_s, "previous runlist update")
+  # The retained S10-passing GTX 770 path and the historical 660-labelled
+  # candidate preempt and allow the runlist before every commit.  The supplied
+  # Nouveau trace does not do that on its initial insert, but it also never
+  # reaches compute.  Keep the pair as an explicit A/B for our unusual
+  # stop -> context-pointer replacement -> restart lifecycle.
+  if os.environ.get("KEPLER_RUNLIST_PREEMPT", "0") == "1":
+    dev.write32(0x262c, 1 << runl_id)
+    nvkm_mask(dev, 0x2630, 1 << runl_id, 0)
   # The complete 660 Ti Nouveau trace writes only 0x2270/0x2274 for healthy
   # updates.  0x262c (preempt) and 0x2630 (block/allow) first appear in its
   # later fault-removal path and must not be folded into every commit.
@@ -7537,6 +7925,82 @@ def snapshot_fecs_gpccs(dev):
     "pc": dev.read32(0x41aff0),
   }
   return {"fecs": fecs, "gpccs": gpccs}
+
+
+_GK104_DISPATCH_STATE_REGS = (
+  # PGRAPH virtual/busy status.  These are read-only status registers.
+  ("VSTATUS0", 0x400380), ("VSTATUS1", 0x400384),
+  ("VSTATUS2", 0x400388), ("VSTATUS3", 0x400390),
+  ("GPC_STATUS", 0x400604), ("ROP_STATUS", 0x400608),
+  ("GR_BUSY", 0x40060c), ("PGRAPH_STATUS", 0x400700),
+  # Method-dispatch pipeline: useful for proving the launch reached SKED.
+  ("DISPATCH_CMD", 0x404004), ("DISPATCH_ST2", 0x40402c),
+  ("DISPATCH_ST3", 0x404048),
+  # Context-switched compute-resource state.  UNK5B00 controls the maximum
+  # MPs used by compute grids and their TEMP layout; TEMP_SIZE_PER_MP is
+  # encoded in 0x100-byte units.
+  ("COMPUTE_TOPOLOGY", 0x405b00),
+  ("TEMP_TOO_SMALL", 0x40601c), ("TEMP_SIZE_PER_MP", 0x4064b0),
+  ("CTX_4C0", 0x4064c0), ("CTX_4C4", 0x4064c4),
+  ("CTX_4C8", 0x4064c8), ("CTX_4CC", 0x4064cc),
+  # GK104 SKED launch checks and context-switched scheduler state.
+  ("SKED_PM", 0x407010), ("SKED_TRAP", 0x407020),
+  ("SKED_TRAP_EN", 0x407024), ("SKED_28", 0x407028),
+  ("SKED_2C", 0x40702c), ("SKED_CTX_40", 0x407040),
+  ("SKED_54", 0x407054), ("SKED_100", 0x407100),
+  # Packed topology programmed by the GK104 floorsweep path.
+  ("TPC_COUNT", 0x418bb8), ("TPC_MAP", 0x41bfd0),
+)
+
+
+def _gk104_dispatch_state_snapshot(dev, label):
+  """Read-only snapshot of GK104 compute admission and per-SM activity."""
+  regs = {name: dev.read32(addr) & 0xffffffff
+          for name, addr in _GK104_DISPATCH_STATE_REGS}
+  gpc_nr = dev.read32(0x409604) & 0x1f
+  tpc_nr = _gk104_read_tpc_nr(dev, gpc_nr)
+  tpcs = []
+  for gpc, count in enumerate(tpc_nr):
+    for tpc in range(count):
+      base = 0x504000 + gpc * 0x8000 + tpc * 0x800
+      tpcs.append({
+        "gpc": gpc,
+        "tpc": tpc,
+        "tpc_vstatus": dev.read32(base + 0x060) & 0xffffffff,
+        "mp_vstatus": dev.read32(base + 0x728) & 0xffffffff,
+        "mp_tpcid": dev.read32(base + 0x698) & 0xffffffff,
+      })
+  snap = {"label": label, "regs": regs, "gpc_nr": gpc_nr,
+          "tpc_nr": tpc_nr, "tpcs": tpcs}
+  reg_text = " ".join(f"{name}={value:#010x}"
+                      for name, value in regs.items())
+  tpc_text = " ".join(
+      f"G{entry['gpc']}T{entry['tpc']}="
+      f"{entry['tpc_vstatus']:#010x}/{entry['mp_vstatus']:#010x}"
+      f"@{entry['mp_tpcid']:#x}" for entry in tpcs)
+  print(f"[kepler-dispatch] {label}: gpcs={gpc_nr} tpcs={tpc_nr} "
+        f"{reg_text}", flush=True)
+  print(f"[kepler-dispatch] {label}: TPC/MP_VSTATUS@TPCID {tpc_text}",
+        flush=True)
+  return snap
+
+
+def _gk104_print_dispatch_state_delta(before, after):
+  """Print only the register/activity changes between two snapshots."""
+  changed = []
+  for name, old in before["regs"].items():
+    new = after["regs"][name]
+    if new != old:
+      changed.append(f"{name}:{old:#010x}->{new:#010x}")
+  for old, new in zip(before["tpcs"], after["tpcs"]):
+    tag = f"G{old['gpc']}T{old['tpc']}"
+    for field, short in (("tpc_vstatus", "TPC"), ("mp_vstatus", "MP")):
+      if old[field] != new[field]:
+        changed.append(
+            f"{tag}.{short}:{old[field]:#010x}->{new[field]:#010x}")
+  print("[kepler-dispatch] delta: " + (" ".join(changed) or "no changes"),
+        flush=True)
+
 
 def snapshot_gr_traps(dev, label, *, emit_json=False):
   """Capture a register-accurate PGRAPH/FECS/GPCCS/GPC/TPC trap snapshot.
@@ -7873,7 +8337,20 @@ def _gk104_read_tpc_nr(dev, gpc_nr=None):
   """Silicon TPC_NR per GPC (sum of per-GPC TPC enables from 0x2608)."""
   if gpc_nr is None:
     gpc_nr = max(1, dev.read32(0x409604) & 0x1f)
-  return [dev.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f for g in range(gpc_nr)]
+  silicon = [dev.read32(0x500000 + g * 0x8000 + 0x2608) & 0x1f
+             for g in range(gpc_nr)]
+  override = _gk104_tpc_counts_override(gpc_nr)
+  if override is None:
+    return silicon
+  if any(wanted > present for wanted, present in zip(override, silicon)):
+    raise ValueError(
+        f"KEPLER_TPC_COUNTS_OVERRIDE={override} exceeds silicon {silicon}")
+  if not getattr(dev, "_kepler_tpc_override_reported", False):
+    print(f"[kepler] diagnostic reduced TPC topology: silicon={silicon} "
+          f"active={override}", flush=True)
+    try: setattr(dev, "_kepler_tpc_override_reported", True)
+    except Exception: pass
+  return override
 
 
 def _gk104_grctx_floorsweep(dev, tpc_nr, ppc_tpc_mask):
@@ -7981,8 +8458,9 @@ def _gk104_grctx_main(dev, pagepool_pa, bundle_pa, attrib_cb_pa, tpc_nr):
                   for gpc in range(gpc_nr)]
   # A zero mask is not a valid active PPC; topology registers occasionally
   # read late on this cold-attached card, so fall back to the known TPC mask.
-  ppc_tpc_mask = [m or ((1 << tpc_nr[gpc]) - 1)
-                  for gpc, m in enumerate(ppc_tpc_mask)]
+  ppc_tpc_mask = [
+      (m or ((1 << tpc_nr[gpc]) - 1)) & ((1 << tpc_nr[gpc]) - 1)
+      for gpc, m in enumerate(ppc_tpc_mask)]
   dev.write32(0x000260, 0)
   # Diagnostic: check if GR registers are accessible before writing.
   _test_read = dev.read32(0x404154)
@@ -10670,6 +11148,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   # Keep those experiments available only as an explicit
   # developer opt-in; the normal add demo must fail closed.
   unsafe_experiments = os.environ.get("KEPLER_UNSAFE_EXPERIMENTS") == "1"
+  _dispatch_snapshot_enabled = (
+      os.environ.get("KEPLER_SCHED_SNAPSHOT", "0") == "1" and hw is not None)
+  _dispatch_snapshot_before = None
+  _dispatch_snapshot_after_taken = False
   alloc = NVAllocator(dev)
   ramin = alloc.alloc(0x1000)
   userd = alloc.alloc(0x200)
@@ -10693,6 +11175,21 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   _alpha_nr_max = _GC["alpha_nr_max"]
   _attrib_nr = _GC["attrib_nr"]
   _alpha_nr = _GC["alpha_nr"]
+  # Historical bc12d25 kept the whole attribute object in one alias-safe
+  # 512-KiB bank by reducing the advertised per-TPC capacities.  The Nouveau
+  # trace uses the native capacities and the production path preserves them,
+  # but retain the old contiguous geometry as a focused CTA-admission A/B.
+  if os.environ.get("KEPLER_ATTRIB_SHRINK", "0") == "1":
+    _sum_max = max(1, 0x80000 // (0x20 * _tpc_total))
+    if _attrib_nr_max + _alpha_nr_max > _sum_max:
+      _attrib_nr_max = min(_attrib_nr_max, max(1, _sum_max // 3))
+      _alpha_nr_max = max(1, _sum_max - _attrib_nr_max)
+      _attrib_nr = min(_attrib_nr, _attrib_nr_max)
+      _alpha_nr = min(_alpha_nr, _alpha_nr_max)
+    print(f"[kepler] diagnostic contiguous attrib geometry: "
+          f"attrib_nr_max={_attrib_nr_max:#x} "
+          f"alpha_nr_max={_alpha_nr_max:#x} attrib_nr={_attrib_nr:#x} "
+          f"alpha_nr={_alpha_nr:#x}", flush=True)
   # The lossless Nouveau GTX 660 Ti trace programs the native GK104 values:
   # 405830=0x02180648, 4064c4=0x0192ffff, with max strides 0x324/0x7ff.
   # Preserve those values.  The resulting 0x9c000-byte object is striped over
@@ -13903,6 +14400,9 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           _xors = _xors2
         if _xors:
           raise RuntimeError(f"GK104 compute mirror unsettled before GP_PUT: va={_m.va_addr:#x} xors={[(hex(o), hex(x)) for o,_,_,x in _xors]}")
+    if _dispatch_snapshot_enabled:
+      _dispatch_snapshot_before = _gk104_dispatch_state_snapshot(
+          dev, "before_gp_put")
     if use_vram_inst:
       # Make the observed GR guard leaf the final framebuffer store before the USERD notification.  The complete hierarchy was already invalidated above; this last literal publication closes the window in which the cold PRAMIN path can settle a dword to its complemented write payload.
       _gk104_pramin_write_literal(
@@ -14146,6 +14646,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           f"IREN=0x{_fecs_iren:08x}", flush=True)
   _fecs_poll_count = 0
   _gp_get_snapshot_taken = False
+  _exec_snapshot_taken = False
   _last_launch_snapshot = None
   _last_fecs_poll = None
   if hw is not None:
@@ -14155,6 +14656,10 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
   # (GPU-owned); resetting it left PUT==GET and an empty ring on re-kick.
   _sem_targets = list(range(done_value - n_gp_entries + 1, done_value + 1))
   assert _sem_targets[-1] == done_value, (_sem_targets, done_value)
+  _sem_poll_limit = int(os.environ.get("KEPLER_SEM_POLL_LIMIT", "2000"), 0)
+  if not 1 <= _sem_poll_limit <= 20000:
+    raise ValueError(
+        f"KEPLER_SEM_POLL_LIMIT must be 1..20000, got {_sem_poll_limit}")
   val = signal_initial
   # Host-visible "kernel time": GP_PUT → done_value.  Includes post-kick
   # diagnostics + TinyGPU poll RPCs; compare baseline vs boost, not FLOPs.
@@ -14170,7 +14675,7 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
             1, _userd_mmio_base + USERD_GP_PUT, struct.pack("<I", _next_put))
         _gk104_bar_flush(dev)
     _gp_get_snapshot_taken = False
-    for _ in range(2000):
+    for _ in range(_sem_poll_limit):
       # H18: eng-ctx auto-load on SET_OBJECT races FE power-gate; keep FE alive in the same RPC thread.
       if (dev.dev_impl.hw is not None and
           os.environ.get("KEPLER_SUBMIT_FE_PWR",
@@ -14195,6 +14700,27 @@ def submit_launch(dev, words, signal_va, signal_pa, wait_value, done_value,
           _sked_status = dev.read32(0x407020) & 0x3fffffff
           _last_launch_snapshot = (
               _gp_get_now, _intr, _trap, _gpc_trap, _sked_status)
+          if (_dispatch_snapshot_enabled and
+              not _dispatch_snapshot_after_taken and _gp_get_now >= 1):
+            _dispatch_snapshot_after = _gk104_dispatch_state_snapshot(
+                dev, "after_gp_get")
+            if _dispatch_snapshot_before is not None:
+              _gk104_print_dispatch_state_delta(
+                  _dispatch_snapshot_before, _dispatch_snapshot_after)
+            _dispatch_snapshot_after_taken = True
+          if (not _exec_snapshot_taken and
+              os.environ.get("KEPLER_EXEC_SNAPSHOT", "0") == "1"):
+            print(
+                "[kepler] execution snapshot: "
+                f"GP_GET={_gp_get_now} GR_BUSY={dev.read32(0x40060c):#010x} "
+                f"STATUS={dev.read32(0x400700):#010x} "
+                f"TRAPPED_ADDR={dev.read32(0x400704):#010x} "
+                f"SUBCH={dev.read32(0x400744):#010x}/"
+                f"{dev.read32(0x404204):#010x} "
+                f"PBDMA_ENG={dev.read32(0x400a4):#010x} "
+                f"FECS_CHAN={dev.read32(0x409b00):#010x}/"
+                f"{dev.read32(0x409b04):#010x}", flush=True)
+            _exec_snapshot_taken = True
           # A SKED trap means the compute launch did not retire.  Acknowledging
           # it here lets the following semaphore execute and falsely turns the
           # launch into S9=OK with an untouched NaN output buffer. Keep the first
@@ -14824,7 +15350,10 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     if _replay_floorsweep:
       _ppc_masks = [((1 << _fuse_tpc[g]) - 1) if _fuse_tpc[g] else 0 for g in range(_gpc_nr)]
       # Prefer live PPC mask when silicon reports one.
-      _ppc_masks = [(dev.read32(0x500c30 + g * 0x8000) & 0xff) or _ppc_masks[g] for g in range(_gpc_nr)]
+      _ppc_masks = [
+          ((dev.read32(0x500c30 + g * 0x8000) & 0xff) or _ppc_masks[g]) &
+          ((1 << _fuse_tpc[g]) - 1)
+          for g in range(_gpc_nr)]
       _gk104_grctx_floorsweep(dev, _fuse_tpc, _ppc_masks)
       print(f"[kepler] pre-launch floorsweep re-armed: tpc={_fuse_tpc} ppc={[hex(m) for m in _ppc_masks]}", flush=True)
     print(f"[kepler] pre-launch GR state: "
@@ -15011,15 +15540,37 @@ def run_hardware_demo(dev, cubin=None, *, _hosts=None, _no_window=False):
     if _settle_ms:
       time.sleep(_settle_ms / 1000.0)
     print(f"[kepler] output settle: waited_ms={_settle_ms:g} via=local-sleep", flush=True)
+    # Diagnostic for a completed launch whose shader stores may still be
+    # resident in LTC.  WFI/GRAPH_SERIALIZE establishes execution ordering,
+    # but the direct bridge's CPU apertures are not guaranteed to snoop a dirty
+    # GPU L2 line.  Keep this opt-in until a physical A/B proves that the flush
+    # is required and safe on the seven-TPC board.
+    if os.environ.get("KEPLER_POSTLAUNCH_LTC_FLUSH", "0") == "1":
+      _post_ltc_ok = _gk104_ltc_invalidate(dev, force=True, flush=True)
+      print(f"[kepler] post-launch LTC flush+invalidate: ok={_post_ltc_ok}",
+            flush=True)
+      if not _post_ltc_ok:
+        raise TimeoutError("GK104 post-launch LTC flush/invalidate timed out")
     _out_pa = out_dev.meta["vram_pa"]
-    _result_kind = _gk104_mirror_transfer_kind(len(out_host))
-    if _result_kind == "pramin":
+    _output_read = os.environ.get("KEPLER_OUTPUT_READ", "auto").lower()
+    if _output_read not in ("auto", "pramin", "bar1", "both"):
+      raise ValueError(
+          "KEPLER_OUTPUT_READ must be auto, pramin, bar1, or both")
+    _result_kind = (_gk104_mirror_transfer_kind(len(out_host))
+                    if _output_read == "auto" else _output_read)
+    if _result_kind in ("pramin", "both"):
+      _pramin_out = bytearray(len(out_host))
       dev.dev_impl.hw.set_phase("output-read")
       for _off in range(0, len(out_host), 4):
         struct.pack_into(
-            "<I", out_host, _off,
+            "<I", _pramin_out, _off,
             _gk104_pramin_read32(dev, _out_pa + _off, force_bar0=True))
-    else:
+      if _result_kind == "pramin":
+        out_host[:] = _pramin_out
+      else:
+        print(f"[kepler] PRAMIN output before BAR1: "
+              f"{bytes(_pramin_out[:32]).hex()}", flush=True)
+    if _result_kind in ("bar1", "both"):
       dev.dev_impl.hw.arm_final_output_read(1, _out_pa, len(out_host))
       out_host[:] = dev.dev_impl.hw.mmio_read(1, _out_pa, len(out_host))
     print(f"[kepler] GPU output read from VRAM pa={out_dev.meta['vram_pa']:#x} "
@@ -15090,6 +15641,8 @@ def _probe_mac_device():
 
 def _probe_hw_device():
   """Return the selected live PCI transport (USB3/socket on macOS, sysfs on Linux)."""
+  if _PCI_TRANSPORT_FACTORY is not None:
+    return _PCI_TRANSPORT_FACTORY.probe()
   if OSX:
     return _probe_mac_device()
   return LinuxPCIDevice.probe()
@@ -15601,6 +16154,7 @@ def main():
     trace_format_selftest()
     return
   mac_factory = None
+  linux_factory = None
   # The verified GTX 770 sequence needs FIFO reset; retain an environment
   # override for diagnosis, but make the known-good behavior the default.
   os.environ.setdefault("KEPLER_FIFO_RESET", "1")
@@ -15617,6 +16171,9 @@ def main():
       _probe_option_rom_vga_preamble(); return
     if "--probe-nouveau-init-io" in sys.argv:
       _probe_nouveau_init_io(); return
+  else:
+    linux_factory = _LinuxPCIDeviceFactory()
+    set_pci_transport_factory(linux_factory)
   # Offline goldens pin Palit strap-6.  A live run leaves RAMCFG unset so
   # _init_hardware can cache the first 0x101000 sample before BIT-I POST, like
   # Nouveau; an explicit KEPLER_RAMCFG_STRAP remains an A/B override.
@@ -15700,8 +16257,10 @@ def main():
   offline = any(x in sys.argv for x in (
       "--offline-selftest", "--middle-selftest", "--mmiotrace-selftest",
       "--vbios-info", "--vbios-init-info", "--compare-cubin"))
-  if OSX and not offline:
-    # Proven TinyGPU classic BAR1 + literal PRAMIN path (Night41ay/bc).
+  if (OSX or (linux_factory is not None and
+              linux_factory.choice == "USB")) and not offline:
+    # Proven direct-USB/TinyGPU classic BAR1 + literal PRAMIN path
+    # (Night41ay/bc).  These are transport defaults, not Darwin defaults.
     os.environ.setdefault("KEPLER_POST_BEFORE_PMC", "1")
     os.environ.setdefault("KEPLER_TINYGPU_ATOMIC_BAR1", "0")
     os.environ.setdefault("KEPLER_PRAMIN_MEMX", "0")
@@ -15754,14 +16313,15 @@ def main():
       bool(live_probe_flags.intersection(sys.argv)) or not _offline_selftest)
   if (needs_hardware and os.environ.get("KEPLER_NO_AUTO_SUDO") != "1" and
       hasattr(os, "geteuid") and os.geteuid() != 0):
-    # Raw sysfs BAR mmap normally requires root.  Re-exec the exact interpreter
-    # so `python3 file.py` is the only command the user has to remember.
-    print("[kepler] raw PCIe access needs privilege; requesting sudo...", flush=True)
+    # Raw sysfs BAR mmap and detaching a kernel USB driver normally require
+    # root.  Re-exec the exact interpreter so `python3 file.py` is the only
+    # command the user has to remember.
+    print("[kepler] live PCI/USB access needs privilege; requesting sudo...", flush=True)
     os.execvp("sudo", ["sudo", "--", sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
   if "--probe" in sys.argv:
     if OSX:
       _probe(); return
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe: GK104 not reachable (is the card unbound from nvidia? set NV_PCIBDF)")
       sys.exit(1)
@@ -15774,7 +16334,7 @@ def main():
   if "--probe-post-ownership" in sys.argv:
     if OSX:
       _probe_post_ownership(); return
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe-post-ownership: GK104 not reachable (is the card unbound?)")
       sys.exit(1)
@@ -15792,7 +16352,7 @@ def main():
   if "--probe-rom-shadow-ownership" in sys.argv:
     if OSX:
       _probe_rom_shadow_ownership(); return
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe-rom-shadow-ownership: GK104 not reachable (is the card unbound?)")
       sys.exit(1)
@@ -15811,7 +16371,7 @@ def main():
   if "--probe-golden-preinit" in sys.argv:
     if OSX:
       _probe_golden_preinit(); return
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe-golden-preinit: GK104 not reachable (is the card unbound?)")
       sys.exit(1)
@@ -15826,7 +16386,7 @@ def main():
       d.fini()
     return
   if "--probe-pgob" in sys.argv:
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe-pgob: GK104 not reachable (is the card unbound from nvidia?)")
       sys.exit(1)
@@ -15843,7 +16403,7 @@ def main():
     d.fini()
     return
   if "--probe-gpc-clock" in sys.argv:
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe-gpc-clock: GK104 not reachable (is the card unbound from nvidia?)")
       sys.exit(1)
@@ -15860,7 +16420,7 @@ def main():
     d.fini()
     return
   if "--probe-vbios-devinit" in sys.argv:
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe-vbios-devinit: GK104 not reachable (is the card unbound from nvidia?)")
       sys.exit(1)
@@ -15886,7 +16446,7 @@ def main():
     d.fini()
     return
   if "--probe-falcon" in sys.argv:
-    d = LinuxPCIDevice.probe()
+    d = _probe_hw_device()
     if d is None:
       print("probe-falcon: GK104 not reachable (is the card unbound from nvidia?)")
       sys.exit(1)
@@ -15944,7 +16504,8 @@ def main():
   dev = None
 
   def _emit_quiet_diagnostics(
-      prefixes=("[kepler]", "[kepler-trap]", "[transport]", "[pcie]",
+      prefixes=("[kepler]", "[kepler-trap]", "[kepler-dispatch]",
+                "[transport]", "[pcie]",
                 "[phase]", "[hw]", "[mem]", "[wait]", "[reg]", "[S"),
       also=("hardware_demo=", "[nvbios]")):
     if quiet_buf is None:
@@ -16028,6 +16589,7 @@ def main():
         "[kepler] grctx topology:", "[kepler] grctx GPC TPC_NR:", "[kepler] LTC ctx preserve", "[kepler] native 660 Ti attrib geometry:",
         "[kepler] grctx attrib consts:", "[kepler] grctx PPC+0xe4:", "[kepler] GR ctx size override:",
         "[kepler] pre-launch floorsweep re-armed:", "[kepler] pre-launch GPC TPC_NR:", "[kepler] grctx_main GPC/TPC:", "[kepler] grctx_main:",
+        "[kepler-dispatch]",
     )
     for line in quiet_buf.getvalue().splitlines():
       if any(line.startswith(p) for p in _keep):

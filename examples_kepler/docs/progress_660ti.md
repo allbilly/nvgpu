@@ -5,12 +5,23 @@ running on the seven-TPC GTX 660 Ti (GK104) eGPU over Chestnut USB3.
 
 ## Current 660 Ti state (2026-09-04)
 
-The direct-USB path boots GK104, discovers topology `[2,2,2,1]`, and builds the
-golden/runtime context. The latest physical run reached `GP_GET=1` and the
-no-WFI completion semaphore reached 2, but all eight output words remained the
-original `0x7fc00001` NaN poison. That proves PBDMA consumed the IB; without a
-WFI bit, only S10 numerical validation can prove that GR executed it. Add and
-mul are therefore still unverified on this board.
+**Add and multiply now pass on the physical `10de:1183` GTX 660 Ti over
+Chestnut USB3.** Both verification runs started from an ATX/PCIe power cycle,
+used the native `[2,2,2,1]` seven-TPC topology, retired one GPFIFO entry with
+completion semaphore 2, and reported no GR/GPC/SKED trap:
+
+- add, `N=8`: 8/8 results matched
+- mul, `N=256`: 256/256 results matched
+
+The final initialization defect was a paired divergence from Nouveau. The
+Python `nvkm_mask()` returned the post-write value instead of the original
+register value, so `nvkm_fuse_read_31c()` restored its temporary fuse-access
+gates incorrectly. In addition, `gk104_pmu_pgob()` ignored Nouveau's
+`0x02141c[0]` board-fuse gate. This 660 Ti reads zero there, as does the
+same-board mmiotrace, so Nouveau skips PGOB. Matching both behaviors produced
+the first retained numerical passes on device `10de:1183`.
+
+## Investigation record (before the fix)
 
 A history audit found no retained successful GTX 660 Ti run. Commit `bc12d25`
 claims “660 add works” in its subject, but its only checked-in S10 log identifies
@@ -106,15 +117,16 @@ post-snapshot MMIO. The USB transport's PMU nowait patch and long-context-build
 power keepalive remain in place because a fast Linux PCIe trace cannot validate
 those transport-specific requirements.
 
-One board-state discrepancy remains pending live verification: this trace read
+One board-state discrepancy was pending live verification: this trace read
 `0x101000=0x80404c9a` (RAMCFG group 6), whereas the latest direct-Mac run read
 `0x80405096` (group 5). Group 5 and group 6 differ at 196 RAM-init writes.
 The live path now samples and caches `0x101000` immediately after BAR0 becomes
 readable and before BIT-I POST can rewrite strap state, matching Nouveau's
 ordering. A valid sample selects its own group for both POST and RAM training;
 zero/`bad*` samples retain group 5 as the direct-Mac fallback, and an explicit
-`KEPLER_RAMCFG_STRAP` still takes precedence for controlled A/B tests. Physical
-verification of this selection remains required.
+`KEPLER_RAMCFG_STRAP` still takes precedence for controlled A/B tests. The
+successful Orange Pi runs sampled `0x80404c9a`, selected group 6, and therefore
+verified this path physically.
 
 The lossless Nouveau capture `mmiotrace_660ti.txt.gz` records native attribute
 state `0x405830=0x02180648`, `0x4064c4=0x0192ffff`, and the four PPC pairs. The
@@ -129,7 +141,8 @@ sequence places the default workload at `0x280000` and leaves the separately
 backed FECS guard leaf at VA `0x100000`. Compilation, add/mul offline selftests, add/mul software runs,
 the trace-format test, exact captured attribute-register assertions,
 segmented-PTE tests, and the final BAR1-read transport guard pass offline.
-Physical S10 result validation remains the completion gate.
+Physical S10 result validation has now passed for add and multiply as recorded
+above.
 
 ## GTX 770 baseline (2026-07-20)
 

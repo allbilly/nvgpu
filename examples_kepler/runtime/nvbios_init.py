@@ -901,14 +901,16 @@ class NvbiosInit:
     return {field: any(cfg[field] != first[field] for cfg in configs[1:])
             for field in fields}
 
-  def refpll_limits(self) -> dict | None:
-    """Decode the ROM's BIT-C memory reference-PLL limits.
+  def pll_limits(self, *, pll_type: int | None = None,
+                 reg: int | None = None) -> dict | None:
+    """Decode one v0x40 BIT-C PLL-limits entry by type or register.
 
-    GK104's ``gt215_pll_calc()`` does not use a generic VCO range.  It uses
-    the per-board limits from the type-0x0c PLL entry (including the allowed
-    P/M/N ranges and reference clock).  Returning those fields keeps the
-    userspace RAM transition on the same coefficient path as Nouveau.
+    This is the userspace equivalent of ``nvbios_pll_parse()`` for the GK104
+    table format.  Clock-domain PLLs are looked up by register (for example
+    ``0x137000``), while the memory reclock path uses type ``0x0c``.
     """
+    if (pll_type is None) == (reg is None):
+      raise ValueError("specify exactly one of pll_type or reg")
     coff, cver = self._bit_entry(b"C")
     if not coff:
       return None
@@ -927,7 +929,12 @@ class NvbiosInit:
       return None
     for i in range(count):
       entry = table + hdr + i * length
-      if entry + length > len(self.image) or self.rd08(entry) != 0x0c:
+      if entry + length > len(self.image):
+        break
+      entry_type = self.rd08(entry)
+      entry_reg = self.rd32(entry + 3) if length >= 7 else 0
+      if ((pll_type is not None and entry_type != int(pll_type)) or
+          (reg is not None and entry_reg != int(reg))):
         continue
       if ver >= 0x50:
         # GK104 uses v0x40, but leave newer tables explicitly unsupported
@@ -941,6 +948,8 @@ class NvbiosInit:
       if ver == 0x40:
         # nvbios_pll_parse(), case 0x40.
         return {
+          "type": entry_type,
+          "reg": entry_reg,
           "refclk": self.rd16(entry + 9) * 1000,
           "min_freq": self.rd16(limits + 0) * 1000,
           "max_freq": self.rd16(limits + 2) * 1000,
@@ -955,6 +964,16 @@ class NvbiosInit:
         }
       return None
     return None
+
+  def refpll_limits(self) -> dict | None:
+    """Decode the ROM's type-0x0c memory reference-PLL limits.
+
+    GK104's ``gt215_pll_calc()`` does not use a generic VCO range.  It uses
+    the per-board limits (including allowed P/M/N ranges and reference
+    clock), keeping the userspace RAM transition on Nouveau's coefficient
+    path.
+    """
+    return self.pll_limits(pll_type=0x0c)
 
   def dcb_gpios(self) -> list[dict]:
     """Return all DCB GPIO descriptors needed by GK104 ``gpio_reset``."""

@@ -23,11 +23,13 @@ python3 examples_kepler/add_770.py mul
 python3 examples_kepler/add_660ti.py
 python3 examples_kepler/add_660ti.py mul
 
-# Transport overrides (AUTO prefers direct Chestnut USB3 for either board)
+# Transport overrides
 KEPLER_IFACE=USB python3 examples_kepler/add_770.py
 KEPLER_IFACE=SOCKET python3 examples_kepler/add_770.py mul
 KEPLER_IFACE=USB python3 examples_kepler/add_660ti.py
 KEPLER_IFACE=SOCKET python3 examples_kepler/add_660ti.py mul
+# Linux add_660ti.py: AUTO prefers Chestnut USB; PCI forces raw sysfs
+KEPLER_IFACE=PCI python3 examples_kepler/add_660ti.py
 ```
 
 `--middle-selftest` remains an alias for `--offline-selftest` in both Kepler
@@ -41,9 +43,10 @@ default Chestnut IDs. Direct USB uses a CPU-only staging arena: all GPU-visible
 instance, runlist, GPFIFO, push, semaphore, page-table, context, cubin, and data
 objects are copied and remapped into physical VRAM before submission.
 
-The GTX 660 Ti entry point uses the same macOS selection contract: direct
-Chestnut USB3 when present, with TinyGPU.app's socket as the fallback. Both
-board entry points accept `KEPLER_USBDEV=VID:PID` for a non-default controller.
+The GTX 660 Ti entry point prefers direct Chestnut USB3 on both macOS and
+Linux. On macOS, the fallback is TinyGPU.app's socket; on Linux, the fallback
+is raw PCI sysfs. Linux accepts `KEPLER_IFACE=AUTO`, `USB`, or `PCI`. Both board
+entry points accept `KEPLER_USBDEV=VID:PID` for a non-default controller.
 Its seven-TPC GR context keeps Nouveau's native attribute geometry
 (`0x324/0x7ff` allocation strides and `0x218/0x648` active counts). The
 logical 0x9c000-byte attribute buffer is mapped across two bit-19-safe physical
